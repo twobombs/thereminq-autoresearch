@@ -16,7 +16,7 @@ from openai import OpenAI
 # ==============================================================================
 
 ORCHESTRATOR_ENDPOINTS = [
-    "http://192.168.2.137:8080/v1",
+    "http://192.168.2.134:8080/v1",
     "http://192.168.2.137:8080/v1"
 ]
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "nvidia_Orchestrator-8B-Q6_K.gguf")
@@ -61,11 +61,16 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
 Your sole purpose is to take a large, complex query or task and shatter it into atomic, independent pieces for parallel processing.
 Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conversational text."""
 
-    target_orch = ORCHESTRATOR_ENDPOINTS[0]
-    client = OpenAI(base_url=target_orch, api_key=ORCH_API_KEY)
+    # Explicitly overriding hidden SDK defaults
+    client = OpenAI(
+        base_url=ORCHESTRATOR_ENDPOINTS[0], 
+        api_key=ORCH_API_KEY,
+        timeout=1800.0,
+        max_retries=0
+    )
 
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"[2] 🔬 DECOMPOSITION: Engaging atomic breakdown via {target_orch} (Attempt {attempt}/{MAX_RETRIES})...", flush=True)
+        print(f"[2] 🔬 DECOMPOSITION: Engaging atomic breakdown via {ORCHESTRATOR_ENDPOINTS[0]} (Attempt {attempt}/{MAX_RETRIES})...", flush=True)
         raw_output = ""
         prompt_tokens, comp_tokens = 0, 0
         
@@ -78,7 +83,7 @@ Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conv
                     {"role": "user", "content": f"Decompose this to the atomic level:\n\n{large_query}"}
                 ],
                 temperature=0.7, max_tokens=40960, stream=True,
-                stream_options={"include_usage": True}, timeout=600.0
+                stream_options={"include_usage": True}
             )
             
             print("    [~] Streaming Live Generation:\n    >> ", end="", flush=True)
@@ -106,10 +111,7 @@ Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conv
 
         except Exception as e:
             print(f"\n    [!] Decomposition Error: {e}", flush=True)
-            if attempt < MAX_RETRIES:
-                target_orch = ORCHESTRATOR_ENDPOINTS[attempt % len(ORCHESTRATOR_ENDPOINTS)]
-                client = OpenAI(base_url=target_orch, api_key=ORCH_API_KEY)
-                time.sleep(2)
+            time.sleep(2)
 
     return [large_query], estimate_tokens(large_query), 10
 
@@ -142,7 +144,12 @@ def export_to_split_files(pieces: list) -> Path:
 def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: str, original_query: str, run_dir: Path) -> dict:
     print(f"    -> [{slot_name}] Worker-{task_id:02d} Dispatched to {endpoint} | Task: '{task_prompt[:40]}...' ", flush=True)
     
-    worker_client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY)
+    worker_client = OpenAI(
+        base_url=endpoint, 
+        api_key=WORKER_API_KEY,
+        timeout=1800.0,
+        max_retries=0
+    )
     start_time = time.time()
     
     system_instruction = (
@@ -161,7 +168,7 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
         response = worker_client.chat.completions.create(
             model=WORKER_MODEL,
             messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": user_instruction}],
-            temperature=0.4, max_tokens=65536, timeout=1200.0,   
+            temperature=0.4, max_tokens=65536 
         )
         result_text = response.choices[0].message.content.strip()
         prompt_tokens = response.usage.prompt_tokens if response.usage else estimate_tokens(system_instruction + user_instruction)
@@ -193,7 +200,12 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
     }
 
 def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original_query: str) -> tuple:
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY)
+    client = OpenAI(
+        base_url=endpoint, 
+        api_key=ORCH_API_KEY,
+        timeout=1800.0,
+        max_retries=0
+    )
     
     system_prompt = (
         "You are a Level-1 Synthesis Node in a distributed cluster. "
@@ -217,7 +229,12 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
     return batch_id, res_content, p_tok, c_tok, elapsed
 
 def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, endpoint: str, original_query: str) -> tuple:
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY)
+    client = OpenAI(
+        base_url=endpoint, 
+        api_key=ORCH_API_KEY,
+        timeout=1800.0,
+        max_retries=0
+    )
     
     system_prompt = "You are the Final Assembly Layer. Seamlessly weave the new sequential section into the existing master document. Expand the document logically. Do not drop existing data or code."
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\n--- CURRENT MASTER DOCUMENT ---\n{current_master}\n\n--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{new_chunk}"
@@ -245,7 +262,6 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     
     print(f"\n[4] 🚀 CONTINUOUS MAP-REDUCE: Launching parallel workers, chunks, and rolling master stitch...", flush=True)
 
-    # Initialize Hardware Token Buckets with named slots
     worker_queue = queue.Queue()
     w_slot_idx = 1
     for ep in WORKER_ENDPOINTS:
@@ -330,7 +346,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                         success = True
                         break
                     except Exception as e:
-                        pass
+                        print(f"    [!] [{slot_name}] Master Stitch {c_id} error (Attempt {attempt}): {e}", flush=True)
                     finally:
                         orch_queue.put((orch_endpoint, slot_name))
                     time.sleep(2)
