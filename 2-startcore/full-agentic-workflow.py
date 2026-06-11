@@ -50,7 +50,8 @@ def estimate_tokens(text: str) -> int:
 
 def extract_json_array(raw_text: str) -> str:
     cleaned_text = re.sub(r'```json\s*', '', raw_text, flags=re.IGNORECASE)
-    cleaned_text = re.sub(r'```\s*', '', cleaned_text)
+    cleaned_text = re.sub(r'
+```\s*', '', cleaned_text)
     match = re.search(r'\[.*?\]', cleaned_text, re.DOTALL)
     return match.group(0) if match else ""
 
@@ -168,10 +169,10 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
             model=WORKER_MODEL,
             messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": user_instruction}],
             temperature=0.4, 
-            max_tokens=4096,           # <-- FIX: Hardware-level hardcap for worker nodes
-            frequency_penalty=1.1,     # <-- FIX: Prevents infinite code loops
-            presence_penalty=0.5,      # <-- FIX: Encourages moving on to new concepts
-            stop=["</file>"]           # <-- FIX: Instantly halts generation once task is done
+            max_tokens=12288,          # Increased to safely accommodate 8k+ bursts
+            frequency_penalty=1.1,     # Prevents infinite code loops
+            presence_penalty=0.5,      # Encourages moving on to new concepts
+            stop=["</file>"]           # Instantly halts generation once task is done
         )
         result_text = response.choices[0].message.content.strip()
         
