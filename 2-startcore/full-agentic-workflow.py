@@ -17,7 +17,7 @@ from openai import OpenAI
 
 ORCHESTRATOR_ENDPOINTS = [
     "http://192.168.2.137:8080/v1",
-    "http://192.168.2.134:8080/v1"
+    "http://192.168.2.137:8080/v1"
 ]
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "nvidia_Orchestrator-8B-Q6_K.gguf")
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
@@ -202,18 +202,26 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
     batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\nREPORTS TO MERGE:\n{batch_context}"
         
-    start_time = time.time()
-    response = client.chat.completions.create(
-        model=ORCHESTRATOR_MODEL,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-        temperature=0.3, max_tokens=40960
-    )
-    elapsed = round(time.time() - start_time, 2)
-    
-    res_content = response.choices[0].message.content.strip()
-    p_tok = response.usage.prompt_tokens if response.usage else estimate_tokens(system_prompt + user_prompt)
-    c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
-    return batch_id, res_content, p_tok, c_tok, elapsed
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            start_time = time.time()
+            response = client.chat.completions.create(
+                model=ORCHESTRATOR_MODEL,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=0.3, max_tokens=40960
+            )
+            elapsed = round(time.time() - start_time, 2)
+            
+            res_content = response.choices[0].message.content.strip()
+            p_tok = response.usage.prompt_tokens if response.usage else estimate_tokens(system_prompt + user_prompt)
+            c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
+            return batch_id, res_content, p_tok, c_tok, elapsed
+            
+        except Exception as e:
+            time.sleep(2)
+            
+    print(f"    [!] CRITICAL: Chunk {batch_id} failed synthesis. Falling back to raw concatenation.", flush=True)
+    return batch_id, f"\n--- [RAW CHUNK {batch_id}] ---\n" + batch_context, 0, 0, 0
 
 def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, endpoint: str, original_query: str) -> tuple:
     client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY)
@@ -221,18 +229,25 @@ def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, en
     system_prompt = "You are the Final Assembly Layer. Seamlessly weave the new sequential section into the existing master document. Expand the document logically. Do not drop existing data or code."
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\n--- CURRENT MASTER DOCUMENT ---\n{current_master}\n\n--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{new_chunk}"
     
-    start_time = time.time()
-    response = client.chat.completions.create(
-        model=ORCHESTRATOR_MODEL,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-        temperature=0.3, max_tokens=65536
-    )
-    elapsed = round(time.time() - start_time, 2)
-    
-    res_content = response.choices[0].message.content.strip()
-    p_tok = response.usage.prompt_tokens if response.usage else estimate_tokens(system_prompt + user_prompt)
-    c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
-    return res_content, p_tok, c_tok, elapsed
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            start_time = time.time()
+            response = client.chat.completions.create(
+                model=ORCHESTRATOR_MODEL,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=0.3, max_tokens=65536
+            )
+            elapsed = round(time.time() - start_time, 2)
+            
+            res_content = response.choices[0].message.content.strip()
+            p_tok = response.usage.prompt_tokens if response.usage else estimate_tokens(system_prompt + user_prompt)
+            c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
+            return res_content, p_tok, c_tok, elapsed
+        except Exception as e:
+            time.sleep(2)
+            
+    print(f"    [!] CRITICAL: Master stitch failed on Chunk {chunk_id}. Falling back to raw append.", flush=True)
+    return current_master + f"\n\n--- SECTION {chunk_id} ---\n" + new_chunk, 0, 0, 0
 
 # ==============================================================================
 # Phase 3, 4 & 5: Continuous Map-Reduce Event Loop
@@ -264,7 +279,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 res = process_subtask(tid, prompt, endpoint, original_query, run_dir)
                 if res["status"] == "success": 
                     event_queue.put(("worker", res))
-                    return  # The finally block cleanly handles token return
+                    return  
                 last_result = res
             except Exception as e:
                 last_result = {"id": tid, "status": "error", "result": f"Failed: {str(e)}", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "elapsed": 0, "tps": 0}
@@ -274,21 +289,12 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         event_queue.put(("worker", last_result))
 
     def chunk_wrapper(batch_id: int, tasks: list):
-        for attempt in range(1, MAX_RETRIES + 1):
-            endpoint = orch_queue.get()
-            try:
-                b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
-                event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap))
-                return
-            except Exception as e:
-                print(f"    [!] Chunk {batch_id} synthesis error (Attempt {attempt}): {e}", flush=True)
-            finally:
-                orch_queue.put(endpoint)
-            time.sleep(2)
-            
-        batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
-        print(f"    [!] CRITICAL: Chunk {batch_id} failed synthesis. Falling back to raw concatenation.", flush=True)
-        event_queue.put(("chunk", batch_id, f"\n--- [RAW CHUNK {batch_id}] ---\n" + batch_context, 0, 0, 0))
+        endpoint = orch_queue.get()
+        try:
+            b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
+            event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap))
+        finally:
+            orch_queue.put(endpoint)
 
     # --- Level 2 Background Stitching Thread ---
     master_document = ""
@@ -344,9 +350,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     chunks_dict = {}
     worker_stats_log = []
     
-    next_chunk_start_id = 1
     next_stitch_id = 1
-    chunk_id_counter = 1
     chunks_completed = 0
     dispatch_start_time = time.time()
     
@@ -375,20 +379,22 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 
                 print(f"    <- [Worker-{tid:02d}] Finished in {task_res['elapsed']}s | Status: {task_res['status']} | Agg TPS: {agg_tps}", flush=True)
 
-                # Check if a Level 1 chunk is ready
-                expected_end = min(next_chunk_start_id + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
+                # Dynamically calculate which chunk this task belongs to
+                chunk_idx = (tid - 1) // SYNTHESIS_CHUNK_SIZE + 1
+                expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
+                expected_end = min(expected_start + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
+                
+                # Check if this specific out-of-order chunk is now fully populated
                 chunk_ready = True
-                for i in range(next_chunk_start_id, expected_end):
+                for i in range(expected_start, expected_end):
                     if i not in results_dict:
                         chunk_ready = False
                         break
                         
-                if chunk_ready and next_chunk_start_id <= total_tasks:
-                    chunk_tasks = [results_dict.pop(i) for i in range(next_chunk_start_id, expected_end)]
-                    print(f"    [🗜️] Multithread trigger: Grouping tasks {chunk_tasks[0]['id']}-{chunk_tasks[-1]['id']} into Chunk {chunk_id_counter}...", flush=True)
-                    orch_exec.submit(chunk_wrapper, chunk_id_counter, chunk_tasks)
-                    next_chunk_start_id = expected_end
-                    chunk_id_counter += 1
+                if chunk_ready:
+                    chunk_tasks = [results_dict.pop(i) for i in range(expected_start, expected_end)]
+                    print(f"    [🗜️] Multithread trigger: Grouping tasks {chunk_tasks[0]['id']}-{chunk_tasks[-1]['id']} into Chunk {chunk_idx}...", flush=True)
+                    orch_exec.submit(chunk_wrapper, chunk_idx, chunk_tasks)
 
             elif event[0] == "chunk":
                 _, b_id, text, p_tok, c_tok, elap = event
@@ -476,4 +482,3 @@ if __name__ == "__main__":
     print(f"    [+] Synthesis Payload Size: {len(final_output):,} characters", flush=True)
     print(f"    📂 Run Master Directory:    {run_directory.absolute()}", flush=True)
     print("==============================================================================", flush=True)
-    
