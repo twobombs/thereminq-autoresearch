@@ -1,7 +1,7 @@
 <img width="1016" height="443" alt="Screenshot from 2026-01-01 15-36-30" src="https://github.com/user-attachments/assets/b5c8d613-5dac-484a-baef-0032dfd8e484" />
 
 
-# ThereminQ Autoresearch Tool Cupboard
+# ThereminQ Autoresearch
 
 A collection of utilities and autonomous workflows for the ThereminQ project. This repo acts as the nexus for AI-driven automation, bridging project management, deep research, workspace synchronization, and generative reporting.
 
