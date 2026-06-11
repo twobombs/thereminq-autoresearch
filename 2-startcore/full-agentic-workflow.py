@@ -167,9 +167,18 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
         response = worker_client.chat.completions.create(
             model=WORKER_MODEL,
             messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": user_instruction}],
-            temperature=0.4, max_tokens=65536 
+            temperature=0.4, 
+            max_tokens=4096,           # <-- FIX: Hardware-level hardcap for worker nodes
+            frequency_penalty=1.1,     # <-- FIX: Prevents infinite code loops
+            presence_penalty=0.5,      # <-- FIX: Encourages moving on to new concepts
+            stop=["</file>"]           # <-- FIX: Instantly halts generation once task is done
         )
         result_text = response.choices[0].message.content.strip()
+        
+        # Ensure the closing tag is appended back if the stop sequence cut it off
+        if "<file" in result_text and "</file>" not in result_text:
+            result_text += "\n</file>"
+
         prompt_tokens = response.usage.prompt_tokens if response.usage else estimate_tokens(system_instruction + user_instruction)
         comp_tokens = response.usage.completion_tokens if response.usage else estimate_tokens(result_text)
         
@@ -291,9 +300,11 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                     MAX_WORKER_TOKENS = 16000
                     if res.get("total_tokens", 0) > MAX_WORKER_TOKENS:
                         print(f"    [✂️] [{slot_name}] Worker-{tid:02d} exceeded limit ({res['total_tokens']} tokens). Truncating to {MAX_WORKER_TOKENS}...", flush=True)
-                        # Safe character limit approximation (~4 chars per token)
                         safe_char_limit = MAX_WORKER_TOKENS * 4
                         res["result"] = res["result"][:safe_char_limit] + "\n\n...[OUTPUT TRUNCATED DUE TO LENGTH LIMIT]..."
+                        
+                        # Fix: Ensure completion_tokens is updated so the telemetry table reflects reality
+                        res["completion_tokens"] = MAX_WORKER_TOKENS - res["prompt_tokens"]
                         res["total_tokens"] = MAX_WORKER_TOKENS
 
                     event_queue.put(("worker", res))
