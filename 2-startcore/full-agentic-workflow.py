@@ -61,7 +61,6 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
 Your sole purpose is to take a large, complex query or task and shatter it into atomic, independent pieces for parallel processing.
 Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conversational text."""
 
-    # Explicitly overriding hidden SDK defaults
     client = OpenAI(
         base_url=ORCHESTRATOR_ENDPOINTS[0], 
         api_key=ORCH_API_KEY,
@@ -287,6 +286,16 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             try:
                 res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir)
                 if res["status"] == "success": 
+                    
+                    # Failsafe: Hard truncate runaway hallucinations to prevent context poisoning
+                    MAX_WORKER_TOKENS = 16000
+                    if res.get("total_tokens", 0) > MAX_WORKER_TOKENS:
+                        print(f"    [✂️] [{slot_name}] Worker-{tid:02d} exceeded limit ({res['total_tokens']} tokens). Truncating to {MAX_WORKER_TOKENS}...", flush=True)
+                        # Safe character limit approximation (~4 chars per token)
+                        safe_char_limit = MAX_WORKER_TOKENS * 4
+                        res["result"] = res["result"][:safe_char_limit] + "\n\n...[OUTPUT TRUNCATED DUE TO LENGTH LIMIT]..."
+                        res["total_tokens"] = MAX_WORKER_TOKENS
+
                     event_queue.put(("worker", res))
                     return  
                 last_result = res
