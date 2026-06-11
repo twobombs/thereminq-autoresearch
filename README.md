@@ -3,7 +3,7 @@
 
 # ThereminQ Autoresearch Tool Cupboard
 
-A collection of auxiliary utilities and autonomous workflows for the ThereminQ Holoqubed project. This directory acts as the nexus for AI-driven automation, bridging project management, deep research, workspace synchronization, and generative reporting.
+A collection of auxiliary utilities and autonomous workflows for the ThereminQ project. This directory acts as the nexus for AI-driven automation, bridging project management, deep research, workspace synchronization, and generative reporting.
 
 ## Scripts
 
