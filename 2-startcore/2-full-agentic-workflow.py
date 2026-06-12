@@ -50,9 +50,9 @@ def estimate_tokens(text: str) -> int:
 
 def extract_json_array(raw_text: str) -> str:
     cleaned_text = re.sub(r'```json\s*', '', raw_text, flags=re.IGNORECASE)
-    cleaned_text = re.sub(r'
-```\s*', '', cleaned_text)
-    match = re.search(r'\[.*?\]', cleaned_text, re.DOTALL)
+    cleaned_text = re.sub(r'\n?```\s*', '', cleaned_text)
+    # Using greedy match to ensure we capture the full array even if there are nested brackets
+    match = re.search(r'\[.*\]', cleaned_text, re.DOTALL)
     return match.group(0) if match else ""
 
 def decompose_to_atomic_pieces(large_query: str) -> tuple:
@@ -497,14 +497,21 @@ if __name__ == "__main__":
     global_output_tokens += (w_c + o_c)
     
     # 6. Append Telemetry to Master Document
+    master_elapsed_time = time.time() - master_start_time
+
     stats_md = "\n\n---\n## 📊 Worker Execution Statistics\n"
     stats_md += "| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens |\n"
     stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|\n"
     for stat in sorted(worker_stats, key=lambda x: x['id']):
         stats_md += f"| Thread-{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} |\n"
     
-    final_output += stats_md
-    master_elapsed_time = time.time() - master_start_time
+    agg_md = "\n\n## 📈 Cluster Aggregate Statistics\n"
+    agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
+    agg_md += f"- **Total Input Tokens:** {global_input_tokens:,}\n"
+    agg_md += f"- **Total Output Tokens:** {global_output_tokens:,}\n"
+    agg_md += f"- **Total Cluster Tokens:** {global_input_tokens + global_output_tokens:,}\n"
+    
+    final_output += stats_md + agg_md
     
     print("\n[5] 💾 MASTER EXPORT: Saving master synthesis to disk...", flush=True)
     final_file_path = run_directory / "FINAL_SYNTHESIS.md"
