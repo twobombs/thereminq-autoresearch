@@ -38,9 +38,9 @@ MAX_EXEC_WORKERS = 4
 EXECUTION_RESULT_FIELDS = ["filename", "language", "status", "message"]
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
 # Shared helpers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
 
 def _safe_output_path(detected_filename: str, output_dir: Path) -> Path:
     """
@@ -103,9 +103,9 @@ def _extract_error_line(output: str, lang: str) -> str:
     return lines[-1].strip()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Phase 1 â€” extraction
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
+# Phase 1 — extraction
+# ---------------------------------------------------------------------
 
 def extract_code_blocks(md_content: str, output_dir: str) -> list:
     """
@@ -218,9 +218,9 @@ def extract_code_blocks(md_content: str, output_dir: str) -> list:
     return extracted_artifacts
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Phase 2 â€” parallel test generation
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
+# Phase 2 — parallel test generation
+# ---------------------------------------------------------------------
 
 def request_unittests_from_worker(
     artifact: dict,
@@ -317,9 +317,9 @@ def request_unittests_from_worker(
     return generation_metadata
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Phase 3 â€” execution and validation
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
+# Phase 3 — execution and validation
+# ---------------------------------------------------------------------
 
 def execute_test_artifact(test_meta: dict) -> dict:
     """
@@ -330,7 +330,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
       - Python: invokes pytest (portable) instead of passing a raw path to
         unittest's CLI, which only works when CWD is the parent directory.
       - C/C++ binary cleanup moved to a finally block so it runs on timeout,
-        crash, or any exception â€” not just on clean exit.
+        crash, or any exception — not just on clean exit.
       - All subprocess calls use explicit encoding="utf-8", errors="replace"
         to avoid UnicodeDecodeError on non-UTF-8 locales.
       - Execution timer for C/C++ starts after compilation succeeds, so the
@@ -433,7 +433,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
                     result["message"] = _extract_error_line(res.stderr + res.stdout, lang)
             finally:
                 # FIX: clean up the binary regardless of exit code, timeout,
-                # or exception â€” previously only ran on clean exit.
+                # or exception — previously only ran on clean exit.
                 if binary_path.exists():
                     binary_path.unlink()
 
@@ -451,9 +451,9 @@ def execute_test_artifact(test_meta: dict) -> dict:
     return result
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
 # Entrypoint
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
     MARKDOWN_SOURCE = "POLISHED_SYNTHESIS.md"
@@ -471,11 +471,11 @@ if __name__ == "__main__":
         with open(MARKDOWN_SOURCE, "r", encoding="utf-8") as fh:
             md_content = fh.read()
 
-        # â”€â”€ Phase 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ---------------- Phase 1 ------------------------------
         print("=== Phase 1: Local Extraction ===")
         artifacts = extract_code_blocks(md_content, OUTPUT_WORKSPACE)
 
-        # â”€â”€ Phase 2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ---------------- Phase 2 ------------------------------
         print(f"\n=== Phase 2: Parallelised Test Generation ===")
         print(f"[*] {len(artifacts)} artifacts extracted.")
         print(f"[*] Initialising ThreadPoolExecutor with {len(WORKER_ENDPOINTS)} workers...")
@@ -515,14 +515,14 @@ if __name__ == "__main__":
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        # â”€â”€ Phase 3 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ---------------- Phase 3 ------------------------------
         print("\n=== Phase 3: Functional Test Execution ===")
         execution_results: list[dict] = []
 
         if not generated_tests:
             print("[-] No valid test suites were successfully generated to execute.")
         else:
-            # FIX: run executions in parallel â€” tests are independent.
+            # FIX: run executions in parallel — tests are independent.
             # A separate, capped pool avoids spawning excessive compilers.
             print(f"[*] Running {len(generated_tests)} test suites"
                   f" (up to {MAX_EXEC_WORKERS} parallel)...")
@@ -551,7 +551,7 @@ if __name__ == "__main__":
             finally:
                 exec_executor.shutdown(wait=False, cancel_futures=True)
 
-        # â”€â”€ Report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ---------------- Report -------------------------------
         if execution_results:
             passed_count  = sum(1 for r in execution_results if r["status"] == "PASSED")
             failed_count  = sum(1 for r in execution_results if r["status"] in ("FAILED", "COMPILE_ERROR"))
@@ -583,7 +583,7 @@ if __name__ == "__main__":
             with open(json_report_path, "w", encoding="utf-8") as f:
                 json.dump(execution_results, f, indent=4)
 
-            # FIX: fieldnames are statically declared â€” no IndexError when
+            # FIX: fieldnames are statically declared — no IndexError when
             # execution_results happens to be empty at CSV-write time.
             with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS)
@@ -595,4 +595,3 @@ if __name__ == "__main__":
             print(f"    - {csv_report_path}")
 
         print("\n=== Pipeline execution complete ===")
-        
