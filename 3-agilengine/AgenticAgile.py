@@ -74,8 +74,8 @@ def mark_file_processed(file_path: Path):
 # ==============================================================================
 
 WORKER_ENDPOINTS = ["http://localhost:8033/v1/chat/completions"]
-ORCHESTRATOR_ENDPOINT = "http://192.168.2.134:8033/v1/chat/completions"
-MAX_SESSIONS_PER_ENDPOINT = 2
+ORCHESTRATOR_ENDPOINT = "http://192.168.2.134:8080/v1/chat/completions"
+MAX_SESSIONS_PER_ENDPOINT = 1
 
 class LLMClusterManager:
     def __init__(self):
@@ -110,7 +110,7 @@ class LLMClusterManager:
                 return True, result
                 
             except Exception as e:
-                print(f"      -> [LLM Cluster] Node {endpoint} failed: {e}. Retrying...")
+                print(f"      -> [LLM Cluster] Node {endpoint} failed: {e}. Retrying ({attempt+1}/{max_retries})...")
                 time.sleep(2 ** attempt)
         
         if not is_orchestrator:
@@ -123,22 +123,49 @@ cluster = LLMClusterManager()
 # Micro-Task Dispatcher
 # ==============================================================================
 
-def chunk_text(text, chunk_size=6, overlap=1):
-    lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
-    chunks, i = [], 0
-    while i < len(lines):
-        chunks.append('\n'.join(lines[i:i + chunk_size]))
-        i += (chunk_size - overlap)
-        if i >= len(lines):
-            break
+def chunk_markdown_semantically(text, max_chars=4000):
+    """
+    Splits text primarily by Markdown headers to preserve code blocks and context.
+    If a section is still too large, it falls back to paragraph splitting.
+    """
+    # Split by heading markers (H1, H2, H3) to maintain architectural context
+    sections = re.split(r'(?m)^#{1,3}\s+', text)
+    chunks = []
+    
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+            
+        # If the semantic section is within limit, add it
+        if len(section) <= max_chars:
+            chunks.append(section)
+        else:
+            # Fallback: Split large sections by double newline (paragraphs/code block edges)
+            sub_sections = section.split('\n\n')
+            current_chunk = []
+            current_len = 0
+            
+            for sub in sub_sections:
+                if current_len + len(sub) > max_chars and current_chunk:
+                    chunks.append('\n\n'.join(current_chunk))
+                    current_chunk = [sub]
+                    current_len = len(sub)
+                else:
+                    current_chunk.append(sub)
+                    current_len += len(sub)
+            
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+                
     return chunks
 
 def dispatch_jobs_in_chunks(large_text, prompt_template, system_prompt=""):
-    chunks = chunk_text(large_text)
+    chunks = chunk_markdown_semantically(large_text)
     if not chunks:
         return [], []
         
-    print(f"      -> [Dispatcher] Processing {len(chunks)} chunks in parallel.")
+    print(f"      -> [Dispatcher] Processing {len(chunks)} semantic chunks in parallel.")
     
     results, failed_chunks = [None] * len(chunks), []
     total_capacity = len(WORKER_ENDPOINTS) * MAX_SESSIONS_PER_ENDPOINT
@@ -156,7 +183,7 @@ def dispatch_jobs_in_chunks(large_text, prompt_template, system_prompt=""):
                 if success:
                     results[idx] = output
                 else:
-                    failed_chunks.append({"type": "extraction_failure", "payload": chunks[idx]})
+                    failed_chunks.append({"type": "extraction_failure", "payload": chunks[idx][:200] + "..."})
             except Exception as exc:
                 failed_chunks.append({"type": "exception", "error": str(exc)})
                 
@@ -179,7 +206,10 @@ def ingest_and_merge_source(source_path: Path) -> bool:
         return False
 
     # Phase 1: Distributed Extraction
-    content_prompt = "Extract bullet points of actionable tasks, blockers, or architectural changes from this transcript segment:\n{chunk}"
+    content_prompt = (
+        "Extract bullet points of actionable tasks, potential technical blockers, "
+        "or core architectural configurations from this artifact segment:\n\n{chunk}"
+    )
     raw_tasks_list, extraction_failures = dispatch_jobs_in_chunks(raw_content, content_prompt)
 
     state = load_state()
@@ -193,15 +223,20 @@ def ingest_and_merge_source(source_path: Path) -> bool:
     # Phase 2: Context-Aware Orchestrator Merge
     print(f"[*] MERGING: Orchestrator reconciling signals from {rel_path}...")
     
-    existing_tasks_context = json.dumps(list(state["tasks"].values()), indent=2)
-    new_signals_context = "\n".join(raw_tasks_list)
+    # Send a truncated context if tasks are too massive to prevent token overflow
+    existing_tasks = list(state["tasks"].values())
+    # Take the 50 most recently updated tasks for context to save prompt space
+    existing_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    existing_tasks_context = json.dumps(existing_tasks[:50], indent=2)
+    
+    new_signals_context = "\n---\n".join(raw_tasks_list)
 
     merge_prompt = f"""
-Reconcile these new signals with the current project state. 
+Reconcile these newly extracted technical signals with the current agile project state. 
 Update existing tasks if the content is related, or create new tasks if the signal is fresh.
-Return a valid JSON array of objects with keys: id (slug), content, status, confidence.
+Ensure blockers are explicitly flagged.
 
-CURRENT STATE:
+CURRENT STATE (Recent Tasks):
 {existing_tasks_context}
 
 NEW SIGNALS FROM {source_path.name}:
@@ -209,20 +244,28 @@ NEW SIGNALS FROM {source_path.name}:
 """
     success, merged_output = cluster.query(
         prompt=merge_prompt,
-        system_prompt="Return ONLY a flat JSON array. No markdown code blocks.",
+        system_prompt="Return ONLY a flat JSON array of objects with keys: 'id' (slug), 'content', 'status', 'confidence'. No markdown formatting, code blocks, or explanatory text.",
         is_orchestrator=True,
         requires_json=True
     )
 
     if success:
         try:
-            clean_json = re.sub(r'```json|```', '', merged_output).strip()
-            merged_tasks = json.loads(clean_json)
+            # More robust JSON cleaning to handle LLM edge-case responses
+            clean_json = re.search(r'\[.*\]', merged_output, re.DOTALL)
+            if clean_json:
+                merged_tasks = json.loads(clean_json.group())
+            else:
+                merged_tasks = json.loads(merged_output)
+
             for task in merged_tasks:
                 slug = task.get("id")
                 if slug:
                     task["updated_at"] = datetime.now().isoformat()
                     task["last_source"] = source_path.name
+                    # Ensure status falls within valid agile states
+                    if task.get("status") not in VALID_STATES:
+                        task["status"] = "in_progress" 
                     state["tasks"][slug] = task
                     
             print(f" [+] Reconciliation complete for {rel_path}.")
@@ -231,6 +274,7 @@ NEW SIGNALS FROM {source_path.name}:
             
         except Exception as e:
             print(f" [!] JSON Parse Error during merge: {e}")
+            print(f" [!] Raw Orchestrator Output was: {merged_output[:200]}...")
             return False
             
     print(f" [!] Orchestrator failed to merge signals for {rel_path}.")
@@ -245,7 +289,7 @@ def generate_daily_synthesis():
         print(" [!] State is empty. No report generated.")
         return
 
-    synthesis_prompt = f"Summarize this project state into a readable executive markdown report. Group by status (Blocked, Active, Completed):\n{json.dumps(state['tasks'])}"
+    synthesis_prompt = f"Summarize this agile project state into a readable executive markdown report. Group cleanly by status (Blocked, Active, Completed). Keep it concise.\n\nSTATE:\n{json.dumps(state['tasks'])}"
     success, response = cluster.query(synthesis_prompt, is_orchestrator=True)
     
     if success:
