@@ -39,21 +39,25 @@ A collection of utilities and autonomous workflows for the ThereminQ project. Th
 
 ### Core Orchestration (`2-startcore/`)
 
-*   **`2-startcore/distill-macrotask.py`**
-    **Functional Description:** A script that uses an LLM to distill actionable tasks from dense or fluffy technical documents.
-    **Internal Workings:** Reads a specified text document and sends its content to an orchestrator-level LLM with a system prompt instructing it to extract only a clean, actionable markdown list of to-dos and requirements. It saves this distilled list alongside the original file.
-
-*   **`2-startcore/full-agentic-workflow.py`**
-    **Functional Description:** A Unified Local LLM Orchestrator Engine that handles hyper-granular decomposition, parallel dispatch across worker nodes, artifact harvesting, and final synthesis.
-    **Internal Workings:** It implements a multi-phase architecture: 1) Uses an Orchestrator model to break a complex query into atomic pieces. 2) Saves these pieces to disk in a timestamped run directory. 3) Utilizing Python's `concurrent.futures`, it dispatches tasks across multiple parallel worker endpoints, explicitly extracting and saving generated file artifacts. 4) Synthesizes all worker outputs and artifacts into a cohesive final document using the Orchestrator model.
-
-*   **`2-startcore/generate-macrotask.py`**
+*   **`2-startcore/0-generate-macrotask.py`**
     **Functional Description:** A utility script to stream the generation of large markdown documents or raw content using a local LLM based on a direct prompt or an input file.
     **Internal Workings:** It calls the local LLM endpoint with a system prompt optimized for expert technical writing. It streams the response to the console in real-time and ultimately saves the output as a distinct markdown file in a categorized `raw/` subdirectory with a safely generated timestamped filename.
 
+*   **`2-startcore/1-distill-macrotask.py`**
+    **Functional Description:** A script that uses an LLM to distill actionable tasks from dense or fluffy technical documents.
+    **Internal Workings:** Reads a specified text document and sends its content to an orchestrator-level LLM with a system prompt instructing it to extract only a clean, actionable markdown list of to-dos and requirements. It saves this distilled list alongside the original file.
+
+*   **`2-startcore/2-full-agentic-workflow.py`**
+    **Functional Description:** A Unified Local LLM Orchestrator Engine that handles hyper-granular decomposition, parallel dispatch across worker nodes, artifact harvesting, and final synthesis.
+    **Internal Workings:** It implements a multi-phase architecture: 1) Uses an Orchestrator model to break a complex query into atomic pieces. 2) Saves these pieces to disk in a timestamped run directory. 3) Utilizing Python's `concurrent.futures`, it dispatches tasks across multiple parallel worker endpoints, explicitly extracting and saving generated file artifacts. 4) Synthesizes all worker outputs and artifacts into a cohesive final document using the Orchestrator model.
+
+*   **`2-startcore/3-post_process_synthesis.py`**
+    **Functional Description:** Distributed Parallel Post-Processing Editorial Node (40k Context Optimized). Features Parallel Chunk Compression followed by a Global Consolidation Pass to holistically smooth the entire document, with Strict Placeholder Auditing.
+    **Internal Workings:** Implements parallel semantic deduplication of logical document chunks using multiple orchestrator endpoints to maintain a small context size. After chunk compression, it executes a global consolidation pass to smooth out transitions between sections and dynamically re-injects code blocks mapped via a protected artifact inventory to ensure no critical data is lost during the heavy markdown refinement.
+
 *   **`2-startcore/macrotask-example-prompt.txt`**
     **Functional Description:** A comprehensive, highly structured LLM prompt designed to elicit a deep, interdisciplinary synthesis combining agile project management, quantum mechanical computational principles, and llm wiki methodics.
-    **Internal Workings:** This text file provides a standardized, complex input that can be fed into `generate-macrotask.py` to test the agentic pipeline's ability to handle demanding, multi-faceted constraints and structure generation.
+    **Internal Workings:** This text file provides a standardized, complex input that can be fed into `2-startcore/0-generate-macrotask.py` to test the agentic pipeline's ability to handle demanding, multi-faceted constraints and structure generation.
 
 ### Agile Engine (`3-agilengine/`)
 
@@ -97,7 +101,7 @@ A collection of utilities and autonomous workflows for the ThereminQ project. Th
 To create a fully cohesive local AI ecosystem, start the scripts in the following logical sequence:
 
 1. **Infrastructure:** Execute `1-runinfra/start-zerg-swarm.sh` to ignite the underlying LLM swarm, ensuring all local API endpoints (e.g., ports 8030-8035) are online and ready to accept requests.
-2. **Orchestration:** Launch `2-startcore/full-agentic-workflow.py` to establish the master routing and task breakdown capabilities across the swarm.
+2. **Orchestration:** Launch `2-startcore/2-full-agentic-workflow.py` to establish the master routing and task breakdown capabilities across the swarm.
 3. **Project State & Knowledge:** Run `3-agilengine/AgenticAgile.py` to ingest new context and update the agile state (`project_state.json`).
 4. **Integrations & Interfaces:** Start bridge services like `9-misc/mcp-workspace-bridge.py` and `3-agilengine/Atlassian-suite.py` to expose local state to external tools, and run `9-misc/local-discord-bot.py` to provide a conversational interface.
 5. **On-Demand Utilities:** Use scripts like `9-misc/deep-local-research.py`, `9-misc/git-compare-and-merge.py`, or `5-viz/a1111-status-visualizer.py` as needed for specific tasks, leveraging the established infrastructure.
