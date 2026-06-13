@@ -5,6 +5,17 @@
 
 A collection of utilities and autonomous workflows for the ThereminQ project. This repo acts as the nexus for AI-driven automation, bridging project management, deep research, workspace synchronization, and generative reporting.
 
+### VDI Environment
+
+To run the VDI environment, you can use the following command:
+
+```bash
+docker run --gpus all --device=/dev/kfd --device=/dev/dri:/dev/dri -p 6080:6080 -d twobombs/thereminq-tensors:jupyter
+```
+
+It is a good safety measure to run Inference engines inside a container as well because of the preinstalled tooling and guardrails provided by the Docker engine
+
+
 ## Scripts
 
 ### Build & Infrastructure (`0-build/`, `1-runinfra/`)
