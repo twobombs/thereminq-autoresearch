@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Distributed Parallel Post-Processing Editorial Node (40k Context Optimized).
 Features Parallel Chunk Compression followed by a Global Consolidation Pass 
@@ -12,6 +13,7 @@ import time
 import queue
 import concurrent.futures
 from pathlib import Path
+from typing import Tuple, List, Dict
 from openai import OpenAI
 
 # ==============================================================================
@@ -37,24 +39,23 @@ CONCURRENT_SLOTS_PER_ENDPOINT = 1
 # Core Processing Logic
 # ==============================================================================
 
-def extract_and_protect_blocks(markdown_text: str) -> tuple:
+def extract_and_protect_blocks(markdown_text: str) -> Tuple[str, Dict[str, str]]:
     protected_blocks = {}
     block_counter = 0
 
-    # 1. Protect Code Blocks
-    code_pattern = re.compile(r'```[\s\S]*?```')
-    for match in code_pattern.finditer(markdown_text):
+    # 1. Protect Code Blocks using a robust replacement function
+    def replacer(match: re.Match) -> str:
+        nonlocal block_counter
         placeholder = f"[[PROTECTED_CODE_BLOCK_{block_counter:03d}]]"
         protected_blocks[placeholder] = match.group(0)
         block_counter += 1
+        return placeholder
 
-    text_without_code = code_pattern.sub(
-        lambda m: f"[[PROTECTED_CODE_BLOCK_{(block_counter - len(protected_blocks) + list(protected_blocks.values()).index(m.group(0))):03d}]]", 
-        markdown_text
-    )
+    code_pattern = re.compile(r'```[\s\S]*?```')
+    text_without_code = code_pattern.sub(replacer, markdown_text)
 
-    # 2. Protect Worker Telemetry Table
-    table_pattern = re.compile(r'## 📊 Worker Execution Statistics[\s\S]*')
+    # 2. Protect Worker Telemetry Table (Strict ASCII regex)
+    table_pattern = re.compile(r'##.*Worker Execution Statistics[\s\S]*')
     table_match = table_pattern.search(text_without_code)
     
     if table_match:
@@ -64,7 +65,7 @@ def extract_and_protect_blocks(markdown_text: str) -> tuple:
 
     return text_without_code, protected_blocks
 
-def split_into_logical_chunks(text: str, max_chars: int) -> list:
+def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
     chunks = []
     current_chunk = ""
     sections = re.split(r'(?=\n## )', text)
@@ -79,10 +80,12 @@ def split_into_logical_chunks(text: str, max_chars: int) -> list:
                     if len(current_chunk) + len(p) < max_chars:
                         current_chunk += p + "\n\n"
                     else:
-                        if current_chunk.strip(): chunks.append(current_chunk.strip())
+                        if current_chunk.strip(): 
+                            chunks.append(current_chunk.strip())
                         current_chunk = p + "\n\n"
             else:
-                if current_chunk.strip(): chunks.append(current_chunk.strip())
+                if current_chunk.strip(): 
+                    chunks.append(current_chunk.strip())
                 current_chunk = section
 
     if current_chunk.strip():
@@ -150,7 +153,7 @@ def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, en
         print(f"    [!] [{slot_name}] API Error on Chunk {chunk_id:02d}: {e}")
         return chunk_text
 
-def parallel_edit_chunks(chunks: list) -> str:
+def parallel_edit_chunks(chunks: List[str]) -> str:
     total_chunks = len(chunks)
     
     endpoint_queue = queue.Queue()
@@ -161,7 +164,7 @@ def parallel_edit_chunks(chunks: list) -> str:
             endpoint_queue.put((ep, slot_name))
 
     total_workers = endpoint_queue.qsize()
-    print(f"[3] 🚀 Dispatching {total_chunks} massive chunk(s) across {len(ORCHESTRATOR_ENDPOINTS)} endpoints ({total_workers} parallel slots)...", flush=True)
+    print(f"[3] Dispatching {total_chunks} massive chunk(s) across {len(ORCHESTRATOR_ENDPOINTS)} endpoints ({total_workers} parallel slots)...", flush=True)
     
     results = [""] * total_chunks
     
@@ -187,18 +190,18 @@ def parallel_edit_chunks(chunks: list) -> str:
                 
     return "\n\n".join(results)
 
-def global_consolidation_pass(full_skeleton: str, global_inventory: list, endpoint: str) -> str:
+def global_consolidation_pass(full_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
     """
     Takes the fully stitched (but compressed) document and runs it through the LLM 
     one final time to smooth out transitions between chunks and unify the document holistically.
     """
-    print(f"[4] 🌍 Executing Global Consolidation Pass (Holistic Smoothing)...", flush=True)
+    print(f"[4] Executing Global Consolidation Pass (Holistic Smoothing)...", flush=True)
     print(f"    -> Sending {len(full_skeleton):,} characters to Executive Node...", flush=True)
     
     client = OpenAI(
         base_url=endpoint,
         api_key=API_KEY,
-        timeout=1800.0, # Extended timeout for full document processing
+        timeout=1800.0,
         max_retries=1
     )
 
@@ -229,8 +232,8 @@ def global_consolidation_pass(full_skeleton: str, global_inventory: list, endpoi
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": full_skeleton}
             ],
-            temperature=0.2, # Slightly higher temperature for creative transition smoothing 
-            max_tokens=32768, # Massive output window to ensure it doesn't clip the final file
+            temperature=0.2,
+            max_tokens=32768,
             presence_penalty=0.1
         )
         final_text = response.choices[0].message.content.strip()
@@ -250,14 +253,13 @@ def global_consolidation_pass(full_skeleton: str, global_inventory: list, endpoi
         print(f"    [-] Falling back to the stitched chunk skeleton.")
         return full_skeleton
 
-def reassemble_document(distilled_text: str, protected_blocks: dict) -> str:
+def reassemble_document(distilled_text: str, protected_blocks: Dict[str, str]) -> str:
     final_text = distilled_text
     
     for placeholder, original_content in protected_blocks.items():
         if placeholder in final_text:
             final_text = final_text.replace(placeholder, original_content)
         else:
-            # Absolute Global Failsafe
             print(f"[!] Critical Warning: {placeholder} bypassed all recovery. Appending to absolute bottom.")
             final_text += f"\n\n### Orphaned Artifact\n{original_content}"
 
@@ -292,12 +294,28 @@ def main():
     print(f"[2] Analyzing context footprint...", flush=True)
     chunks = split_into_logical_chunks(skeleton_text, MAX_CHUNK_CHARS)
     
+    # --------------------------------------------------------------------------
+    # Document Size Bypass: Skip refinement if the file is short enough
+    # --------------------------------------------------------------------------
+    if len(chunks) <= 1:
+        print(f"    [!] Document fits within a single chunk ({len(raw_markdown):,} chars). Skipping LLM refinement.")
+        print("[3] Saving unaltered document as-is...", flush=True)
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(raw_markdown)
+
+        print("\n==============================================================================")
+        print("POST-PROCESSING COMPLETE (BYPASSED)")
+        print(f"    Unaltered File Saved To: {output_path.absolute()}")
+        print("==============================================================================\n")
+        return
+    # --------------------------------------------------------------------------
+
     # Phase 3: Parallel Chunk Compression
     distilled_skeleton = parallel_edit_chunks(chunks)
     
     # Phase 4: Global Consolidation Pass
     global_inventory = list(protected_assets.keys())
-    # Route the global pass to the first available Orchestrator node
     final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
     
     # Phase 5: Code Re-injection
@@ -308,9 +326,9 @@ def main():
         f.write(final_polished_markdown)
 
     print("\n==============================================================================")
-    print("✨ POST-PROCESSING COMPLETE ✨")
-    print(f"    📂 Cleaned File Saved To: {output_path.absolute()}")
-    print(f"    📉 Size Reduction:        {len(raw_markdown):,} chars -> {len(final_polished_markdown):,} chars")
+    print("POST-PROCESSING COMPLETE")
+    print(f"    Cleaned File Saved To: {output_path.absolute()}")
+    print(f"    Size Reduction:        {len(raw_markdown):,} chars -> {len(final_polished_markdown):,} chars")
     print("==============================================================================\n")
 
 if __name__ == "__main__":
