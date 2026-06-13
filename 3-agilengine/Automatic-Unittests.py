@@ -169,7 +169,7 @@ def _sanitize_requirements_file(filepath: Path) -> None:
 # Phase 1 - extraction
 # ---------------------------------------------------------------------
 
-def extract_code_blocks(md_content: str, output_dir: str) -> list:
+def extract_code_blocks(md_content: str, output_dir: str | Path) -> list:
     """
     Parses a Markdown string, extracts code blocks, identifies their intended
     filenames based on context heuristics, and writes them to a local directory.
@@ -542,10 +542,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    MARKDOWN_SOURCE = args.source_file
-    OUTPUT_WORKSPACE = "./extracted_workspace"
-    TEST_OUTPUT_DIR = Path(OUTPUT_WORKSPACE) / "tests"
-    REPORT_OUTPUT_DIR = Path(OUTPUT_WORKSPACE) / "reports"
+    # Resolve the target input file to an absolute path
+    source_path = Path(args.source_file).resolve()
+
+    if not source_path.exists():
+        print(f"Error: Could not find {source_path}. Please ensure the file exists and the path is correct.")
+        exit(1)
+
+    # Dynamic Workspace generation based on the source file location
+    OUTPUT_WORKSPACE = source_path.parent / f"{source_path.stem}_workspace"
+    TEST_OUTPUT_DIR = OUTPUT_WORKSPACE / "tests"
+    REPORT_OUTPUT_DIR = OUTPUT_WORKSPACE / "reports"
 
     # Queue tokens dictate how many concurrent threads can hit a given endpoint
     endpoint_concurrency = args.concurrency
@@ -556,158 +563,156 @@ if __name__ == "__main__":
         for _ in range(endpoint_concurrency):
             endpoint_queue.put(ep)
 
-    if not os.path.exists(MARKDOWN_SOURCE):
-        print(f"Error: Could not find {MARKDOWN_SOURCE}. Please ensure the file exists and the path is correct.")
+    with open(source_path, "r", encoding="utf-8") as fh:
+        md_content = fh.read()
+
+    # ---------------- Phase 1 ------------------------------
+    print(f"Sourcing artifacts from: {source_path}")
+    print(f"Workspace mapped to: {OUTPUT_WORKSPACE}")
+    print("=== Phase 1: Local Extraction ===")
+    artifacts = extract_code_blocks(md_content, OUTPUT_WORKSPACE)
+
+    # ---------------- Phase 2 ------------------------------
+    print(f"\n=== Phase 2: Parallelised Test Generation ===")
+    print(f"{len(artifacts)} artifacts extracted.")
+    print(f"Initialising ThreadPoolExecutor with {total_gen_workers} workers ({endpoint_concurrency} per endpoint)...")
+
+    progress_lock = threading.Lock()
+    progress_counter = [0, len(artifacts)]
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_gen_workers)
+    futures = []
+    generated_tests: list[dict] = []
+
+    try:
+        futures = [
+            executor.submit(
+                request_unittests_from_worker,
+                artifact,
+                endpoint_queue,
+                TEST_OUTPUT_DIR,
+                progress_lock,
+                progress_counter,
+            )
+            for artifact in artifacts
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                test_meta = future.result()
+                if test_meta:
+                    generated_tests.append(test_meta)
+            except Exception as exc:
+                print(f"Unhandled exception in worker thread: {exc}")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted - cancelling pending tasks...")
+        for f in futures:
+            f.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # ---------------- Phase 2.5 - Dependency Resolution ----------------
+    print("\n=== Phase 2.5: Dependency Resolution ===")
+    req_files = [a for a in artifacts if "requirements" in a["filename"].lower() and a["filename"].endswith(".txt")]
+    if not req_files:
+        print("No requirements.txt files found to install.")
     else:
-        with open(MARKDOWN_SOURCE, "r", encoding="utf-8") as fh:
-            md_content = fh.read()
+        for req in req_files:
+            req_path = Path(req["filepath"]).resolve()
+            print(f"Installing dependencies from {req['filename']}...")
+            
+            # Sanitize out any LLM hallucinated conversational sentences before executing pip
+            _sanitize_requirements_file(req_path)
+            
+            try:
+                res = subprocess.run(
+                    ["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120
+                )
+                if res.returncode == 0:
+                    print(f"Successfully installed {req['filename']}")
+                else:
+                    print(f"Warning: pip install failed for {req['filename']}\n{res.stderr.strip()}")
+            except Exception as e:
+                print(f"Failed to execute pip install for {req['filename']}: {e}")
 
-        # ---------------- Phase 1 ------------------------------
-        print(f"Sourcing artifacts from: {MARKDOWN_SOURCE}")
-        print("=== Phase 1: Local Extraction ===")
-        artifacts = extract_code_blocks(md_content, OUTPUT_WORKSPACE)
+    # ---------------- Phase 3 ------------------------------
+    print("\n=== Phase 3: Functional Test Execution ===")
+    execution_results: list[dict] = []
 
-        # ---------------- Phase 2 ------------------------------
-        print(f"\n=== Phase 2: Parallelised Test Generation ===")
-        print(f"{len(artifacts)} artifacts extracted.")
-        print(f"Initialising ThreadPoolExecutor with {total_gen_workers} workers ({endpoint_concurrency} per endpoint)...")
+    if not generated_tests:
+        print("No valid test suites were successfully generated to execute.")
+    else:
+        print(f"Running {len(generated_tests)} test suites"
+              f" (up to {MAX_EXEC_WORKERS} parallel)...")
 
-        progress_lock = threading.Lock()
-        progress_counter = [0, len(artifacts)]
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_gen_workers)
-        futures = []
-        generated_tests: list[dict] = []
+        exec_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_EXEC_WORKERS)
+        exec_futures = []
 
         try:
-            futures = [
-                executor.submit(
-                    request_unittests_from_worker,
-                    artifact,
-                    endpoint_queue,
-                    TEST_OUTPUT_DIR,
-                    progress_lock,
-                    progress_counter,
-                )
-                for artifact in artifacts
+            exec_futures = [
+                exec_executor.submit(execute_test_artifact, tm)
+                for tm in generated_tests
             ]
 
-            for future in concurrent.futures.as_completed(futures):
+            for future in concurrent.futures.as_completed(exec_futures):
                 try:
-                    test_meta = future.result()
-                    if test_meta:
-                        generated_tests.append(test_meta)
+                    res = future.result()
+                    execution_results.append(res)
+                    print(f"Executed: {res['filename']} -> {res['status']}")
                 except Exception as exc:
-                    print(f"Unhandled exception in worker thread: {exc}")
+                    print(f"Unhandled exception during test execution: {exc}")
 
         except KeyboardInterrupt:
-            print("\nInterrupted - cancelling pending tasks...")
-            for f in futures:
+            print("\nInterrupted - cancelling pending executions...")
+            for f in exec_futures:
                 f.cancel()
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            exec_executor.shutdown(wait=False, cancel_futures=True)
 
-        # ---------------- Phase 2.5 - Dependency Resolution ----------------
-        print("\n=== Phase 2.5: Dependency Resolution ===")
-        req_files = [a for a in artifacts if "requirements" in a["filename"].lower() and a["filename"].endswith(".txt")]
-        if not req_files:
-            print("No requirements.txt files found to install.")
-        else:
-            for req in req_files:
-                req_path = Path(req["filepath"]).resolve()
-                print(f"Installing dependencies from {req['filename']}...")
-                
-                # Sanitize out any LLM hallucinated conversational sentences before executing pip
-                _sanitize_requirements_file(req_path)
-                
-                try:
-                    res = subprocess.run(
-                        ["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
-                        capture_output=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=120
-                    )
-                    if res.returncode == 0:
-                        print(f"Successfully installed {req['filename']}")
-                    else:
-                        print(f"Warning: pip install failed for {req['filename']}\n{res.stderr.strip()}")
-                except Exception as e:
-                    print(f"Failed to execute pip install for {req['filename']}: {e}")
+    # ---------------- Report -------------------------------
+    if execution_results:
+        passed_count  = sum(1 for r in execution_results if r["status"] == "PASSED")
+        failed_count  = sum(1 for r in execution_results if r["status"] in ("FAILED", "COMPILE_ERROR"))
+        error_count   = sum(1 for r in execution_results if r["status"] not in ("PASSED", "FAILED", "COMPILE_ERROR"))
 
-        # ---------------- Phase 3 ------------------------------
-        print("\n=== Phase 3: Functional Test Execution ===")
-        execution_results: list[dict] = []
+        print("\n" + "=" * 90)
+        print(f"{'AUTOMATED TEST RUN PIPELINE REPORT':^90}")
+        print("=" * 90)
+        print(f"{'Generated Test File':<35} | {'Lang':<6} | {'Status':<13} | {'Details / Error Context'}")
+        print("-" * 90)
 
-        if not generated_tests:
-            print("No valid test suites were successfully generated to execute.")
-        else:
-            print(f"Running {len(generated_tests)} test suites"
-                  f" (up to {MAX_EXEC_WORKERS} parallel)...")
+        for r in execution_results:
+            msg_summary = r["message"][:32] + "..." if len(r["message"]) > 35 else r["message"]
+            print(f"{r['filename']:<35} | {r['language']:<6} | {r['status']:<13} | {msg_summary}")
 
-            exec_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_EXEC_WORKERS)
-            exec_futures = []
+        print("-" * 90)
+        print(
+            f"TOTAL RUNS: {len(execution_results)}  |  "
+            f"PASSED: {passed_count}  |  "
+            f"FAILED/COMPILE: {failed_count}  |  "
+            f"ERRORS: {error_count}"
+        )
+        print("=" * 90)
 
-            try:
-                exec_futures = [
-                    exec_executor.submit(execute_test_artifact, tm)
-                    for tm in generated_tests
-                ]
+        REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        json_report_path = REPORT_OUTPUT_DIR / "execution_report.json"
+        csv_report_path  = REPORT_OUTPUT_DIR / "execution_report.csv"
 
-                for future in concurrent.futures.as_completed(exec_futures):
-                    try:
-                        res = future.result()
-                        execution_results.append(res)
-                        print(f"Executed: {res['filename']} -> {res['status']}")
-                    except Exception as exc:
-                        print(f"Unhandled exception during test execution: {exc}")
+        with open(json_report_path, "w", encoding="utf-8") as f:
+            json.dump(execution_results, f, indent=4)
 
-            except KeyboardInterrupt:
-                print("\nInterrupted - cancelling pending executions...")
-                for f in exec_futures:
-                    f.cancel()
-            finally:
-                exec_executor.shutdown(wait=False, cancel_futures=True)
+        with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS)
+            writer.writeheader()
+            writer.writerows(execution_results)
 
-        # ---------------- Report -------------------------------
-        if execution_results:
-            passed_count  = sum(1 for r in execution_results if r["status"] == "PASSED")
-            failed_count  = sum(1 for r in execution_results if r["status"] in ("FAILED", "COMPILE_ERROR"))
-            error_count   = sum(1 for r in execution_results if r["status"] not in ("PASSED", "FAILED", "COMPILE_ERROR"))
+        print(f"\nReports saved to:")
+        print(f"    - {json_report_path}")
+        print(f"    - {csv_report_path}")
 
-            print("\n" + "=" * 90)
-            print(f"{'AUTOMATED TEST RUN PIPELINE REPORT':^90}")
-            print("=" * 90)
-            print(f"{'Generated Test File':<35} | {'Lang':<6} | {'Status':<13} | {'Details / Error Context'}")
-            print("-" * 90)
-
-            for r in execution_results:
-                msg_summary = r["message"][:32] + "..." if len(r["message"]) > 35 else r["message"]
-                print(f"{r['filename']:<35} | {r['language']:<6} | {r['status']:<13} | {msg_summary}")
-
-            print("-" * 90)
-            print(
-                f"TOTAL RUNS: {len(execution_results)}  |  "
-                f"PASSED: {passed_count}  |  "
-                f"FAILED/COMPILE: {failed_count}  |  "
-                f"ERRORS: {error_count}"
-            )
-            print("=" * 90)
-
-            REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            json_report_path = REPORT_OUTPUT_DIR / "execution_report.json"
-            csv_report_path  = REPORT_OUTPUT_DIR / "execution_report.csv"
-
-            with open(json_report_path, "w", encoding="utf-8") as f:
-                json.dump(execution_results, f, indent=4)
-
-            with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS)
-                writer.writeheader()
-                writer.writerows(execution_results)
-
-            print(f"\nReports saved to:")
-            print(f"    - {json_report_path}")
-            print(f"    - {csv_report_path}")
-
-        print("\n=== Pipeline execution complete ===")
+    print("\n=== Pipeline execution complete ===")
