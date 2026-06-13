@@ -13,7 +13,8 @@ To run the VDI environment, you can use the following command:
 docker run --gpus all --device=/dev/kfd --device=/dev/dri:/dev/dri -p 6080:6080 -d twobombs/thereminq-tensors:jupyter
 ```
 
-It is a good safety measure to run Inference engines inside a container as well because of the preinstalled tooling and guardrails provided by the Docker engine
+It is a good safety measure to run Inference engines inside a container because 
+- preinstalled tooling and guardrails provided by the Docker engine
 
 
 ## Scripts
