@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import sys
 import time
 import random
 import queue
@@ -10,6 +11,7 @@ import subprocess
 import json
 import csv
 import argparse
+import tempfile
 from pathlib import Path, PurePosixPath
 
 import requests
@@ -83,8 +85,15 @@ def _safe_output_path(detected_filename: str, output_dir: Path) -> Path:
 
 
 def _strip_markdown_fences(text: str) -> str:
-    """Remove opening and closing Markdown code fences from model output."""
-    return re.sub(r'^```[^\n]*\n?|```\s*$', '', text.strip())
+    """
+    Remove all opening and closing Markdown code fences from model output.
+    Handles nested or multiple fences that some quantized models emit.
+    """
+    # Strip all opening fences (``` optionally followed by a language tag)
+    text = re.sub(r'^```[^\n]*\n?', '', text.strip(), flags=re.MULTILINE)
+    # Strip all closing fences
+    text = re.sub(r'^```\s*$', '', text.strip(), flags=re.MULTILINE)
+    return text.strip()
 
 
 def _extract_error_line(output: str, lang: str) -> str:
@@ -97,16 +106,19 @@ def _extract_error_line(output: str, lang: str) -> str:
 
     # Filter out useless pytest summary lines so they don't hijack the fallback
     filtered_lines = [l for l in lines if not re.match(r'^\d+ (failed|error|passed|warning|deselected)', l.strip())]
+
+    # FIX: if all lines were summary lines, return a meaningful sentinel rather
+    # than falling back to a summary line that carries no actionable context.
     if not filtered_lines:
-        filtered_lines = lines  # Fallback if somehow everything was filtered
-        
+        return "(pytest summary only — no error detail captured)"
+
     if lang in ("python", "py"):
         # 1. Pytest 'E ' prefix
         for line in filtered_lines:
             if line.strip().startswith("E "):
                 return line.strip()[2:].strip()
-        
-        # 2. Standard Exception naming conventions (e.g. ValueError:, SyntaxError:, ImportError:)
+
+        # 2. Standard Exception naming conventions
         err_regex = re.compile(r'^([A-Z][a-zA-Z0-9_]+Error|[A-Z][a-zA-Z0-9_]+Exception|Exception|FAIL:|ERROR:)( |:)')
         for line in filtered_lines:
             if err_regex.match(line.strip()):
@@ -121,8 +133,7 @@ def _extract_error_line(output: str, lang: str) -> str:
         # Compiler errors: first line is usually the most specific
         return filtered_lines[0].strip()
 
-    # 4. Fallback for all languages: grab the last 2 non-empty lines. 
-    # This provides context (file/line number + code snippet) when standard parsers fail.
+    # 4. Fallback: grab the last 2 non-empty lines for context
     if len(filtered_lines) >= 2:
         return f"{filtered_lines[-2].strip()} | {filtered_lines[-1].strip()}"
     return filtered_lines[-1].strip()
@@ -137,30 +148,55 @@ def _sanitize_requirements_file(filepath: Path) -> None:
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
+
         cleaned_lines = []
         valid_pip_operators = ['==', '>=', '<=', '~=', '<', '>', '!=', '@', '-r', '-e', '--', ';']
-        
+
         for line in lines:
             s_line = line.strip()
             # Keep empty lines and standard comments
             if not s_line or s_line.startswith('#'):
                 cleaned_lines.append(line)
                 continue
-            
+
             has_space = ' ' in s_line
             has_operator = any(op in s_line for op in valid_pip_operators)
-            
-            # If it has spaces but no valid pip syntax, it's almost certainly conversational bleed.
-            if has_space and not has_operator:
+
+            # FIX: A line like "--index-url https://... extra words" passes the
+            # original has_operator check because '--' is in the operator list,
+            # but it is still malformed. Tighten the heuristic: if the line has
+            # spaces AND an operator, only keep it when every whitespace-delimited
+            # token that contains a space looks like a URL, environment marker,
+            # or a known pip flag — i.e. no bare English words follow the URL.
+            if has_space and has_operator:
+                tokens = s_line.split()
+                # First token must be a known pip flag, URL scheme, or package spec
+                first_tok = tokens[0]
+                looks_like_pip = (
+                    first_tok.startswith('-')          # flag like --index-url, -r, -e
+                    or '://' in first_tok              # direct URL
+                    or re.match(r'^[A-Za-z0-9_\-\.]+', first_tok)  # package name
+                )
+                # If there are tokens beyond the first two (flag + value) and they
+                # look like plain English words (no operators, no URLs), strip the line.
+                extra_tokens = tokens[2:] if len(tokens) > 2 else []
+                has_plain_english_suffix = any(
+                    not re.search(r'[=<>!~@;:/]', tok) and tok.isalpha() and len(tok) > 2
+                    for tok in extra_tokens
+                )
+                if not looks_like_pip or has_plain_english_suffix:
+                    print(f"Stripped hallucinated requirement line: '{s_line}'")
+                    continue
+            elif has_space and not has_operator:
+                # Spaces with no pip operators at all: definitely conversational bleed.
                 print(f"Stripped hallucinated requirement line: '{s_line}'")
                 continue
-                
+
             cleaned_lines.append(line)
-            
+
         with open(filepath, 'w', encoding='utf-8') as f:
             f.writelines(cleaned_lines)
-            
+
     except Exception as e:
         print(f"Warning: Could not sanitize requirements file {filepath}: {e}")
 
@@ -198,16 +234,29 @@ def extract_code_blocks(md_content: str, output_dir: str | Path) -> list:
             continue
 
         header_match = re.match(r'^###?\s+([a-zA-Z0-9_\-\.]+.*)$', line)
-        if header_match:
+        if header_match and not in_block:
             potential_name = header_match.group(1).strip()
-            
+
             # Look for embedded filenames inside parens or backticks
             embedded_match = re.search(r'[\(\`]([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)[\)\`]', potential_name)
             if embedded_match:
-                detected_filename = embedded_match.group(1)
+                candidate = embedded_match.group(1)
             elif "." in potential_name or potential_name.lower() in ("dockerfile", "makefile"):
-                detected_filename = potential_name
-                
+                candidate = potential_name
+            else:
+                candidate = None
+
+            # FIX: warn when a previously detected filename is about to be
+            # clobbered by a new header before any fence has opened.
+            if candidate is not None:
+                if detected_filename is not None and detected_filename != candidate:
+                    print(
+                        f"WARNING: detected_filename '{detected_filename}' overwritten by "
+                        f"header '{candidate}' before a code fence opened. "
+                        f"The earlier filename will be lost."
+                    )
+                detected_filename = candidate
+
             last_header = potential_name
             i += 1
             continue
@@ -313,7 +362,7 @@ def request_unittests_from_worker(
 
     endpoint_url = endpoint_queue.get()
     port = endpoint_url.split(":")[-1].split("/")[0]
-    
+
     try:
         print(f"Thread started for {artifact['filename']} -> Dispatching to worker on port {port}")
 
@@ -331,11 +380,11 @@ def request_unittests_from_worker(
         payload = {
             "messages": [
                 {
-                    "role": "system", 
+                    "role": "system",
                     "content": "You are a highly efficient code testing assistant. Write succinct, compact, and boilerplate-free unit tests. Use parametrization to consolidate test cases where applicable. Do not explain your code."
                 },
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": prompt
                 },
             ],
@@ -361,9 +410,21 @@ def request_unittests_from_worker(
                     break
 
                 test_code = choices[0].get("message", {}).get("content", "")
+
+                # FIX: treat empty content as a transient error and retry,
+                # rather than treating it as a permanent failure with break.
                 if not test_code:
-                    print(f"FAILED [{port}]: Empty content in response for {artifact['filename']}: {result}")
-                    break
+                    last_exception = RuntimeError(
+                        f"Empty content in response for {artifact['filename']}: {result}"
+                    )
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
+                        print(
+                            f"RETRY [{port}] attempt {attempt}/{MAX_RETRIES} for "
+                            f"{artifact['filename']} (empty content) in {delay:.1f}s"
+                        )
+                        time.sleep(delay)
+                    continue
 
                 test_code = _strip_markdown_fences(test_code)
 
@@ -401,7 +462,7 @@ def request_unittests_from_worker(
         return generation_metadata
 
     finally:
-        # GUARANTEE: The endpoint token is always returned to the queue 
+        # GUARANTEE: The endpoint token is always returned to the queue
         # even if an unhandled Python exception interrupts the block.
         endpoint_queue.put(endpoint_url)
 
@@ -416,7 +477,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
     a result dict suitable for JSON/CSV export.
     """
     lang = test_meta["language"].lower()
-    
+
     # Resolve paths to absolute to prevent cwd shifts from breaking file access
     test_path = Path(test_meta["test_filepath"]).resolve()
     artifact_path = Path(test_meta["artifact_filepath"]).resolve()
@@ -430,6 +491,13 @@ def execute_test_artifact(test_meta: dict) -> dict:
 
     try:
         if lang in ("python", "py"):
+            # FIX: use test_path.parent as cwd and inject it into PYTHONPATH so
+            # relative imports resolve correctly regardless of nesting depth.
+            env = os.environ.copy()
+            src_dir = str(test_path.parent)
+            existing_pypath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{src_dir}:{existing_pypath}" if existing_pypath else src_dir
+
             cmd = ["python", "-m", "pytest", "--tb=short", "-q", str(test_path)]
             start_time = time.time()
             res = subprocess.run(
@@ -438,7 +506,8 @@ def execute_test_artifact(test_meta: dict) -> dict:
                 encoding="utf-8",
                 errors="replace",
                 timeout=45,
-                cwd=str(test_path.parent.parent),
+                cwd=str(test_path.parent),
+                env=env,
             )
             duration = time.time() - start_time
 
@@ -469,24 +538,28 @@ def execute_test_artifact(test_meta: dict) -> dict:
                 result["message"] = _extract_error_line(res.stderr + res.stdout, lang)
 
         elif lang in ("c", "cpp"):
-            binary_path = test_path.with_suffix(".bin")
             compiler = "gcc" if lang == "c" else "g++"
 
-            compile_cmd = [compiler, str(artifact_path), str(test_path), "-o", str(binary_path)]
-            comp_res = subprocess.run(
-                compile_cmd,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-            )
-
-            if comp_res.returncode != 0:
-                result["status"] = "COMPILE_ERROR"
-                result["message"] = _extract_error_line(comp_res.stderr, lang)
-                return result
+            # FIX: use a temp file for the binary to avoid path collisions when
+            # two artifacts share the same stem (e.g. utils.c and utils.cpp).
+            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+                binary_path = Path(tmp.name)
 
             try:
+                compile_cmd = [compiler, str(artifact_path), str(test_path), "-o", str(binary_path)]
+                comp_res = subprocess.run(
+                    compile_cmd,
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=20,
+                )
+
+                if comp_res.returncode != 0:
+                    result["status"] = "COMPILE_ERROR"
+                    result["message"] = _extract_error_line(comp_res.stderr, lang)
+                    return result
+
                 start_time = time.time()
                 res = subprocess.run(
                     [str(binary_path)],
@@ -547,7 +620,9 @@ if __name__ == "__main__":
 
     if not source_path.exists():
         print(f"Error: Could not find {source_path}. Please ensure the file exists and the path is correct.")
-        exit(1)
+        # FIX: sys.exit flushes buffers correctly in all implementations;
+        # bare exit() is a REPL convenience and not appropriate here.
+        sys.exit(1)
 
     # Dynamic Workspace generation based on the source file location
     OUTPUT_WORKSPACE = source_path.parent / f"{source_path.stem}_workspace"
@@ -621,10 +696,10 @@ if __name__ == "__main__":
         for req in req_files:
             req_path = Path(req["filepath"]).resolve()
             print(f"Installing dependencies from {req['filename']}...")
-            
+
             # Sanitize out any LLM hallucinated conversational sentences before executing pip
             _sanitize_requirements_file(req_path)
-            
+
             try:
                 res = subprocess.run(
                     ["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
@@ -706,8 +781,10 @@ if __name__ == "__main__":
         with open(json_report_path, "w", encoding="utf-8") as f:
             json.dump(execution_results, f, indent=4)
 
+        # FIX: extrasaction='ignore' prevents DictWriter from raising if result
+        # dicts ever acquire extra debugging keys during future development.
         with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS)
+            writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(execution_results)
 
