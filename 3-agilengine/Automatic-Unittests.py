@@ -17,16 +17,28 @@ import requests
 # =====================================================================
 # CONFIGURABLE WORKER ENDPOINTS
 # Map these ports to your llama.cpp instances bound to specific GPUs.
-# For example, across a dual-socket H11DSi board running a 6-GPU mesh:
 # =====================================================================
 WORKER_ENDPOINTS = [
-    "http://192.168.2.137:8034/v1/chat/completions",  # Target: GPU 4
-    "http://192.168.2.137:8035/v1/chat/completions",  # Target: GPU 5
+    "http://192.168.2.137:8034/v1/chat/completions",  # Target: GPU 0
+    "http://192.168.2.137:8035/v1/chat/completions",  # Target: GPU 1
 ]
 
 # Configurable multiplier for concurrent requests per endpoint.
 # Increase this if your inference server supports continuous batching.
 CONCURRENT_REQS_PER_ENDPOINT = 2
+
+# Maximum output tokens for the generated test suites.
+# Scaled up to support large >= 40k context window configurations.
+MAX_OUTPUT_TOKENS = 16384
+
+# =====================================================================
+# LLM INFERENCE GUARDRAILS
+# Tuned to prevent hallucination and looping in local models.
+# =====================================================================
+LLM_TEMPERATURE = 0.1          # Keep low for precision code generation
+LLM_TOP_P = 0.95               # Truncate lowest probability tokens to prevent wild hallucinations
+LLM_FREQUENCY_PENALTY = 0.5    # Aggressively penalize repeating the same tokens (anti-looping)
+LLM_PRESENCE_PENALTY = 0.2     # Encourage moving on to new concepts/functions
 
 # Retry configuration for worker requests
 MAX_RETRIES = 3
@@ -78,27 +90,79 @@ def _strip_markdown_fences(text: str) -> str:
 def _extract_error_line(output: str, lang: str) -> str:
     """
     Return the most actionable error line from combined stderr+stdout.
-
-    Strategy: scan for known failure-signal prefixes first; fall back to the
-    last non-empty line only if nothing more specific is found.
     """
     lines = [l for l in output.splitlines() if l.strip()]
     if not lines:
         return "no output"
 
+    # Filter out useless pytest summary lines so they don't hijack the fallback
+    filtered_lines = [l for l in lines if not re.match(r'^\d+ (failed|error|passed|warning|deselected)', l.strip())]
+    if not filtered_lines:
+        filtered_lines = lines  # Fallback if somehow everything was filtered
+        
     if lang in ("python", "py"):
-        # Prefer the first FAIL:/ERROR: label, then any AssertionError line.
-        for prefix in ("FAIL:", "ERROR:", "AssertionError"):
-            for line in lines:
-                if line.strip().startswith(prefix):
-                    return line.strip()
+        # 1. Pytest 'E ' prefix
+        for line in filtered_lines:
+            if line.strip().startswith("E "):
+                return line.strip()[2:].strip()
+        
+        # 2. Standard Exception naming conventions (e.g. ValueError:, SyntaxError:, ImportError:)
+        err_regex = re.compile(r'^([A-Z][a-zA-Z0-9_]+Error|[A-Z][a-zA-Z0-9_]+Exception|Exception|FAIL:|ERROR:)( |:)')
+        for line in filtered_lines:
+            if err_regex.match(line.strip()):
+                return line.strip()
+
+        # 3. Pytest FAILED inline summary
+        for line in filtered_lines:
+            if line.strip().startswith("FAILED "):
+                return line.strip()
 
     if lang in ("c", "cpp"):
-        # Compiler errors: first line is usually the most specific.
-        return lines[0].strip()
+        # Compiler errors: first line is usually the most specific
+        return filtered_lines[0].strip()
 
-    # Bash and fallback: last line is generally fine.
-    return lines[-1].strip()
+    # 4. Fallback for all languages: grab the last 2 non-empty lines. 
+    # This provides context (file/line number + code snippet) when standard parsers fail.
+    if len(filtered_lines) >= 2:
+        return f"{filtered_lines[-2].strip()} | {filtered_lines[-1].strip()}"
+    return filtered_lines[-1].strip()
+
+
+def _sanitize_requirements_file(filepath: Path) -> None:
+    """
+    Strips LLM-hallucinated plain text sentences from a requirements.txt file.
+    Valid pip lines contain no spaces unless they involve specific operators
+    or environment markers.
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        cleaned_lines = []
+        valid_pip_operators = ['==', '>=', '<=', '~=', '<', '>', '!=', '@', '-r', '-e', '--', ';']
+        
+        for line in lines:
+            s_line = line.strip()
+            # Keep empty lines and standard comments
+            if not s_line or s_line.startswith('#'):
+                cleaned_lines.append(line)
+                continue
+            
+            has_space = ' ' in s_line
+            has_operator = any(op in s_line for op in valid_pip_operators)
+            
+            # If it has spaces but no valid pip syntax, it's almost certainly conversational bleed.
+            if has_space and not has_operator:
+                print(f"Stripped hallucinated requirement line: '{s_line}'")
+                continue
+                
+            cleaned_lines.append(line)
+            
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.writelines(cleaned_lines)
+            
+    except Exception as e:
+        print(f"Warning: Could not sanitize requirements file {filepath}: {e}")
 
 
 # ---------------------------------------------------------------------
@@ -136,8 +200,14 @@ def extract_code_blocks(md_content: str, output_dir: str) -> list:
         header_match = re.match(r'^###?\s+([a-zA-Z0-9_\-\.]+.*)$', line)
         if header_match:
             potential_name = header_match.group(1).strip()
-            if "." in potential_name or potential_name.lower() in ("dockerfile", "makefile"):
+            
+            # Look for embedded filenames inside parens or backticks
+            embedded_match = re.search(r'[\(\`]([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)[\)\`]', potential_name)
+            if embedded_match:
+                detected_filename = embedded_match.group(1)
+            elif "." in potential_name or potential_name.lower() in ("dockerfile", "makefile"):
                 detected_filename = potential_name
+                
             last_header = potential_name
             i += 1
             continue
@@ -176,6 +246,10 @@ def extract_code_blocks(md_content: str, output_dir: str) -> list:
                         else "Dockerfile"
                     )
                     file_counter += 1
+
+                # Sanitize the filename to ensure it is shell-safe and importable
+                detected_filename = re.sub(r'[()\[\]{}]', '', detected_filename)
+                detected_filename = detected_filename.replace(" ", "_")
 
                 file_path = _safe_output_path(detected_filename, output_path)
 
@@ -244,18 +318,32 @@ def request_unittests_from_worker(
         print(f"Thread started for {artifact['filename']} -> Dispatching to worker on port {port}")
 
         prompt = (
-            f"You are an expert software engineer. Write comprehensive unit tests for the following "
-            f"{artifact['language']} code. Ensure edge cases are covered. Output ONLY the test code.\n\n"
+            f"Write highly compact, succinct, and targeted unit tests for the following {artifact['language']} code.\n"
+            f"Focus ONLY on core functionality and critical paths. Minimize boilerplate aggressively.\n\n"
+            f"CRITICAL RULES:\n"
+            f"1. DO NOT hallucinate imports or use non-existent modules.\n"
+            f"2. Keep the code as short as possible while ensuring it runs and passes.\n"
+            f"3. Group assertions and use parametrization where possible to save space.\n"
+            f"4. Output ONLY valid test code inside a single markdown code block. No explanations.\n\n"
             f"File: {artifact['filename']}\n"
             f"```{artifact['language']}\n{artifact['content']}\n```"
         )
         payload = {
             "messages": [
-                {"role": "system", "content": "You are a specialized code testing assistant."},
-                {"role": "user", "content": prompt},
+                {
+                    "role": "system", 
+                    "content": "You are a highly efficient code testing assistant. Write succinct, compact, and boilerplate-free unit tests. Use parametrization to consolidate test cases where applicable. Do not explain your code."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                },
             ],
-            "temperature": 0.2,
-            "max_tokens": 2048,
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
+            "frequency_penalty": LLM_FREQUENCY_PENALTY,
+            "presence_penalty": LLM_PRESENCE_PENALTY,
+            "max_tokens": MAX_OUTPUT_TOKENS,
         }
 
         last_exception: Exception | None = None
@@ -263,7 +351,7 @@ def request_unittests_from_worker(
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.post(endpoint_url, json=payload, timeout=300)
+                response = requests.post(endpoint_url, json=payload, timeout=600)
                 response.raise_for_status()
                 result = response.json()
 
@@ -328,8 +416,10 @@ def execute_test_artifact(test_meta: dict) -> dict:
     a result dict suitable for JSON/CSV export.
     """
     lang = test_meta["language"].lower()
-    test_path = Path(test_meta["test_filepath"])
-    artifact_path = Path(test_meta["artifact_filepath"])
+    
+    # Resolve paths to absolute to prevent cwd shifts from breaking file access
+    test_path = Path(test_meta["test_filepath"]).resolve()
+    artifact_path = Path(test_meta["artifact_filepath"]).resolve()
 
     result = {
         "filename": test_meta["filename"],
@@ -516,6 +606,34 @@ if __name__ == "__main__":
                 f.cancel()
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # ---------------- Phase 2.5 - Dependency Resolution ----------------
+        print("\n=== Phase 2.5: Dependency Resolution ===")
+        req_files = [a for a in artifacts if "requirements" in a["filename"].lower() and a["filename"].endswith(".txt")]
+        if not req_files:
+            print("No requirements.txt files found to install.")
+        else:
+            for req in req_files:
+                req_path = Path(req["filepath"]).resolve()
+                print(f"Installing dependencies from {req['filename']}...")
+                
+                # Sanitize out any LLM hallucinated conversational sentences before executing pip
+                _sanitize_requirements_file(req_path)
+                
+                try:
+                    res = subprocess.run(
+                        ["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=120
+                    )
+                    if res.returncode == 0:
+                        print(f"Successfully installed {req['filename']}")
+                    else:
+                        print(f"Warning: pip install failed for {req['filename']}\n{res.stderr.strip()}")
+                except Exception as e:
+                    print(f"Failed to execute pip install for {req['filename']}: {e}")
 
         # ---------------- Phase 3 ------------------------------
         print("\n=== Phase 3: Functional Test Execution ===")
