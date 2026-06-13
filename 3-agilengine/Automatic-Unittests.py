@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import time
@@ -8,6 +9,7 @@ import concurrent.futures
 import subprocess
 import json
 import csv
+import argparse
 from pathlib import Path, PurePosixPath
 
 import requests
@@ -18,13 +20,13 @@ import requests
 # For example, across a dual-socket H11DSi board running a 6-GPU mesh:
 # =====================================================================
 WORKER_ENDPOINTS = [
-    "http://127.0.0.1:8080/v1/chat/completions",  # Target: GPU 0
-    "http://127.0.0.1:8081/v1/chat/completions",  # Target: GPU 1
-    "http://127.0.0.1:8082/v1/chat/completions",  # Target: GPU 2
-    "http://127.0.0.1:8083/v1/chat/completions",  # Target: GPU 3
-    "http://127.0.0.1:8084/v1/chat/completions",  # Target: GPU 4
-    "http://127.0.0.1:8085/v1/chat/completions",  # Target: GPU 5
+    "http://192.168.2.137:8034/v1/chat/completions",  # Target: GPU 4
+    "http://192.168.2.137:8035/v1/chat/completions",  # Target: GPU 5
 ]
+
+# Configurable multiplier for concurrent requests per endpoint.
+# Increase this if your inference server supports continuous batching.
+CONCURRENT_REQS_PER_ENDPOINT = 2
 
 # Retry configuration for worker requests
 MAX_RETRIES = 3
@@ -79,10 +81,6 @@ def _extract_error_line(output: str, lang: str) -> str:
 
     Strategy: scan for known failure-signal prefixes first; fall back to the
     last non-empty line only if nothing more specific is found.
-
-    FIX: the previous approach always took err_lines[-1], which for
-    `python -m unittest` is the summary line ("FAILED (failures=N)") rather
-    than the actual assertion message.
     """
     lines = [l for l in output.splitlines() if l.strip()]
     if not lines:
@@ -104,7 +102,7 @@ def _extract_error_line(output: str, lang: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# Phase 1 — extraction
+# Phase 1 - extraction
 # ---------------------------------------------------------------------
 
 def extract_code_blocks(md_content: str, output_dir: str) -> list:
@@ -184,7 +182,7 @@ def extract_code_blocks(md_content: str, output_dir: str) -> list:
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write(content + "\n")
 
-                print(f"[+] Extracted: {file_path.relative_to(output_path)} ({current_lang})")
+                print(f"Extracted: {file_path.relative_to(output_path)} ({current_lang})")
 
                 extracted_artifacts.append({
                     "filename": file_path.name,
@@ -211,7 +209,7 @@ def extract_code_blocks(md_content: str, output_dir: str) -> list:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content + "\n")
         print(
-            f"[!] WARNING: Unclosed code fence at end of document. "
+            f"WARNING: Unclosed code fence at end of document. "
             f"Partial content written to {fallback_name}"
         )
 
@@ -219,7 +217,7 @@ def extract_code_blocks(md_content: str, output_dir: str) -> list:
 
 
 # ---------------------------------------------------------------------
-# Phase 2 — parallel test generation
+# Phase 2 - parallel test generation
 # ---------------------------------------------------------------------
 
 def request_unittests_from_worker(
@@ -232,111 +230,102 @@ def request_unittests_from_worker(
     """
     Checks out an available endpoint from the queue, sends the payload to the
     local worker with exponential-backoff retry, writes the result, and returns
-    the endpoint to the queue.
-
-    Returns the generated test file metadata dict on success, or None on failure.
+    the endpoint to the queue securely via a finally block.
     """
     valid_langs = {"python", "py", "cpp", "c", "bash", "sh"}
     if artifact["language"].lower() not in valid_langs:
-        print(f"[-] Skipping generation for non-code artifact: {artifact['filename']}")
+        print(f"Skipping generation for non-code artifact: {artifact['filename']}")
         return None
 
     endpoint_url = endpoint_queue.get()
     port = endpoint_url.split(":")[-1].split("/")[0]
-    print(f"[*] Thread started for {artifact['filename']} -> Dispatching to worker on port {port}")
+    
+    try:
+        print(f"Thread started for {artifact['filename']} -> Dispatching to worker on port {port}")
 
-    prompt = (
-        f"You are an expert software engineer. Write comprehensive unit tests for the following "
-        f"{artifact['language']} code. Ensure edge cases are covered. Output ONLY the test code.\n\n"
-        f"File: {artifact['filename']}\n"
-        f"```{artifact['language']}\n{artifact['content']}\n```"
-    )
-    payload = {
-        "messages": [
-            {"role": "system", "content": "You are a specialized code testing assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 2048,
-    }
+        prompt = (
+            f"You are an expert software engineer. Write comprehensive unit tests for the following "
+            f"{artifact['language']} code. Ensure edge cases are covered. Output ONLY the test code.\n\n"
+            f"File: {artifact['filename']}\n"
+            f"```{artifact['language']}\n{artifact['content']}\n```"
+        )
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are a specialized code testing assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2048,
+        }
 
-    last_exception: Exception | None = None
-    generation_metadata: dict | None = None
+        last_exception: Exception | None = None
+        generation_metadata: dict | None = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.post(endpoint_url, json=payload, timeout=300)
-            response.raise_for_status()
-            result = response.json()
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = requests.post(endpoint_url, json=payload, timeout=300)
+                response.raise_for_status()
+                result = response.json()
 
-            choices = result.get("choices")
-            if not choices:
-                print(f"[!] FAILED [{port}]: Unexpected response body for {artifact['filename']}: {result}")
+                choices = result.get("choices")
+                if not choices:
+                    print(f"FAILED [{port}]: Unexpected response body for {artifact['filename']}: {result}")
+                    break
+
+                test_code = choices[0].get("message", {}).get("content", "")
+                if not test_code:
+                    print(f"FAILED [{port}]: Empty content in response for {artifact['filename']}: {result}")
+                    break
+
+                test_code = _strip_markdown_fences(test_code)
+
+                test_output_dir.mkdir(parents=True, exist_ok=True)
+                test_filename = f"test_{artifact['filename']}"
+                test_filepath = test_output_dir / test_filename
+
+                with open(test_filepath, "w", encoding="utf-8") as f:
+                    f.write(test_code + "\n")
+
+                with progress_lock:
+                    progress_counter[0] += 1
+                    done, total = progress_counter
+                    print(f"SUCCESS [{port}] ({done}/{total}): Tests for {artifact['filename']} -> {test_filename}")
+
+                generation_metadata = {
+                    "filename": test_filename,
+                    "test_filepath": str(test_filepath),
+                    "language": artifact["language"],
+                    "artifact_filepath": artifact["filepath"],
+                }
+                last_exception = None
                 break
 
-            test_code = choices[0].get("message", {}).get("content", "")
-            if not test_code:
-                print(f"[!] FAILED [{port}]: Empty content in response for {artifact['filename']}: {result}")
-                break
+            except requests.exceptions.RequestException as exc:
+                last_exception = exc
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
+                    print(f"RETRY [{port}] attempt {attempt}/{MAX_RETRIES} for {artifact['filename']} in {delay:.1f}s: {exc}")
+                    time.sleep(delay)
 
-            test_code = _strip_markdown_fences(test_code)
+        if last_exception is not None:
+            print(f"FAILED [{port}]: All {MAX_RETRIES} attempts exhausted for {artifact['filename']}: {last_exception}")
 
-            test_output_dir.mkdir(parents=True, exist_ok=True)
-            test_filename = f"test_{artifact['filename']}"
-            test_filepath = test_output_dir / test_filename
+        return generation_metadata
 
-            with open(test_filepath, "w", encoding="utf-8") as f:
-                f.write(test_code + "\n")
-
-            with progress_lock:
-                progress_counter[0] += 1
-                done, total = progress_counter
-                print(f"[+] SUCCESS [{port}] ({done}/{total}): Tests for {artifact['filename']} -> {test_filename}")
-
-            generation_metadata = {
-                "filename": test_filename,
-                # FIX: str() so json.dump never sees a PosixPath object.
-                "test_filepath": str(test_filepath),
-                "language": artifact["language"],
-                "artifact_filepath": artifact["filepath"],
-            }
-            last_exception = None
-            break
-
-        except requests.exceptions.RequestException as exc:
-            last_exception = exc
-            if attempt < MAX_RETRIES:
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
-                print(f"[~] RETRY [{port}] attempt {attempt}/{MAX_RETRIES} for {artifact['filename']} in {delay:.1f}s: {exc}")
-                time.sleep(delay)
-
-    if last_exception is not None:
-        print(f"[!] FAILED [{port}]: All {MAX_RETRIES} attempts exhausted for {artifact['filename']}: {last_exception}")
-
-    endpoint_queue.put(endpoint_url)
-    return generation_metadata
+    finally:
+        # GUARANTEE: The endpoint token is always returned to the queue 
+        # even if an unhandled Python exception interrupts the block.
+        endpoint_queue.put(endpoint_url)
 
 
 # ---------------------------------------------------------------------
-# Phase 3 — execution and validation
+# Phase 3 - execution and validation
 # ---------------------------------------------------------------------
 
 def execute_test_artifact(test_meta: dict) -> dict:
     """
     Runs the generated test file using language-appropriate tooling and returns
     a result dict suitable for JSON/CSV export.
-
-    Fixes applied vs. the original:
-      - Python: invokes pytest (portable) instead of passing a raw path to
-        unittest's CLI, which only works when CWD is the parent directory.
-      - C/C++ binary cleanup moved to a finally block so it runs on timeout,
-        crash, or any exception — not just on clean exit.
-      - All subprocess calls use explicit encoding="utf-8", errors="replace"
-        to avoid UnicodeDecodeError on non-UTF-8 locales.
-      - Execution timer for C/C++ starts after compilation succeeds, so the
-        reported duration reflects test runtime only.
-      - Error extraction uses _extract_error_line() which looks for actionable
-        signal lines before falling back to the last line.
     """
     lang = test_meta["language"].lower()
     test_path = Path(test_meta["test_filepath"])
@@ -351,11 +340,6 @@ def execute_test_artifact(test_meta: dict) -> dict:
 
     try:
         if lang in ("python", "py"):
-            # FIX: use pytest instead of `python -m unittest <path>`.
-            # pytest accepts file paths directly and doesn't require the file
-            # to be importable as a dotted module name from CWD.
-            # --tb=short gives a compact but actionable traceback.
-            # -q suppresses per-test dots so only failures print.
             cmd = ["python", "-m", "pytest", "--tb=short", "-q", str(test_path)]
             start_time = time.time()
             res = subprocess.run(
@@ -364,7 +348,6 @@ def execute_test_artifact(test_meta: dict) -> dict:
                 encoding="utf-8",
                 errors="replace",
                 timeout=45,
-                # Run from the workspace root so relative imports resolve.
                 cwd=str(test_path.parent.parent),
             )
             duration = time.time() - start_time
@@ -383,7 +366,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
                 ["bash", str(test_path)],
                 capture_output=True,
                 encoding="utf-8",
-                errors="replace",   # FIX: explicit encoding
+                errors="replace",
                 timeout=30,
             )
             duration = time.time() - start_time
@@ -404,7 +387,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
                 compile_cmd,
                 capture_output=True,
                 encoding="utf-8",
-                errors="replace",   # FIX: explicit encoding
+                errors="replace",
                 timeout=20,
             )
 
@@ -413,14 +396,13 @@ def execute_test_artifact(test_meta: dict) -> dict:
                 result["message"] = _extract_error_line(comp_res.stderr, lang)
                 return result
 
-            # FIX: start the execution timer only after compilation succeeds.
             try:
                 start_time = time.time()
                 res = subprocess.run(
                     [str(binary_path)],
                     capture_output=True,
                     encoding="utf-8",
-                    errors="replace",   # FIX: explicit encoding
+                    errors="replace",
                     timeout=30,
                 )
                 duration = time.time() - start_time
@@ -432,8 +414,6 @@ def execute_test_artifact(test_meta: dict) -> dict:
                     result["status"] = "FAILED"
                     result["message"] = _extract_error_line(res.stderr + res.stdout, lang)
             finally:
-                # FIX: clean up the binary regardless of exit code, timeout,
-                # or exception — previously only ran on clean exit.
                 if binary_path.exists():
                     binary_path.unlink()
 
@@ -456,34 +436,56 @@ def execute_test_artifact(test_meta: dict) -> dict:
 # ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    MARKDOWN_SOURCE = "POLISHED_SYNTHESIS.md"
+    parser = argparse.ArgumentParser(description="Parallelised LLM Test Generation and Execution Pipeline")
+    parser.add_argument(
+        "source_file",
+        type=str,
+        nargs="?",
+        default="POLISHED_SYNTHESIS.md",
+        help="Path to the input Markdown file (default: POLISHED_SYNTHESIS.md)"
+    )
+    parser.add_argument(
+        "-c", "--concurrency",
+        type=int,
+        default=CONCURRENT_REQS_PER_ENDPOINT,
+        help=f"Concurrent requests allowed per worker endpoint (default: {CONCURRENT_REQS_PER_ENDPOINT})"
+    )
+    args = parser.parse_args()
+
+    MARKDOWN_SOURCE = args.source_file
     OUTPUT_WORKSPACE = "./extracted_workspace"
     TEST_OUTPUT_DIR = Path(OUTPUT_WORKSPACE) / "tests"
     REPORT_OUTPUT_DIR = Path(OUTPUT_WORKSPACE) / "reports"
 
+    # Queue tokens dictate how many concurrent threads can hit a given endpoint
+    endpoint_concurrency = args.concurrency
+    total_gen_workers = len(WORKER_ENDPOINTS) * endpoint_concurrency
+
     endpoint_queue: queue.Queue = queue.Queue()
     for ep in WORKER_ENDPOINTS:
-        endpoint_queue.put(ep)
+        for _ in range(endpoint_concurrency):
+            endpoint_queue.put(ep)
 
     if not os.path.exists(MARKDOWN_SOURCE):
-        print(f"Error: Could not find {MARKDOWN_SOURCE}. Please ensure the file is in the current directory.")
+        print(f"Error: Could not find {MARKDOWN_SOURCE}. Please ensure the file exists and the path is correct.")
     else:
         with open(MARKDOWN_SOURCE, "r", encoding="utf-8") as fh:
             md_content = fh.read()
 
         # ---------------- Phase 1 ------------------------------
+        print(f"Sourcing artifacts from: {MARKDOWN_SOURCE}")
         print("=== Phase 1: Local Extraction ===")
         artifacts = extract_code_blocks(md_content, OUTPUT_WORKSPACE)
 
         # ---------------- Phase 2 ------------------------------
         print(f"\n=== Phase 2: Parallelised Test Generation ===")
-        print(f"[*] {len(artifacts)} artifacts extracted.")
-        print(f"[*] Initialising ThreadPoolExecutor with {len(WORKER_ENDPOINTS)} workers...")
+        print(f"{len(artifacts)} artifacts extracted.")
+        print(f"Initialising ThreadPoolExecutor with {total_gen_workers} workers ({endpoint_concurrency} per endpoint)...")
 
         progress_lock = threading.Lock()
         progress_counter = [0, len(artifacts)]
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(WORKER_ENDPOINTS))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_gen_workers)
         futures = []
         generated_tests: list[dict] = []
 
@@ -506,10 +508,10 @@ if __name__ == "__main__":
                     if test_meta:
                         generated_tests.append(test_meta)
                 except Exception as exc:
-                    print(f"[!] Unhandled exception in worker thread: {exc}")
+                    print(f"Unhandled exception in worker thread: {exc}")
 
         except KeyboardInterrupt:
-            print("\n[!] Interrupted - cancelling pending tasks...")
+            print("\nInterrupted - cancelling pending tasks...")
             for f in futures:
                 f.cancel()
         finally:
@@ -520,11 +522,9 @@ if __name__ == "__main__":
         execution_results: list[dict] = []
 
         if not generated_tests:
-            print("[-] No valid test suites were successfully generated to execute.")
+            print("No valid test suites were successfully generated to execute.")
         else:
-            # FIX: run executions in parallel — tests are independent.
-            # A separate, capped pool avoids spawning excessive compilers.
-            print(f"[*] Running {len(generated_tests)} test suites"
+            print(f"Running {len(generated_tests)} test suites"
                   f" (up to {MAX_EXEC_WORKERS} parallel)...")
 
             exec_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_EXEC_WORKERS)
@@ -540,12 +540,12 @@ if __name__ == "__main__":
                     try:
                         res = future.result()
                         execution_results.append(res)
-                        print(f"[*] Executed: {res['filename']} -> {res['status']}")
+                        print(f"Executed: {res['filename']} -> {res['status']}")
                     except Exception as exc:
-                        print(f"[!] Unhandled exception during test execution: {exc}")
+                        print(f"Unhandled exception during test execution: {exc}")
 
             except KeyboardInterrupt:
-                print("\n[!] Interrupted - cancelling pending executions...")
+                print("\nInterrupted - cancelling pending executions...")
                 for f in exec_futures:
                     f.cancel()
             finally:
@@ -583,14 +583,12 @@ if __name__ == "__main__":
             with open(json_report_path, "w", encoding="utf-8") as f:
                 json.dump(execution_results, f, indent=4)
 
-            # FIX: fieldnames are statically declared — no IndexError when
-            # execution_results happens to be empty at CSV-write time.
             with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS)
                 writer.writeheader()
                 writer.writerows(execution_results)
 
-            print(f"\n[*] Reports saved to:")
+            print(f"\nReports saved to:")
             print(f"    - {json_report_path}")
             print(f"    - {csv_report_path}")
 
