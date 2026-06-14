@@ -16,33 +16,44 @@ from pathlib import Path
 # Configuration & Directory Setup
 # ==============================================================================
 
-RAW_DIR = Path(os.getenv("RAW_DIR", "raw"))
-WIKI_DIR = Path(os.getenv("WIKI_DIR", "wiki"))
-
-RAW_DIR.mkdir(parents=True, exist_ok=True)
-WIKI_DIR.mkdir(parents=True, exist_ok=True)
-
-STATE_FILE = WIKI_DIR / "project_state.json"
-STATE_LOCK_FILE = WIKI_DIR / "project_state.lock"
-WIKI_SYNTHESIS_FILE = WIKI_DIR / "DAILY_SYNTHESIS.md"
-RAW_INDEX_FILE = WIKI_DIR / "RAWINDEX.md"
+# These will be dynamically initialized based on the CLI target path
+RAW_DIR = None
+WIKI_DIR = None
+STATE_FILE = None
+STATE_LOCK_FILE = None
+WIKI_SYNTHESIS_FILE = None
+RAW_INDEX_FILE = None
 
 VALID_STATES = {"active", "in_progress", "blocked", "completed", "invalid"}
 
-# Approximate character budget for existing-task context sent to the orchestrator.
-# Keeps prompt size predictable regardless of how many tasks accumulate.
-MAX_CONTEXT_CHARS = 8_000
+# Context Limits halved to prevent KV cache thrashing and TTFT bottlenecks
+# Orchestrator: Reduced from 120k to 60k chars
+ORCHESTRATOR_MAX_CHARS = 60000 
+# Worker: Reduced from 200k to 100k chars
+WORKER_CHUNK_CHARS = 100000
 
-# Updated logging format for a cleaner CLI interface
 logging.basicConfig(
     level=logging.INFO,
-    format="%(message)s",  # Removed timestamp/level from raw output for cleaner CLI progress tracking
+    format="%(message)s",
 )
 log = logging.getLogger(__name__)
 
 def timestamped_log(msg: str) -> str:
     """Helper to prepend just the time for specific logs while keeping formatting clean."""
     return f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+
+def init_paths(base_dir: Path) -> None:
+    """Dynamically initialize and create directories bound to the target project path."""
+    global RAW_DIR, WIKI_DIR, STATE_FILE, STATE_LOCK_FILE, WIKI_SYNTHESIS_FILE, RAW_INDEX_FILE
+    
+    RAW_DIR = base_dir
+    WIKI_DIR = base_dir / os.getenv("WIKI_DIR", "wiki")
+    WIKI_DIR.mkdir(parents=True, exist_ok=True)
+
+    STATE_FILE = WIKI_DIR / "project_state.json"
+    STATE_LOCK_FILE = WIKI_DIR / "project_state.lock"
+    WIKI_SYNTHESIS_FILE = WIKI_DIR / "DAILY_SYNTHESIS.md"
+    RAW_INDEX_FILE = WIKI_DIR / "RAWINDEX.md"
 
 # ==============================================================================
 # State & Index Management
@@ -102,8 +113,13 @@ def mark_file_processed(file_path: Path) -> None:
 # LLM Cluster & Session Management
 # ==============================================================================
 
-WORKER_ENDPOINTS = ["http://localhost:8033/v1/chat/completions"]
-ORCHESTRATOR_ENDPOINT = "http://192.168.2.134:8033/v1/chat/completions"
+raw_worker_endpoints = os.getenv("WORKER_ENDPOINTS", "http://192.168.2.137:8034/v1/chat/completions")
+WORKER_ENDPOINTS = [e.strip() for e in raw_worker_endpoints.split(",") if e.strip()]
+WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
+
+ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://192.168.2.137:8080/v1/chat/completions")
+ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
+
 MAX_SESSIONS_PER_ENDPOINT = 2
 
 assert ORCHESTRATOR_ENDPOINT not in WORKER_ENDPOINTS, (
@@ -152,12 +168,23 @@ class LLMClusterManager:
             "temperature": 0.2 if requires_json else 0.7,
         }
 
+        headers = {"Content-Type": "application/json"}
+        if endpoint == ORCHESTRATOR_ENDPOINT:
+            headers["Authorization"] = f"Bearer {ORCH_API_KEY}"
+        else:
+            headers["Authorization"] = f"Bearer {WORKER_API_KEY}"
+
         for attempt in range(max_retries):
             try:
-                response = requests.post(endpoint, json=payload, timeout=300)
+                # 10 minute timeout to allow KV cache building for large contexts
+                response = requests.post(endpoint, headers=headers, json=payload, timeout=600)
                 response.raise_for_status()
-                result = response.json()["choices"][0]["message"]["content"].strip()
-                return True, result
+                
+                raw_output = response.json()["choices"][0]["message"]["content"].strip()
+                # Strict ASCII enforcement to prevent downstream JSON parse errors
+                ascii_output = raw_output.encode("ascii", "ignore").decode("ascii")
+                return True, ascii_output
+                
             except Exception as e:
                 log.warning(
                     timestamped_log(f"      [!] Node {endpoint} failed: {e}. Retrying ({attempt + 1}/{max_retries})...")
@@ -172,8 +199,8 @@ cluster = LLMClusterManager()
 # Micro-Task Dispatcher
 # ==============================================================================
 
-def chunk_markdown_semantically(text: str, max_chars: int = 4000) -> list[str]:
-    """Split *text* on Markdown H1/H2/H3 headers."""
+def chunk_markdown_semantically(text: str, max_chars: int = WORKER_CHUNK_CHARS) -> list[str]:
+    """Split *text* on Markdown headers, utilizing the scaled worker context limit."""
     tokens = re.split(r"(?m)(^#{1,3} [^\n]+\n?)", text)
     sections: list[str] = []
     i = 0
@@ -219,7 +246,7 @@ def dispatch_jobs_in_chunks(
     if not chunks:
         return [], []
 
-    log.info(f"   -> [PHASE 1] Chunking complete. Dispatching {len(chunks)} chunks to worker nodes...")
+    log.info(f"   -> [PHASE 1] Dispatching {len(chunks)} chunk(s) to worker nodes...")
 
     results: list[str | None] = [None] * len(chunks)
     failed_chunks: list[dict] = []
@@ -250,25 +277,68 @@ def dispatch_jobs_in_chunks(
 # Core Operations
 # ==============================================================================
 
-def ingest_and_merge_source(source_path: Path, current_idx: int, total_files: int) -> bool:
-    """Read *source_path*, merge extracted insights into state. Returns True on success."""
-    rel_path = source_path.relative_to(RAW_DIR)
+def extract_json_array(raw_text: str) -> str:
+    """Safely extract a JSON array from LLM output, stripping markdown fences."""
+    cleaned_text = re.sub(r'```json\s*', '', raw_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'\n?```\s*', '', cleaned_text)
+    match = re.search(r'\[.*\]', cleaned_text, re.DOTALL)
+    return match.group(0) if match else raw_text
+
+def pack_files_into_batches(files_to_process: list[Path], max_chars: int) -> list[tuple[list[Path], str]]:
+    """Packs multiple files into grouped batches to maximize worker context windows."""
+    batches = []
+    current_batch_text = ""
+    current_batch_files = []
+
+    for file_path in files_to_process:
+        try:
+            with open(file_path, "r", encoding="ascii", errors="ignore") as f:
+                content = f"--- SOURCE: {file_path.name} ---\n{f.read().strip()}"
+        except Exception as e:
+            log.warning(timestamped_log(f"[!] Could not read {file_path.name}: {e}"))
+            continue
+
+        if len(current_batch_text) + len(content) > max_chars and current_batch_text:
+            batches.append((current_batch_files, current_batch_text))
+            current_batch_text = content
+            current_batch_files = [file_path]
+        else:
+            current_batch_text += "\n\n" + content if current_batch_text else content
+            current_batch_files.append(file_path)
+
+    if current_batch_text:
+        batches.append((current_batch_files, current_batch_text))
+
+    return batches
+
+def ingest_and_merge_batch(batch_text: str, batch_files: list[Path], current_idx: int, total_batches: int) -> bool:
+    """Dispatches a packed batch of multiple files to the swarm and merges the output."""
+    file_names = [f.name for f in batch_files]
+    log.info(timestamped_log(f"--- [BATCH {current_idx}/{total_batches}] Processing {len(batch_files)} file(s) ---"))
     
-    log.info(timestamped_log(f"--- [FILE {current_idx}/{total_files}] Processing: {rel_path} ---"))
+    if len(batch_files) <= 3:
+        log.info(f"   -> Included: {', '.join(file_names)}")
+    else:
+        log.info(f"   -> Included: {', '.join(file_names[:3])} and {len(batch_files) - 3} more...")
 
-    try:
-        with open(source_path, "r", encoding="utf-8") as f:
-            raw_content = f.read()
-    except Exception as e:
-        log.error(f" [!] Error reading {rel_path}: {e}")
-        return False
-
-    # Phase 1: Distributed Extraction
-    content_prompt = (
-        "Extract bullet points of actionable tasks, potential technical blockers, "
-        "or core architectural configurations from this artifact segment:\n\n{chunk}"
+    # Phase 1: Distributed Extraction (Workers)
+    system_prompt = (
+        "You are a ruthless, highly technical Lead Engineer. "
+        "Read the provided artifacts and extract a succinct, actionable "
+        "list of explicit TO-DOs, architectural requirements, and implementation tasks. "
+        "\n\nCRITICAL DIRECTIVES: "
+        "\n1. TEST TELEMETRY: Hunt for any unit test execution logs, reports, or telemetry. "
+        "Create a distinct 'Test Execution Status' section detailing passes and failures. "
+        "Convert any failures into high-priority TO-DO items."
+        "\n2. EMBED ARTIFACTS: For EVERY task or failed test, extract and embed the relevant "
+        "source artifact directly beneath the task description. Format code or tracebacks using "
+        "proper markdown code fences and explicitly label the source filename."
+        "\n3. STRICT ASCII ONLY: Do NOT use emojis or specialized unicode symbols."
     )
-    raw_tasks_list, extraction_failures = dispatch_jobs_in_chunks(raw_content, content_prompt)
+    
+    content_prompt = "Artifacts Payload:\n\n{chunk}"
+    
+    raw_tasks_list, extraction_failures = dispatch_jobs_in_chunks(batch_text, content_prompt, system_prompt=system_prompt)
 
     state = load_state()
     if extraction_failures:
@@ -278,7 +348,7 @@ def ingest_and_merge_source(source_path: Path, current_idx: int, total_files: in
         log.info(f"   -> [PHASE 1] Distributed extraction successful.")
 
     if not raw_tasks_list:
-        log.info(f"   -> [SKIP] No actionable signals found in {rel_path}.")
+        log.info(f"   -> [SKIP] No actionable signals found in this batch.")
         return True
 
     # Phase 2: Context-Aware Orchestrator Merge
@@ -287,7 +357,7 @@ def ingest_and_merge_source(source_path: Path, current_idx: int, total_files: in
     existing_tasks = list(state["tasks"].values())
     existing_tasks.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
 
-    existing_tasks_context = json.dumps(existing_tasks[:50], indent=2)[:MAX_CONTEXT_CHARS]
+    existing_tasks_context = json.dumps(existing_tasks[:50], indent=2)[:ORCHESTRATOR_MAX_CHARS]
     new_signals_context = "\n---\n".join(raw_tasks_list)
 
     merge_prompt = f"""
@@ -298,7 +368,7 @@ Ensure blockers are explicitly flagged.
 CURRENT STATE (Recent Tasks):
 {existing_tasks_context}
 
-NEW SIGNALS FROM {source_path.name}:
+NEW SIGNALS FROM BATCH:
 {new_signals_context}
 """
     success, merged_output = cluster.query(
@@ -306,7 +376,7 @@ NEW SIGNALS FROM {source_path.name}:
         system_prompt=(
             "Return ONLY a flat JSON array of objects with keys: 'id' (slug), "
             "'content', 'status', 'confidence'. "
-            "No markdown formatting, code blocks, or explanatory text."
+            "No markdown formatting, code blocks, or explanatory text. Strict ASCII only."
         ),
         is_orchestrator=True,
         requires_json=True,
@@ -314,15 +384,15 @@ NEW SIGNALS FROM {source_path.name}:
 
     if success:
         try:
-            clean_json = re.search(r"\[.*\]", merged_output, re.DOTALL)
-            merged_tasks = json.loads(clean_json.group() if clean_json else merged_output)
+            clean_json_str = extract_json_array(merged_output)
+            merged_tasks = json.loads(clean_json_str)
             
             updated_count = 0
             for task in merged_tasks:
                 slug = task.get("id")
                 if slug:
                     task["updated_at"] = datetime.now().isoformat()
-                    task["last_source"] = source_path.name
+                    task["last_source"] = f"Batch containing {file_names[0]}"
                     raw_status = task.get("status")
                     if raw_status not in VALID_STATES:
                         task["status"] = "in_progress"
@@ -352,14 +422,14 @@ def generate_daily_synthesis(*, block: bool = True) -> threading.Thread | None:
 
         synthesis_prompt = (
             "Summarize this agile project state into a readable executive markdown report. "
-            "Group cleanly by status (Blocked, Active, Completed). Keep it concise.\n\n"
-            f"STATE:\n{json.dumps(state['tasks'])}"
+            "Group cleanly by status (Blocked, Active, Completed). Keep it concise. Strict ASCII only.\n\n"
+            f"STATE:\n{json.dumps(state['tasks'])[:ORCHESTRATOR_MAX_CHARS]}"
         )
         
         success, response = cluster.query(synthesis_prompt, is_orchestrator=True)
 
         if success:
-            with open(WIKI_SYNTHESIS_FILE, "w", encoding="utf-8") as f:
+            with open(WIKI_SYNTHESIS_FILE, "w", encoding="ascii", errors="ignore") as f:
                 f.write(response)
             log.info(timestamped_log(f"[+] Synthesis successfully saved to {WIKI_SYNTHESIS_FILE}"))
         else:
@@ -380,6 +450,11 @@ def generate_daily_synthesis(*, block: bool = True) -> threading.Thread | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deep-scan agentic control loop.")
     parser.add_argument(
+        "project_path",
+        type=str,
+        help="Path to the target project directory to bind the execution context.",
+    )
+    parser.add_argument(
         "--synthesize",
         action="store_true",
         help="Only regenerate the daily synthesis from the current state; skip ingestion.",
@@ -392,23 +467,37 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    target_dir = Path(args.project_path).resolve()
+    
+    if not target_dir.exists() or not target_dir.is_dir():
+        log.error(f"Fatal: Directory '{target_dir}' does not exist or is not a directory.")
+        return
+
+    # Strictly bind operations into the target directory
+    os.chdir(target_dir)
+    init_paths(target_dir)
+
     if args.synthesize:
         generate_daily_synthesis(block=True)
         return
 
     log.info("\n==================================================")
     log.info(timestamped_log("STARTING DEEP-SCAN AGENTIC CONTROL LOOP"))
-    log.info(f"[*] Target Directory: {RAW_DIR.absolute()}")
+    log.info(f"[*] Target Directory: {target_dir}")
     log.info("==================================================\n")
 
     processed_files = load_processed_index()
 
-    extensions = ("*.txt", "*.md", "*.csv")
+    extensions = ("*.txt", "*.md", "*.csv", "*.json")
     raw_files: list[Path] = []
+    
     for ext in extensions:
-        raw_files.extend(RAW_DIR.rglob(ext))
+        for f in RAW_DIR.rglob(ext):
+            # Exclude our internal WIKI_DIR to prevent infinite loops
+            if WIKI_DIR in f.parents:
+                continue
+            raw_files.append(f)
 
-    # Filter files strictly to what needs processing
     files_to_process = [
         f for f in raw_files 
         if f.relative_to(RAW_DIR).as_posix() not in processed_files
@@ -419,15 +508,23 @@ def main() -> None:
     if total_files == 0:
         log.info(timestamped_log("[~] No new files to process. Directory is up-to-date."))
     else:
-        log.info(timestamped_log(f"[*] Discovered {total_files} new file(s) for processing.\n"))
+        log.info(timestamped_log(f"[*] Discovered {total_files} new file(s) for processing."))
+        
+        # Pack the files into ~100k character batches for the worker nodes
+        batches = pack_files_into_batches(files_to_process, WORKER_CHUNK_CHARS)
+        total_batches = len(batches)
+        
+        log.info(timestamped_log(f"[*] Compacted into {total_batches} processing batch(es).\n"))
+        
         new_files_processed = 0
 
-        for current_idx, file_path in enumerate(files_to_process, start=1):
-            success = ingest_and_merge_source(file_path, current_idx, total_files)
+        for current_idx, (batch_files, batch_text) in enumerate(batches, start=1):
+            success = ingest_and_merge_batch(batch_text, batch_files, current_idx, total_batches)
 
             if success:
-                mark_file_processed(file_path)
-                new_files_processed += 1
+                for file_path in batch_files:
+                    mark_file_processed(file_path)
+                    new_files_processed += 1
 
         if new_files_processed > 0:
             synthesis_thread = generate_daily_synthesis(block=not args.async_synthesis)
@@ -443,4 +540,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
