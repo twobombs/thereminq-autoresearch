@@ -1,0 +1,120 @@
+version: '3.8'
+
+services:
+  # ==============================================================================
+  # 1. VDI / Workspace Environment
+  # ==============================================================================
+  vdi-workspace:
+    image: twobombs/thereminq-tensors:jupyter
+    container_name: thereminq-vdi
+    ports:
+      - "6080:6080"
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ==============================================================================
+  # 2. Orchestrator Node (nvidia_Orchestrator-8B)
+  # ==============================================================================
+  orchestrator:
+    image: twobombs/thereminq-tensors:jupyter
+    container_name: thereminq-orchestrator
+    ports:
+      - "8080:8080"
+    devices:
+      - /dev/dri:/dev/dri
+    # Pointing directly to the built binary and fetched model natively inside the image
+    command: >
+      /notebooks/thereminq/thereminq-autoresearch/0-build/llama.orch/build/bin/llama-server
+      -m /notebooks/thereminq/thereminq-autoresearch/0-build/nvidia_Orchestrator-8B-Q6_K.gguf
+      -ngl 99
+      --no-cache-idle-slots
+      --cache-ram 0
+      -c 40960
+      -b 512
+      -ub 512
+      --parallel 1
+      --no-mmap
+      --tools all
+      --jinja
+      --kv-unified
+      -fa on
+      -ctk q8_0
+      -ctv q4_0
+      -fit off
+      --host 0.0.0.0
+      --port 8080
+      --device VULKAN1
+    restart: unless-stopped
+
+  # ==============================================================================
+  # 3. Zerg Swarm Worker 1 (Qwen3.5-9B)
+  # ==============================================================================
+  worker-1:
+    image: twobombs/thereminq-tensors:jupyter
+    container_name: thereminq-worker-1
+    ports:
+      - "8034:8034"
+    devices:
+      - /dev/dri:/dev/dri
+    command: >
+      /notebooks/thereminq/thereminq-autoresearch/0-build/llama.cpp/build/bin/llama-server
+      -m /notebooks/thereminq/thereminq-autoresearch/0-build/Qwen3.5-9B-IQ4_XS.gguf
+      -c 196608
+      -np 2
+      -ngl 999
+      -mg 4
+      --kv-unified
+      -fa on
+      --no-cache-idle-slots
+      --split-mode none
+      --cache-type-k q8_0
+      --cache-type-v q4_0
+      --no-mmap
+      --spec-type draft-mtp
+      --spec-draft-n-max 3
+      --host 0.0.0.0
+      --port 8034
+      --tools all
+      --fit off
+    restart: always
+
+  # ==============================================================================
+  # 4. Zerg Swarm Worker 2 (Qwen3.5-9B)
+  # ==============================================================================
+  worker-2:
+    image: twobombs/thereminq-tensors:jupyter
+    container_name: thereminq-worker-2
+    ports:
+      - "8035:8035"
+    devices:
+      - /dev/dri:/dev/dri
+    command: >
+      /notebooks/thereminq/thereminq-autoresearch/0-build/llama.cpp/build/bin/llama-server
+      -m /notebooks/thereminq/thereminq-autoresearch/0-build/Qwen3.5-9B-IQ4_XS.gguf
+      -c 196608
+      -np 2
+      -ngl 999
+      -mg 5
+      --kv-unified
+      -fa on
+      --no-cache-idle-slots
+      --split-mode none
+      --cache-type-k q8_0
+      --cache-type-v q4_0
+      --no-mmap
+      --spec-type draft-mtp
+      --spec-draft-n-max 3
+      --host 0.0.0.0
+      --port 8035
+      --tools all
+      --fit off
+    restart: always
