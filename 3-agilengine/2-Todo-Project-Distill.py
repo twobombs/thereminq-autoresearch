@@ -43,6 +43,9 @@ def extract_project_tasks(project_name: str, raw_content: str) -> str | None:
         "source artifact directly beneath the task description. If a task involves a specific function, "
         "include the code snippet. If it involves an error, include the traceback. "
         "Format these artifacts using proper markdown code fences and explicitly label the source filename."
+        "\n3. STRICT ASCII ONLY: The generated markdown MUST consist entirely of standard ASCII characters. "
+        "Do NOT use emojis, smart quotes, em-dashes, or specialized unicode symbols. "
+        "Use standard hyphens (-) or asterisks (*) for bullet points. "
         "\n\nOutput a clean, highly structured Markdown document. Do not include conversational filler."
     )
     
@@ -58,13 +61,20 @@ def extract_project_tasks(project_name: str, raw_content: str) -> str | None:
             {"role": "user", "content": f"Extract actionable tasks, test outcomes, and relevant artifacts from this {project_name} documentation:\n\n{raw_content}"}
         ],
         "temperature": 0.2, 
-        "max_tokens": 8192  # Scaled up output limit if the model supports extended generation
+        "max_tokens": 8192
     }
 
     try:
         response = requests.post(ORCHESTRATOR_ENDPOINT, headers=headers, json=payload, timeout=600)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        
+        # Strip output to ensure no leading/trailing whitespace anomalies
+        raw_output = response.json()["choices"][0]["message"]["content"].strip()
+        
+        # Hard enforcement: encode to ascii and ignore errors to drop any hallucinated unicode
+        ascii_output = raw_output.encode("ascii", "ignore").decode("ascii")
+        return ascii_output
+        
     except Exception as e:
         log.error(f"[{project_name}] Orchestrator inference failed: {e}")
         return None
@@ -98,7 +108,8 @@ def process_project_directory(project_dir: Path) -> bool:
     for file_path in raw_files:
         try:
             # STRICT READ-ONLY: Artifacts are read into memory, not altered or moved
-            with open(file_path, "r", encoding="utf-8") as f:
+            # Enforcing ascii reading to prevent unicode bleed from raw logs
+            with open(file_path, "r", encoding="ascii", errors="ignore") as f:
                 aggregated_content.append(f"--- SOURCE: {file_path.name} ---\n{f.read()}")
         except Exception as e:
             log.warning(f"[{project_name}] Could not read {file_path.name}: {e}")
@@ -116,7 +127,7 @@ def process_project_directory(project_dir: Path) -> bool:
         # The output artifact is written directly into the target directory
         output_file = project_dir / "DISTILLED_TASKS.md"
         try:
-            with open(output_file, "w", encoding="utf-8") as f:
+            with open(output_file, "w", encoding="ascii", errors="ignore") as f:
                 f.write(f"# Distilled Tasks: {project_name}\n\n{distilled_markdown}\n")
             log.info(f"[{project_name}] Successfully saved distilled tasks to {output_file.name}")
             return True
@@ -165,4 +176,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
