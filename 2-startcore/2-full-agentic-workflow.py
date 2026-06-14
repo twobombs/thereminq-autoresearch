@@ -35,8 +35,6 @@ WORKER_RETRIES = 3
 ORCH_PARALLEL_SLOTS = 1
 SYNTHESIS_CHUNK_SIZE = 3  
 
-BASE_DIR = Path(__file__).parent
-
 # ==============================================================================
 # Helper: Fallback Token Estimator
 # ==============================================================================
@@ -56,7 +54,7 @@ def extract_json_array(raw_text: str) -> str:
     return match.group(0) if match else ""
 
 def decompose_to_atomic_pieces(large_query: str) -> tuple:
-    print(f"\n[1] 📥 INGRESS: Analyzing massive query...\n    Length: {len(large_query)} characters", flush=True)
+    print(f"\n[1] INGRESS: Analyzing massive query...\n    Length: {len(large_query)} characters", flush=True)
 
     system_prompt = """You are an algorithmic micro-task decomposer.
 Your sole purpose is to take a large, complex query or task and shatter it into atomic, independent pieces for parallel processing.
@@ -70,7 +68,7 @@ Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conv
     )
 
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"[2] 🔬 DECOMPOSITION: Engaging atomic breakdown via {ORCHESTRATOR_ENDPOINTS[0]} (Attempt {attempt}/{MAX_RETRIES})...", flush=True)
+        print(f"[2] DECOMPOSITION: Engaging atomic breakdown via {ORCHESTRATOR_ENDPOINTS[0]} (Attempt {attempt}/{MAX_RETRIES})...", flush=True)
         raw_output = ""
         prompt_tokens, comp_tokens = 0, 0
         
@@ -119,23 +117,19 @@ Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conv
 # Phase 2: Audit Trail Setup
 # ==============================================================================
 
-def export_to_split_files(pieces: list) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = BASE_DIR / f"runs/orchestrator_run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    
-    if len(pieces) <= 1: return run_dir
+def export_to_split_files(pieces: list, work_dir: Path) -> Path:
+    if len(pieces) <= 1: return work_dir
         
-    print("\n[3] 💾 QUEUE EXPORT: Saving task matrix to disk...", flush=True)
-    tasks_dir = run_dir / "tasks"
+    print("\n[3] QUEUE EXPORT: Saving task matrix to target directory...", flush=True)
+    tasks_dir = work_dir / "tasks"
     tasks_dir.mkdir(exist_ok=True)
     
     for idx, piece in enumerate(pieces, start=1):
         filepath = tasks_dir / f"task_{idx:03d}.md"
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(filepath, "w", encoding="ascii", errors="ignore") as f:
             f.write(f"{piece.strip()}\n")
             
-    return run_dir
+    return work_dir
 
 # ==============================================================================
 # Pipeline Processors
@@ -189,7 +183,8 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
             safe_filename = os.path.basename(file_path)
             artifact_dir = run_dir / "artifacts" / f"thread_{task_id:02d}"
             artifact_dir.mkdir(parents=True, exist_ok=True)
-            with open(artifact_dir / safe_filename, "w", encoding="utf-8") as af: af.write(file_content)
+            with open(artifact_dir / safe_filename, "w", encoding="ascii", errors="ignore") as af: 
+                af.write(file_content)
             saved_artifacts.append(safe_filename)
 
         if len(result_text) < 20: status = "failed_validation"
@@ -219,7 +214,8 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
     system_prompt = (
         "You are a Level-1 Synthesis Node in a distributed cluster. "
         "Merge the following sequential worker reports into a coherent, deduplicated section. "
-        "Retain all code blocks, configurations, and critical technical data."
+        "Retain all code blocks, configurations, and critical technical data. "
+        "Output strictly in standard ASCII."
     )
     batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\nREPORTS TO MERGE:\n{batch_context}"
@@ -245,7 +241,10 @@ def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, en
         max_retries=0
     )
     
-    system_prompt = "You are the Final Assembly Layer. Seamlessly weave the new sequential section into the existing master document. Expand the document logically. Do not drop existing data or code."
+    system_prompt = (
+        "You are the Final Assembly Layer. Seamlessly weave the new sequential section into the existing master document. "
+        "Expand the document logically. Do not drop existing data or code. Output strictly in standard ASCII."
+    )
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\n--- CURRENT MASTER DOCUMENT ---\n{current_master}\n\n--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{new_chunk}"
     
     start_time = time.time()
@@ -269,7 +268,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     total_tasks = len(sub_tasks)
     total_chunks = (total_tasks + SYNTHESIS_CHUNK_SIZE - 1) // SYNTHESIS_CHUNK_SIZE
     
-    print(f"\n[4] 🚀 CONTINUOUS MAP-REDUCE: Launching parallel workers, chunks, and rolling master stitch...", flush=True)
+    print(f"\n[4] CONTINUOUS MAP-REDUCE: Launching parallel workers, chunks, and rolling master stitch...", flush=True)
 
     worker_queue = queue.Queue()
     w_slot_idx = 1
@@ -300,7 +299,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                     # Failsafe: Hard truncate runaway hallucinations to prevent context poisoning
                     MAX_WORKER_TOKENS = 16000
                     if res.get("total_tokens", 0) > MAX_WORKER_TOKENS:
-                        print(f"    [✂️] [{slot_name}] Worker-{tid:02d} exceeded limit ({res['total_tokens']} tokens). Truncating to {MAX_WORKER_TOKENS}...", flush=True)
+                        print(f"    [TRUNCATE] [{slot_name}] Worker-{tid:02d} exceeded limit ({res['total_tokens']} tokens). Truncating to {MAX_WORKER_TOKENS}...", flush=True)
                         safe_char_limit = MAX_WORKER_TOKENS * 4
                         res["result"] = res["result"][:safe_char_limit] + "\n\n...[OUTPUT TRUNCATED DUE TO LENGTH LIMIT]..."
                         
@@ -351,14 +350,14 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             c_id, c_text = item
             
             if master_document == "":
-                print(f"    [🧵] Pipeline trigger: Chunk {c_id}/{total_chunks} is foundation. Establishing Master Document...", flush=True)
+                print(f"    [STITCH] Pipeline trigger: Chunk {c_id}/{total_chunks} is foundation. Establishing Master Document...", flush=True)
                 master_document = c_text
             else:
                 success = False
                 for attempt in range(1, MAX_RETRIES + 1):
                     orch_endpoint, slot_name = orch_queue.get()
                     try:
-                        print(f"    [🧵] [{slot_name}] Pipeline trigger: Weaving Chunk {c_id}/{total_chunks} into Master Document...", flush=True)
+                        print(f"    [STITCH] [{slot_name}] Pipeline trigger: Weaving Chunk {c_id}/{total_chunks} into Master Document...", flush=True)
                         new_doc, p, c, elap = rolling_master_stitch(c_id, master_document, c_text, orch_endpoint, original_query)
                         master_document = new_doc
                         stitch_p_tok += p
@@ -431,7 +430,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                         
                 if chunk_ready:
                     chunk_tasks = [results_dict.pop(i) for i in range(expected_start, expected_end)]
-                    print(f"    [🗜️] Multithread trigger: Grouping tasks {chunk_tasks[0]['id']}-{chunk_tasks[-1]['id']} into Chunk {chunk_idx}...", flush=True)
+                    print(f"    [BATCH] Multithread trigger: Grouping tasks {chunk_tasks[0]['id']}-{chunk_tasks[-1]['id']} into Chunk {chunk_idx}...", flush=True)
                     orch_exec.submit(chunk_wrapper, chunk_idx, chunk_tasks)
 
             elif event[0] == "chunk":
@@ -470,14 +469,28 @@ if __name__ == "__main__":
     group.add_argument("-p", "--prompt", type=str, help="Direct prompt input.")
     args = parser.parse_args()
     
+    # Establish dynamic working directory
     if args.file:
-        with open(args.file, "r", encoding="utf-8") as f: target_query = f.read()
+        target_path = Path(args.file).resolve()
+        if not target_path.exists():
+            print(f"[!] Fatal: Input file '{target_path}' not found.", flush=True)
+            sys.exit(1)
+            
+        with open(target_path, "r", encoding="utf-8") as f: 
+            target_query = f.read()
+            
+        # Bind output directory directly to the location of the input file
+        work_dir = target_path.parent
     elif args.prompt:
         target_query = args.prompt
+        # Fallback to current working directory if run via direct prompt string
+        work_dir = Path.cwd()
     else:
         target_query = "Create a simple Python HTTP server using Flask that returns 'Hello, Orchestrator!' on the root endpoint. Also, write a standard Dockerfile to containerize it."
+        work_dir = Path.cwd()
         
     print("\n=== STARTING UNIFIED DISTRIBUTED ORCHESTRATOR CLUSTER ===", flush=True)
+    print(f"[*] Bound Working Directory: {work_dir}", flush=True)
     
     master_start_time = time.time()
     global_input_tokens = 0
@@ -489,7 +502,7 @@ if __name__ == "__main__":
     global_output_tokens += c_tok
     
     # 2. File Setup
-    run_directory = export_to_split_files(fragments)
+    run_directory = export_to_split_files(fragments, work_dir)
     
     # 3, 4, 5. Execution via Continuous Map-Reduce Pipeline
     final_output, w_p, w_c, o_p, o_c, worker_stats = execute_continuous_map_reduce(fragments, target_query, run_directory)
@@ -499,13 +512,13 @@ if __name__ == "__main__":
     # 6. Append Telemetry to Master Document
     master_elapsed_time = time.time() - master_start_time
 
-    stats_md = "\n\n---\n## 📊 Worker Execution Statistics\n"
+    stats_md = "\n\n---\n## Worker Execution Statistics\n"
     stats_md += "| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens |\n"
     stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|\n"
     for stat in sorted(worker_stats, key=lambda x: x['id']):
         stats_md += f"| Thread-{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} |\n"
     
-    agg_md = "\n\n## 📈 Cluster Aggregate Statistics\n"
+    agg_md = "\n\n## Cluster Aggregate Statistics\n"
     agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
     agg_md += f"- **Total Input Tokens:** {global_input_tokens:,}\n"
     agg_md += f"- **Total Output Tokens:** {global_output_tokens:,}\n"
@@ -513,17 +526,19 @@ if __name__ == "__main__":
     
     final_output += stats_md + agg_md
     
-    print("\n[5] 💾 MASTER EXPORT: Saving master synthesis to disk...", flush=True)
+    print("\n[5] MASTER EXPORT: Saving master synthesis to disk...", flush=True)
     final_file_path = run_directory / "FINAL_SYNTHESIS.md"
-    with open(final_file_path, "w", encoding="utf-8") as f:
+    
+    # Enforcing ASCII to prevent unicode errors down the line
+    with open(final_file_path, "w", encoding="ascii", errors="ignore") as f:
         f.write(final_output)
     
     print("\n==============================================================================", flush=True)
-    print("✨ EXECUTION RUN COMPLETE ✨", flush=True)
-    print(f"    ⏱️  Total Wall-Clock Time:  {master_elapsed_time:.2f} seconds", flush=True)
-    print(f"    📥 Total Input Tokens:     {global_input_tokens:,}", flush=True)
-    print(f"    📤 Total Output Tokens:    {global_output_tokens:,}", flush=True)
-    print(f"    📊 Total Cluster Tokens:   {global_input_tokens + global_output_tokens:,}", flush=True)
+    print("EXECUTION RUN COMPLETE", flush=True)
+    print(f"    Total Wall-Clock Time:  {master_elapsed_time:.2f} seconds", flush=True)
+    print(f"    Total Input Tokens:     {global_input_tokens:,}", flush=True)
+    print(f"    Total Output Tokens:    {global_output_tokens:,}", flush=True)
+    print(f"    Total Cluster Tokens:   {global_input_tokens + global_output_tokens:,}", flush=True)
     print(f"    [+] Synthesis Payload Size: {len(final_output):,} characters", flush=True)
-    print(f"    📂 Run Master Directory:    {run_directory.absolute()}", flush=True)
+    print(f"    Run Master Directory:   {run_directory.absolute()}", flush=True)
     print("==============================================================================", flush=True)
