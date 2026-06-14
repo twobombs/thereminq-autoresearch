@@ -48,11 +48,23 @@ def estimate_tokens(text: str) -> int:
 # ==============================================================================
 
 def extract_json_array(raw_text: str) -> str:
+    """Robust extraction walking characters and tracking bracket depth."""
     cleaned_text = re.sub(r'```json\s*', '', raw_text, flags=re.IGNORECASE)
     cleaned_text = re.sub(r'\n?```\s*', '', cleaned_text)
-    # Using greedy match to ensure we capture the full array even if there are nested brackets
-    match = re.search(r'\[.*\]', cleaned_text, re.DOTALL)
-    return match.group(0) if match else ""
+    
+    start_idx = cleaned_text.find('[')
+    if start_idx == -1: 
+        return ""
+        
+    depth = 0
+    for i in range(start_idx, len(cleaned_text)):
+        if cleaned_text[i] == '[': 
+            depth += 1
+        elif cleaned_text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                return cleaned_text[start_idx:i+1]
+    return ""
 
 def decompose_to_atomic_pieces(large_query: str) -> tuple:
     print(f"\n[1] INGRESS: Analyzing massive query...\n    Length: {len(large_query)} characters", flush=True)
@@ -126,8 +138,8 @@ def export_to_split_files(pieces: list, work_dir: Path) -> Path:
     tasks_dir.mkdir(exist_ok=True)
     
     for idx, piece in enumerate(pieces, start=1):
-        filepath = tasks_dir / f"task_{idx:03d}.md"
-        with open(filepath, "w", encoding="ascii", errors="ignore") as f:
+        filepath = tasks_dir / f"task{idx:03d}.md"
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write(f"{piece.strip()}\n")
             
     return work_dir
@@ -137,7 +149,7 @@ def export_to_split_files(pieces: list, work_dir: Path) -> Path:
 # ==============================================================================
 
 def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: str, original_query: str, run_dir: Path) -> dict:
-    print(f"    -> [{slot_name}] Worker-{task_id:02d} Dispatched to {endpoint} | Task: '{task_prompt[:40]}...' ", flush=True)
+    print(f"    -> [{slot_name}] Worker{task_id:02d} Dispatched to {endpoint} | Task: '{task_prompt[:40]}...' ", flush=True)
     
     worker_client = OpenAI(
         base_url=endpoint, 
@@ -164,14 +176,13 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
             model=WORKER_MODEL,
             messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": user_instruction}],
             temperature=0.4, 
-            max_tokens=12288,          # Increased to safely accommodate 8k+ bursts
-            frequency_penalty=1.1,     # Prevents infinite code loops
-            presence_penalty=0.5,      # Encourages moving on to new concepts
-            stop=["</file>"]           # Instantly halts generation once task is done
+            max_tokens=12288,
+            frequency_penalty=1.1,
+            presence_penalty=0.5,
+            stop=["</file>"]
         )
         result_text = response.choices[0].message.content.strip()
         
-        # Ensure the closing tag is appended back if the stop sequence cut it off
         if "<file" in result_text and "</file>" not in result_text:
             result_text += "\n</file>"
 
@@ -182,9 +193,9 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
         for match in file_matches:
             file_path, file_content = match.group(1).strip(), match.group(2).strip()
             safe_filename = os.path.basename(file_path)
-            artifact_dir = run_dir / "artifacts" / f"thread_{task_id:02d}"
+            artifact_dir = run_dir / "artifacts" / f"thread{task_id:02d}"
             artifact_dir.mkdir(parents=True, exist_ok=True)
-            with open(artifact_dir / safe_filename, "w", encoding="ascii", errors="ignore") as af: 
+            with open(artifact_dir / safe_filename, "w", encoding="utf-8") as af: 
                 af.write(file_content)
             saved_artifacts.append(safe_filename)
 
@@ -216,7 +227,7 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
         "You are a Level-1 Synthesis Node in a distributed cluster. "
         "Merge the following sequential worker reports into a coherent, deduplicated section. "
         "Retain all code blocks, configurations, and critical technical data. "
-        "Output strictly in standard ASCII."
+        "Output strictly in standard UTF-8."
     )
     batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\nREPORTS TO MERGE:\n{batch_context}"
@@ -244,7 +255,7 @@ def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, en
     
     system_prompt = (
         "You are the Final Assembly Layer. Seamlessly weave the new sequential section into the existing master document. "
-        "Expand the document logically. Do not drop existing data or code. Output strictly in standard ASCII."
+        "Expand the document logically. Do not drop existing data or code. Output strictly in standard UTF-8."
     )
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\n--- CURRENT MASTER DOCUMENT ---\n{current_master}\n\n--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{new_chunk}"
     
@@ -275,14 +286,14 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     w_slot_idx = 1
     for ep in WORKER_ENDPOINTS:
         for _ in range(WORKER_PARALLEL_SLOTS): 
-            worker_queue.put((ep, f"W-Slot-{w_slot_idx:02d}"))
+            worker_queue.put((ep, f"W-Slot{w_slot_idx:02d}"))
             w_slot_idx += 1
 
     orch_queue = queue.Queue()
     o_slot_idx = 1
     for ep in ORCHESTRATOR_ENDPOINTS:
         for _ in range(ORCH_PARALLEL_SLOTS): 
-            orch_queue.put((ep, f"O-Slot-{o_slot_idx:02d}"))
+            orch_queue.put((ep, f"O-Slot{o_slot_idx:02d}"))
             o_slot_idx += 1
 
     event_queue = queue.Queue()
@@ -296,15 +307,12 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             try:
                 res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir)
                 if res["status"] == "success": 
-                    
-                    # Failsafe: Hard truncate runaway hallucinations to prevent context poisoning
                     MAX_WORKER_TOKENS = 16000
                     if res.get("total_tokens", 0) > MAX_WORKER_TOKENS:
-                        print(f"    [TRUNCATE] [{slot_name}] Worker-{tid:02d} exceeded limit ({res['total_tokens']} tokens). Truncating to {MAX_WORKER_TOKENS}...", flush=True)
+                        print(f"    [TRUNCATE] [{slot_name}] Worker{tid:02d} exceeded limit ({res['total_tokens']} tokens). Truncating to {MAX_WORKER_TOKENS}...", flush=True)
                         safe_char_limit = MAX_WORKER_TOKENS * 4
                         res["result"] = res["result"][:safe_char_limit] + "\n\n...[OUTPUT TRUNCATED DUE TO LENGTH LIMIT]..."
                         
-                        # Fix: Ensure completion_tokens is updated so the telemetry table reflects reality
                         res["completion_tokens"] = MAX_WORKER_TOKENS - res["prompt_tokens"]
                         res["total_tokens"] = MAX_WORKER_TOKENS
 
@@ -322,7 +330,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         for attempt in range(1, MAX_RETRIES + 1):
             endpoint, slot_name = orch_queue.get()
             try:
-                print(f"    -> [{slot_name}] Chunk-{batch_id:02d} Dispatched to {endpoint} | Compressing {len(tasks)} tasks...", flush=True)
+                print(f"    -> [{slot_name}] Chunk{batch_id:02d} Dispatched to {endpoint} | Compressing {len(tasks)} tasks...", flush=True)
                 b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
                 event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
                 return
@@ -344,6 +352,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         nonlocal master_document, stitch_p_tok, stitch_c_tok
         while True:
             item = stitch_queue.get()
+        
             if item is None: 
                 stitch_queue.task_done()
                 break
@@ -373,8 +382,8 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                     time.sleep(2)
                     
                 if not success:
-                    print(f"    [!] CRITICAL: Master stitch failed on Chunk {c_id}. Falling back to raw append.", flush=True)
-                    master_document += f"\n\n--- SECTION {c_id} ---\n" + c_text
+                    print(f"    [!] CRITICAL: Master stitch failed on Chunk {c_id}. Falling back to tagged append.", flush=True)
+                    master_document += f"\n\n\n" + c_text
                     
             stitch_queue.task_done()
 
@@ -394,7 +403,8 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     chunks_completed = 0
     dispatch_start_time = time.time()
     
-    thread_pool_size = max(total_tasks, 100)
+    max_useful_threads = (len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS) + (len(ORCHESTRATOR_ENDPOINTS) * ORCH_PARALLEL_SLOTS)
+    thread_pool_size = min(total_tasks, max_useful_threads)
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=thread_pool_size) as worker_exec, \
          concurrent.futures.ThreadPoolExecutor(max_workers=thread_pool_size) as orch_exec:
@@ -402,7 +412,6 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         for i, task in enumerate(sub_tasks):
             worker_exec.submit(worker_wrapper, i + 1, task)
             
-        # The Event Loop
         while chunks_completed < total_chunks:
             event = event_queue.get()
             
@@ -417,7 +426,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 current_elap = time.time() - dispatch_start_time
                 agg_tps = round(worker_c_tok / current_elap, 2) if current_elap > 0 else 0
                 
-                print(f"    <- [{task_res.get('slot', 'Unknown')}] Worker-{tid:02d} Finished in {task_res['elapsed']}s | Status: {task_res['status']} | Agg TPS: {agg_tps}", flush=True)
+                print(f"    <- [{task_res.get('slot', 'Unknown')}] Worker{tid:02d} Finished in {task_res['elapsed']}s | Status: {task_res['status']} | Agg TPS: {agg_tps}", flush=True)
 
                 chunk_idx = (tid - 1) // SYNTHESIS_CHUNK_SIZE + 1
                 expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
@@ -441,15 +450,13 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 chunk_c_tok += c_tok
                 chunks_completed += 1
                 
-                print(f"    <- [{slot_name}] Chunk-{b_id:02d} Compressed parallel batch in {elap}s.", flush=True)
+                print(f"    <- [{slot_name}] Chunk{b_id:02d} Compressed parallel batch in {elap}s.", flush=True)
 
-                # Feed the Level 2 Stitcher sequentially
                 while next_stitch_id in chunks_dict:
                     stitch_text = chunks_dict.pop(next_stitch_id)
                     stitch_queue.put((next_stitch_id, stitch_text))
                     next_stitch_id += 1
                     
-    # Shutdown stitch thread cleanly
     stitch_queue.put(None)
     stitch_queue.join()
     stitch_thread.join()
@@ -470,7 +477,6 @@ if __name__ == "__main__":
     group.add_argument("-p", "--prompt", type=str, help="Direct prompt input.")
     args = parser.parse_args()
     
-    # Establish dynamic working directory
     if args.file:
         target_path = Path(args.file).resolve()
         if not target_path.exists():
@@ -480,11 +486,9 @@ if __name__ == "__main__":
         with open(target_path, "r", encoding="utf-8") as f: 
             target_query = f.read()
             
-        # Bind output directory directly to the location of the input file
         work_dir = target_path.parent
     elif args.prompt:
         target_query = args.prompt
-        # Fallback to current working directory if run via direct prompt string
         work_dir = Path.cwd()
     else:
         target_query = "Create a simple Python HTTP server using Flask that returns 'Hello, Orchestrator!' on the root endpoint. Also, write a standard Dockerfile to containerize it."
@@ -497,27 +501,23 @@ if __name__ == "__main__":
     global_input_tokens = 0
     global_output_tokens = 0
     
-    # 1. Decomposition
     fragments, p_tok, c_tok = decompose_to_atomic_pieces(target_query)
     global_input_tokens += p_tok
     global_output_tokens += c_tok
     
-    # 2. File Setup
     run_directory = export_to_split_files(fragments, work_dir)
     
-    # 3, 4, 5. Execution via Continuous Map-Reduce Pipeline
     final_output, w_p, w_c, o_p, o_c, worker_stats = execute_continuous_map_reduce(fragments, target_query, run_directory)
     global_input_tokens += (w_p + o_p)
     global_output_tokens += (w_c + o_c)
     
-    # 6. Append Telemetry to Master Document
     master_elapsed_time = time.time() - master_start_time
 
     stats_md = "\n\n---\n## Worker Execution Statistics\n"
     stats_md += "| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens |\n"
     stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|\n"
     for stat in sorted(worker_stats, key=lambda x: x['id']):
-        stats_md += f"| Thread-{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} |\n"
+        stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} |\n"
     
     agg_md = "\n\n## Cluster Aggregate Statistics\n"
     agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
@@ -530,8 +530,7 @@ if __name__ == "__main__":
     print("\n[5] MASTER EXPORT: Saving master synthesis to disk...", flush=True)
     final_file_path = run_directory / "FINAL_SYNTHESIS.md"
     
-    # Enforcing ASCII to prevent unicode errors down the line
-    with open(final_file_path, "w", encoding="ascii", errors="ignore") as f:
+    with open(final_file_path, "w", encoding="utf-8") as f:
         f.write(final_output)
     
     print("\n==============================================================================", flush=True)
@@ -544,18 +543,13 @@ if __name__ == "__main__":
     print(f"    Run Master Directory:   {run_directory.absolute()}", flush=True)
     print("==============================================================================\n", flush=True)
 
-    # ==============================================================================
-    # Phase 7: Automated Post-Processing Handoff
-    # ==============================================================================
     print("[6] AUTOMATED HANDOFF: Post-Processing Synthesis...", flush=True)
     
-    # Dynamically resolve the post-process script relative to this script's execution path
     current_script_dir = Path(__file__).resolve().parent
     post_process_script = (current_script_dir / "3-post_process_synthesis.py").resolve()
     
     if post_process_script.exists():
         try:
-            # Execute the script, passing the final MD file and the working directory
             subprocess.run(
                 ["python3", str(post_process_script), str(final_file_path), str(run_directory)], 
                 cwd=work_dir, 
