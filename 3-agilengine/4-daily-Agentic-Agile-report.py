@@ -113,11 +113,11 @@ def mark_file_processed(file_path: Path) -> None:
 # LLM Cluster & Session Management
 # ==============================================================================
 
-raw_worker_endpoints = os.getenv("WORKER_ENDPOINTS", "http://192.168.2.137:8034/v1/chat/completions")
+raw_worker_endpoints = os.getenv("WORKER_ENDPOINTS", "http://localhost:8034/v1/chat/completions")
 WORKER_ENDPOINTS = [e.strip() for e in raw_worker_endpoints.split(",") if e.strip()]
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 
-ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://192.168.2.137:8080/v1/chat/completions")
+ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://localhost:8080/v1/chat/completions")
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
 
 MAX_SESSIONS_PER_ENDPOINT = 2
