@@ -17,16 +17,14 @@ from openai import OpenAI
 # ==============================================================================
 
 ORCHESTRATOR_ENDPOINTS = [
-    "http://192.168.2.134:8080/v1",
-    "http://192.168.2.137:8080/v1"
+    "http://localhost:8080/v1"
 ]
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "nvidia_Orchestrator-8B-Q6_K.gguf")
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
 MAX_RETRIES = 3
 
 WORKER_ENDPOINTS = [
-    "http://192.168.2.137:8034/v1",
-    "http://192.168.2.137:8035/v1"
+    "http://localhost:8034/v1"
 ]
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.5-9B-IQ4_XS.gguf")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
