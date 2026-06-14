@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import queue
 import threading
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
@@ -541,4 +542,29 @@ if __name__ == "__main__":
     print(f"    Total Cluster Tokens:   {global_input_tokens + global_output_tokens:,}", flush=True)
     print(f"    [+] Synthesis Payload Size: {len(final_output):,} characters", flush=True)
     print(f"    Run Master Directory:   {run_directory.absolute()}", flush=True)
-    print("==============================================================================", flush=True)
+    print("==============================================================================\n", flush=True)
+
+    # ==============================================================================
+    # Phase 7: Automated Post-Processing Handoff
+    # ==============================================================================
+    print("[6] AUTOMATED HANDOFF: Post-Processing Synthesis...", flush=True)
+    
+    # Dynamically resolve the post-process script relative to this script's execution path
+    current_script_dir = Path(__file__).resolve().parent
+    post_process_script = (current_script_dir / "3-post_process_synthesis.py").resolve()
+    
+    if post_process_script.exists():
+        try:
+            # Execute the script, passing the final MD file and the working directory
+            subprocess.run(
+                ["python3", str(post_process_script), str(final_file_path), str(run_directory)], 
+                cwd=work_dir, 
+                check=True
+            )
+            print("    [+] Post-processing pipeline completed successfully.", flush=True)
+        except subprocess.CalledProcessError as e:
+            print(f"    [!] Post-processing script failed with exit code: {e.returncode}", flush=True)
+        except Exception as e:
+            print(f"    [!] Execution error during handoff: {e}", flush=True)
+    else:
+        print(f"    [!] Could not locate {post_process_script.name}. Skipping automated handoff.", flush=True)
