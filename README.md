@@ -5,6 +5,8 @@
 
 A collection of utilities and autonomous workflows for the ThereminQ project. This repo acts as the nexus for AI-driven automation, bridging project management, deep research, workspace synchronization, and generative reporting.
 
+
+
 ### VDI Environment
 
 To run the VDI environment, you can use the following command:
@@ -15,6 +17,9 @@ docker run --gpus all --device=/dev/kfd --device=/dev/dri:/dev/dri -p 6080:6080 
 
 It is a good safety measure to also run the Inference engines with tooling enabled inside a container because 
 - preinstalled tooling and guardrails are provided by the Docker engine
+
+
+<img width="2720" height="2480" alt="thereminq_autoresearch_architecture" src="https://github.com/user-attachments/assets/c6e71290-7cba-4c90-9524-c192f65346b4" />
 
 
 ## Scripts
@@ -124,9 +129,6 @@ To create a fully cohesive local AI ecosystem, start the scripts in the followin
 4. **Integrations & Interfaces:** Start bridge services like `4-MCPs/Agentic-local-MCP.py` and `4-MCPs/Atlassian-ingress-MCP.py` to expose local state to external tools, and run `9-misc/local-discord-bot.py` to provide a conversational interface.
 5. **On-Demand Utilities:** Use scripts like `9-misc/deep-local-research.py`, `9-misc/git-compare-and-merge.py`, or `5-viz/a1111-status-visualizer.py` as needed for specific tasks, leveraging the established infrastructure.
 
-## Architecture Visuals
+## Visualisation of Architecture
 
-<img width="2816" height="1536" alt="Gemini_Generated_Image_3cnxrm3cnxrm3cnx" src="https://github.com/user-attachments/assets/100a743b-a893-42b5-8e37-3dbc221ed72f" />
-<img width="2816" height="1536" alt="Gemini_Generated_Image_j6xa7dj6xa7dj6xa" src="https://github.com/user-attachments/assets/db95e0fa-c8bb-4e96-9aac-9c9224aa1ed2" />
-<img width="2816" height="1536" alt="gemini_generated_image_j0jsqnj0jsqnj0js" src="https://github.com/user-attachments/assets/79406291-6eba-4621-aebd-387f852a714a" />
-<img width="2528" height="1696" alt="gemini_generated_image_x8xdflx8xdflx8xd" src="https://github.com/user-attachments/assets/62637080-7f76-4b5f-b701-04d35eceb793" />
+<img width="1024" height="559" alt="59dd6e06-67a8-4e34-963a-2a0bcfbb1f92" src="https://github.com/user-attachments/assets/eb4a275a-c59d-4fcd-8b73-6be2f3d45e80" />
