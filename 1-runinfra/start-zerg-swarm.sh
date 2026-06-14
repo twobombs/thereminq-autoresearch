@@ -8,7 +8,7 @@
 
 # Configuration
 MODEL="/media/aryan/nvme/models/Qwen3.5-9B-IQ4_XS.gguf"
-SERVER_BIN="/media/aryan/nvme/llama.cpp/build/bin/llama-server"
+SERVER_BIN="../0-build/llama.cpp/build/bin/llama-server"
 LOG_DIR="./agent_logs"
 
 # Ensure the log directory exists
