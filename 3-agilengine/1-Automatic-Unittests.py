@@ -110,7 +110,7 @@ def _extract_error_line(output: str, lang: str) -> str:
     # FIX: if all lines were summary lines, return a meaningful sentinel rather
     # than falling back to a summary line that carries no actionable context.
     if not filtered_lines:
-        return "(pytest summary only — no error detail captured)"
+        return "(pytest summary only - no error detail captured)"
 
     if lang in ("python", "py"):
         # 1. Pytest 'E ' prefix
@@ -162,23 +162,17 @@ def _sanitize_requirements_file(filepath: Path) -> None:
             has_space = ' ' in s_line
             has_operator = any(op in s_line for op in valid_pip_operators)
 
-            # FIX: A line like "--index-url https://... extra words" passes the
-            # original has_operator check because '--' is in the operator list,
-            # but it is still malformed. Tighten the heuristic: if the line has
-            # spaces AND an operator, only keep it when every whitespace-delimited
-            # token that contains a space looks like a URL, environment marker,
-            # or a known pip flag — i.e. no bare English words follow the URL.
+            # Tighten the heuristic: if the line has spaces AND an operator,
+            # only keep it when every whitespace-delimited token that contains
+            # a space looks like a URL, environment marker, or a known pip flag.
             if has_space and has_operator:
                 tokens = s_line.split()
-                # First token must be a known pip flag, URL scheme, or package spec
                 first_tok = tokens[0]
                 looks_like_pip = (
                     first_tok.startswith('-')          # flag like --index-url, -r, -e
                     or '://' in first_tok              # direct URL
                     or re.match(r'^[A-Za-z0-9_\-\.]+', first_tok)  # package name
                 )
-                # If there are tokens beyond the first two (flag + value) and they
-                # look like plain English words (no operators, no URLs), strip the line.
                 extra_tokens = tokens[2:] if len(tokens) > 2 else []
                 has_plain_english_suffix = any(
                     not re.search(r'[=<>!~@;:/]', tok) and tok.isalpha() and len(tok) > 2
@@ -246,8 +240,7 @@ def extract_code_blocks(md_content: str, output_dir: str | Path) -> list:
             else:
                 candidate = None
 
-            # FIX: warn when a previously detected filename is about to be
-            # clobbered by a new header before any fence has opened.
+            # Warn when a previously detected filename is about to be clobbered
             if candidate is not None:
                 if detected_filename is not None and detected_filename != candidate:
                     print(
@@ -411,8 +404,7 @@ def request_unittests_from_worker(
 
                 test_code = choices[0].get("message", {}).get("content", "")
 
-                # FIX: treat empty content as a transient error and retry,
-                # rather than treating it as a permanent failure with break.
+                # Treat empty content as a transient error and retry
                 if not test_code:
                     last_exception = RuntimeError(
                         f"Empty content in response for {artifact['filename']}: {result}"
@@ -491,7 +483,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
 
     try:
         if lang in ("python", "py"):
-            # FIX: use test_path.parent as cwd and inject it into PYTHONPATH so
+            # Use test_path.parent as cwd and inject it into PYTHONPATH so
             # relative imports resolve correctly regardless of nesting depth.
             env = os.environ.copy()
             src_dir = str(test_path.parent)
@@ -540,7 +532,7 @@ def execute_test_artifact(test_meta: dict) -> dict:
         elif lang in ("c", "cpp"):
             compiler = "gcc" if lang == "c" else "g++"
 
-            # FIX: use a temp file for the binary to avoid path collisions when
+            # Use a temp file for the binary to avoid path collisions when
             # two artifacts share the same stem (e.g. utils.c and utils.cpp).
             with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
                 binary_path = Path(tmp.name)
@@ -620,12 +612,10 @@ if __name__ == "__main__":
 
     if not source_path.exists():
         print(f"Error: Could not find {source_path}. Please ensure the file exists and the path is correct.")
-        # FIX: sys.exit flushes buffers correctly in all implementations;
-        # bare exit() is a REPL convenience and not appropriate here.
         sys.exit(1)
 
-    # Dynamic Workspace generation based on the source file location
-    OUTPUT_WORKSPACE = source_path.parent / f"{source_path.stem}_workspace"
+    # Bind the workspace entirely to the target directory containing the markdown file
+    OUTPUT_WORKSPACE = source_path.parent
     TEST_OUTPUT_DIR = OUTPUT_WORKSPACE / "tests"
     REPORT_OUTPUT_DIR = OUTPUT_WORKSPACE / "reports"
 
@@ -781,7 +771,7 @@ if __name__ == "__main__":
         with open(json_report_path, "w", encoding="utf-8") as f:
             json.dump(execution_results, f, indent=4)
 
-        # FIX: extrasaction='ignore' prevents DictWriter from raising if result
+        # extrasaction='ignore' prevents DictWriter from raising if result
         # dicts ever acquire extra debugging keys during future development.
         with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS, extrasaction='ignore')
@@ -793,3 +783,32 @@ if __name__ == "__main__":
         print(f"    - {csv_report_path}")
 
     print("\n=== Pipeline execution complete ===")
+
+    # ---------------------------------------------------------------------
+    # Phase 4 - Automated Handoff to Todo-Project-Distill
+    # ---------------------------------------------------------------------
+    print("\n=== Phase 4: Automated Handoff ===")
+    
+    current_script_dir = Path(__file__).resolve().parent
+    distill_script = (current_script_dir.parent / "3-agilengine" / "2-Todo-Project-Distill.py").resolve()
+    
+    # Fallback to the current directory if it couldn't be resolved in the parent structure
+    if not distill_script.exists():
+        distill_script = (current_script_dir / "2-Todo-Project-Distill.py").resolve()
+
+    if distill_script.exists():
+        print(f"Initiating handoff to {distill_script.name}...")
+        try:
+            # Pass the bound directory directly to the distillation pipeline
+            subprocess.run(
+                ["python3", str(distill_script), str(OUTPUT_WORKSPACE.absolute())],
+                cwd=str(OUTPUT_WORKSPACE),
+                check=True
+            )
+            print("    [+] Todo distillation pipeline completed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"    [!] Distillation script failed with exit code: {e.returncode}")
+        except Exception as e:
+            print(f"    [!] Execution error during handoff: {e}")
+    else:
+        print(f"    [!] Could not locate {distill_script.name}. Skipping automated handoff.")
