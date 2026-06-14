@@ -10,7 +10,7 @@ from pathlib import Path
 # ==============================================================================
 
 # Target the Orchestrator node for high-level distillation tasks
-ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://192.168.2.137:8080/v1/chat/completions")
+ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://localhost:8080/v1/chat/completions")
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
 
 # Tuned for a 40k token context window (~3.5 chars per token = ~140,000 chars max)
