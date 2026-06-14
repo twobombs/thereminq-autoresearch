@@ -106,8 +106,12 @@ It is a good safety measure to also run the Inference engines with tooling enabl
 To create a fully cohesive local AI ecosystem, start the scripts in the following logical sequence:
 
 1. **Infrastructure:** Execute `1-runinfra/start-zerg-swarm.sh` to ignite the underlying LLM swarm, ensuring all local API endpoints (e.g., ports 8030-8035) are online and ready to accept requests.
-2. **Orchestration:** Launch `2-startcore/2-full-agentic-workflow.py` to establish the master routing and task breakdown capabilities across the swarm.
-3. **Project State & Knowledge:** Run `3-agilengine/Agentic-Agile.py` to ingest new context and update the agile state (`project_state.json`).
+2. **Orchestration & Automated Pipeline:** Launch `2-startcore/2-full-agentic-workflow.py` to establish the master routing and task breakdown capabilities across the swarm. This now acts as an automated pipeline cascading into:
+    * `2-startcore/3-post_process_synthesis.py` for text processing,
+    * `3-agilengine/1-Automatic-Unittests.py` for automated test generation and execution,
+    * `3-agilengine/2-Todo-Project-Distill.py` to generate tasks from tests and logs,
+    * `2-startcore/1-distill-macrotask.py` to convert those tasks into actionable items.
+3. **Project State & Knowledge:** Run `3-agilengine/4-daily-Agentic-Agile-report.py` to ingest new context and update the agile state (`project_state.json`).
 4. **Integrations & Interfaces:** Start bridge services like `4-MCPs/Agentic-local-MCP.py` and `4-MCPs/Atlassian-ingress-MCP.py` to expose local state to external tools, and run `9-misc/local-discord-bot.py` to provide a conversational interface.
 5. **On-Demand Utilities:** Use scripts like `9-misc/deep-local-research.py`, `9-misc/git-compare-and-merge.py`, or `5-viz/a1111-status-visualizer.py` as needed for specific tasks, leveraging the established infrastructure.
 
