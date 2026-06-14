@@ -1,6 +1,6 @@
 #!/bin/bash
 
-apt install build-essential cmake glslang-tools spirv-headers 
+apt install -y build-essential cmake glslang-tools spirv-headers 
 git clone https://github.com/ggml-org/llama.cpp.git
 
 cd llama.cpp
