@@ -7,16 +7,22 @@ import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from fpdf import FPDF
+from urllib.parse import urlparse
 
 # --- 1. CONFIGURATION ---
-ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://192.168.2.134:8033/v1")
-REASONING_URL = os.getenv("REASONING_URL", "http://192.168.2.137:8033/v1")
 
-# Deep Scrape Limits (Safely tuned for 40k/131k context windows)
+def secure_local_endpoint(url: str):
+    """Enforces that scripts using 'api_key=not-needed' don't silently leak to the cloud."""
+    parsed = urlparse(url)
+    if parsed.hostname not in ["localhost", "127.0.0.1", "0.0.0.0"] and not parsed.hostname.startswith("192.168."):
+        raise ValueError(f"SECURITY HALT: Attempted to bind unauthenticated client to external endpoint: {url}")
+    return url
+
+ORCHESTRATOR_URL = secure_local_endpoint(os.getenv("ORCHESTRATOR_URL", "http://192.168.2.134:8033/v1"))
+REASONING_URL = secure_local_endpoint(os.getenv("REASONING_URL", "http://192.168.2.137:8033/v1"))
+
 MAX_SEARCH_RESULTS = 4
 CHARS_PER_PAGE = 15000 
-
-# Timeout Fix: Gives the 35B model 10 minutes to read massive texts
 CLIENT_TIMEOUT = (10.0, 600.0)
 
 # Client Setup
@@ -33,21 +39,17 @@ reason_client = openai.OpenAI(
 
 # --- 2. DEEP WEB SCRAPING TOOL (WITH SMART FILTERING) ---
 def perform_web_search(query):
-    """Searches DDG, filters out video sites, and extracts deep page content."""
     print(f"🔍 [Orchestrator] Searching Web for: {query}")
     try:
-        # Fetch 10 results initially to have backups when skipping videos
         results = DDGS().text(query, max_results=10) 
         
         if not results:
             return "No results found."
-
+            
         combined_content_parts = []
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
-        # Domains our text-scraper should avoid (JS-heavy or video platforms)
         banned_domains = ["youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "instagram.com"]
-        
         valid_pages_scraped = 0
 
         for res in results:
@@ -58,7 +60,6 @@ def perform_web_search(query):
             title = res.get("title", "Unknown Title")
             snippet = res.get("body", "")
             
-            # Skip the link if it's a video/image site
             if any(domain in url for domain in banned_domains):
                 print(f"   ⏭️ [Skipping Video Link]: {url}")
                 continue
@@ -70,15 +71,12 @@ def perform_web_search(query):
                 if page_resp.status_code == 200:
                     soup = BeautifulSoup(page_resp.text, 'html.parser')
                     
-                    # Destroy unwanted elements
                     for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
                         element.extract()
                     
-                    # Extract raw text and clean spaces
                     text = soup.get_text(separator=' ', strip=True)
                     text = re.sub(r'\s+', ' ', text)
                     
-                    # Truncate to protect KV cache limits
                     if len(text) > CHARS_PER_PAGE:
                         text = text[:CHARS_PER_PAGE] + "... [CONTENT TRUNCATED FOR LENGTH]"
                 else:
@@ -97,26 +95,23 @@ def perform_web_search(query):
 
 # --- 3. PDF GENERATION ---
 def sanitize_filename(query):
-    """Cleans the query string to make it a valid, safe filename."""
     clean_name = re.sub(r'[^\w\s-]', '', query).strip().replace(' ', '_')
     return clean_name[:50] + ".pdf"
 
 def save_to_pdf(query, content):
-    """Saves the output to a formatted PDF."""
     filename = sanitize_filename(query)
     print(f"\n💾 [System] Saving output to {filename}...")
     
     pdf = FPDF()
     pdf.add_page()
     
-    # Title
     pdf.set_font("helvetica", style="B", size=14)
     pdf.multi_cell(0, 10, text=f"Query: {query}")
     pdf.ln(5)
     
-    # Body
     pdf.set_font("helvetica", size=11)
     safe_content = content.encode('latin-1', 'replace').decode('latin-1')
+    
     pdf.multi_cell(0, 6, text=safe_content)
     
     pdf.output(filename)
@@ -124,7 +119,6 @@ def save_to_pdf(query, content):
 
 # --- 4. THE WORKFLOW ENGINE ---
 def run_orchestration_loop(user_query):
-    # STEP A: Tool Planning
     print("🤖 [Orchestrator] Planning strategy...")
     tools = [{
         "type": "function",
@@ -154,7 +148,6 @@ def run_orchestration_loop(user_query):
     else:
         print("💡 [Orchestrator] No search required.")
 
-    # STEP B: Reasoning (Streaming + Leash)
     print("\n🧠 [Reasoner] Processing deep logic (Live Draft):\n" + "-"*50)
     draft_parts = []
     try:
@@ -165,11 +158,10 @@ def run_orchestration_loop(user_query):
                 {"role": "user", "content": f"FACTS:\n{context}\n\nUSER TASK: {user_query}"}
             ],
             stream=True,
-            max_tokens=2048 # <-- THE LEASH: Stops runaway generation loops
+            max_tokens=2048 
         )
         
         for chunk in reasoning_stream:
-            # Bulletproof chunk parsing
             if chunk.choices and len(chunk.choices) > 0:
                 delta = chunk.choices[0].delta
                 if hasattr(delta, 'content') and delta.content:
@@ -183,12 +175,10 @@ def run_orchestration_loop(user_query):
     draft = "".join(draft_parts)
     print("\n" + "-"*50)
     
-    # Fallback if 35B failed to output anything
     if not draft.strip():
         print("⚠️ [Warning] The 35B model returned an empty response.")
         print("🦸 [Fallback] The 8B Orchestrator will now attempt to write the report from scratch.")
 
-    # STEP C: Sanity Check & Formatting (Streaming)
     print("\n⚖️ [Orchestrator] Verifying and formatting final report (Live Edit):\n" + "="*50)
     editor_prompt = f"""
     FACTS FROM WEB: 
@@ -197,11 +187,11 @@ def run_orchestration_loop(user_query):
     DRAFT ANSWER: 
     {draft}
     
-    TASK: You are the final-stage Editor. Review the Draft Answer against the Facts. 
+    TASK: You are the final-stage Editor. Review the Draft Answer against the Facts.
     - If the draft has logic errors, is empty, or has hallucinations, rewrite it into a corrected final response based ONLY on the facts.
     - If the draft is perfect, just output the draft as-is, polished for the user.
-    
-    CRITICAL RULE: DO NOT include meta-commentary, audit notes, or explain your grading process. Output ONLY the final, polished report intended for the user.
+    CRITICAL RULE: DO NOT include meta-commentary, audit notes, or explain your grading process.
+    Output ONLY the final, polished report intended for the user.
     """
 
     verification_parts = []
@@ -246,4 +236,3 @@ if __name__ == "__main__":
         print(f"✅ [Success] Report generated: {os.path.abspath(saved_file)}")
     except Exception as e:
         print(f"\n❌ [Error] The workflow failed: {str(e)}")
-        
