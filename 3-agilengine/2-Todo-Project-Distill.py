@@ -9,7 +9,12 @@ from pathlib import Path
 # ==============================================================================
 
 # Target the Orchestrator node for high-level distillation tasks
-ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://192.168.2.134:8080/v1/chat/completions")
+ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://192.168.2.137:8080/v1/chat/completions")
+ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
+
+# Tuned for a 40k token context window (~3.5 chars per token = ~140,000 chars max)
+# Set to 120k to leave ample room for system prompts and output generation
+MAX_CONTEXT_CHARS = 120000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,23 +33,36 @@ def extract_project_tasks(project_name: str, raw_content: str) -> str | None:
     
     system_prompt = (
         "You are a ruthless, highly technical Lead Engineer and Project Manager. "
-        "Read the provided raw documentation and extract ONLY a succinct, actionable "
+        "Read the provided raw documentation and extract a succinct, actionable "
         "list of explicit TO-DOs, architectural requirements, and implementation tasks. "
-        "Output a clean, highly structured Markdown checklist. Do not include conversational filler."
+        "\n\nCRITICAL DIRECTIVES: "
+        "\n1. TEST TELEMETRY: Hunt for any unit test execution logs, reports, or telemetry. "
+        "Create a distinct 'Test Execution Status' section detailing passes and failures. "
+        "Convert any failures into high-priority TO-DO items."
+        "\n2. EMBED ARTIFACTS: For EVERY task or failed test, you MUST extract and embed the relevant "
+        "source artifact directly beneath the task description. If a task involves a specific function, "
+        "include the code snippet. If it involves an error, include the traceback. "
+        "Format these artifacts using proper markdown code fences and explicitly label the source filename."
+        "\n\nOutput a clean, highly structured Markdown document. Do not include conversational filler."
     )
+    
+    headers = {
+        "Authorization": f"Bearer {ORCH_API_KEY}",
+        "Content-Type": "application/json"
+    }
     
     payload = {
         "model": "local-model",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Extract actionable tasks from this {project_name} documentation:\n\n{raw_content}"}
+            {"role": "user", "content": f"Extract actionable tasks, test outcomes, and relevant artifacts from this {project_name} documentation:\n\n{raw_content}"}
         ],
-        "temperature": 0.2, # Low temperature for analytical precision
-        "max_tokens": 4096
+        "temperature": 0.2, 
+        "max_tokens": 8192  # Scaled up output limit if the model supports extended generation
     }
 
     try:
-        response = requests.post(ORCHESTRATOR_ENDPOINT, json=payload, timeout=300)
+        response = requests.post(ORCHESTRATOR_ENDPOINT, headers=headers, json=payload, timeout=600)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
@@ -56,24 +74,30 @@ def extract_project_tasks(project_name: str, raw_content: str) -> str | None:
 # ==============================================================================
 
 def process_project_directory(project_dir: Path) -> bool:
-    """Scans a single project directory, concatenates raw files, and generates a distilled task list."""
+    """Scans a single project directory, concatenates raw files strictly in read-only mode, and generates a distilled task list."""
     project_name = project_dir.name
     
-    # Look for raw text/markdown files within the project (adjust extensions as needed)
-    raw_files = list(project_dir.rglob("*.txt")) + list(project_dir.rglob("*.md"))
+    # Expanded scope to catch CSV and JSON test reports alongside standard logs
+    raw_files = (
+        list(project_dir.rglob("*.txt")) + 
+        list(project_dir.rglob("*.md")) + 
+        list(project_dir.rglob("*.csv")) + 
+        list(project_dir.rglob("*.json"))
+    )
     
-    # Exclude existing distilled files or project state files to prevent infinite loops
+    # Exclude existing distilled files or project state files to prevent recursive ingestion
     raw_files = [f for f in raw_files if "DISTILLED_TASKS" not in f.name and "project_state" not in f.name]
 
     if not raw_files:
-        log.info(f"[{project_name}] No raw documentation found. Skipping.")
+        log.info(f"[{project_name}] No raw documentation or test logs found. Skipping.")
         return False
 
-    log.info(f"[{project_name}] Found {len(raw_files)} raw files. Aggregating context...")
+    log.info(f"[{project_name}] Found {len(raw_files)} raw files. Aggregating context (Read-Only)...")
     
     aggregated_content = []
     for file_path in raw_files:
         try:
+            # STRICT READ-ONLY: Artifacts are read into memory, not altered or moved
             with open(file_path, "r", encoding="utf-8") as f:
                 aggregated_content.append(f"--- SOURCE: {file_path.name} ---\n{f.read()}")
         except Exception as e:
@@ -81,15 +105,15 @@ def process_project_directory(project_dir: Path) -> bool:
 
     full_text = "\n\n".join(aggregated_content)
     
-    # Failsafe: Prevent blowing out the context window if a project folder contains massive logs
-    char_limit = 40000 
-    if len(full_text) > char_limit:
-        log.warning(f"[{project_name}] Aggregated text exceeds {char_limit} characters. Truncating.")
-        full_text = full_text[:char_limit] + "\n\n...[CONTENT TRUNCATED FOR CONTEXT LIMITS]..."
+    # Leverage the expanded 40k token context window
+    if len(full_text) > MAX_CONTEXT_CHARS:
+        log.warning(f"[{project_name}] Aggregated text exceeds {MAX_CONTEXT_CHARS} characters. Truncating.")
+        full_text = full_text[:MAX_CONTEXT_CHARS] + "\n\n...[CONTENT TRUNCATED FOR CONTEXT LIMITS]..."
 
     distilled_markdown = extract_project_tasks(project_name, full_text)
     
     if distilled_markdown:
+        # The output artifact is written directly into the target directory
         output_file = project_dir / "DISTILLED_TASKS.md"
         try:
             with open(output_file, "w", encoding="utf-8") as f:
@@ -106,7 +130,7 @@ def process_project_directory(project_dir: Path) -> bool:
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Distill Raw Documents for a Single Project Directory.")
+    parser = argparse.ArgumentParser(description="Distill Raw Documents and Test Logs for a Single Project Directory.")
     parser.add_argument(
         "project_dir", 
         type=str, 
@@ -114,6 +138,7 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve the absolute path to bind the script strictly to the CLI input
     project_path = Path(args.project_dir).resolve()
     
     if not project_path.exists() or not project_path.is_dir():
@@ -123,7 +148,11 @@ def main():
     log.info("==================================================")
     log.info(f"STARTING PROJECT DISTILLATION")
     log.info(f"Target Project: {project_path.name}")
+    log.info(f"Working Directory Bound To: {project_path}")
     log.info("==================================================\n")
+
+    # Explicitly change the current working directory to the target to enforce local operation
+    os.chdir(project_path)
 
     success = process_project_directory(project_path)
 
@@ -136,3 +165,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
