@@ -3,6 +3,8 @@
 
 # ThereminQ Autoresearch
 
+> **Note:** The repository scripts have been overhauled and finalized.
+
 A collection of utilities and autonomous workflows for the ThereminQ project. This repo acts as the nexus for AI-driven automation, bridging project management, deep research, workspace synchronization, and generative reporting.
 
 
