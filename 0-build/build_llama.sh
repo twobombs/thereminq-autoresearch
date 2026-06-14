@@ -10,5 +10,4 @@ cmake --build build --config Release -j$(nproc)
 
 cd ..
 
-cp -r ./llama.cpp ./llama.cpp-embedded
 cp -r ./llama.cpp ./llama.orch
