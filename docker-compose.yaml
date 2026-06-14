@@ -27,14 +27,19 @@ services:
   orchestrator:
     image: twobombs/thereminq-tensors:jupyter
     container_name: thereminq-orchestrator
+    working_dir: /notebooks/thereminq/thereminq-autoresearch/0-build
     ports:
       - "8080:8080"
     devices:
       - /dev/dri:/dev/dri
-    # Pointing directly to the built binary and fetched model natively inside the image
+    # Ensures scripts are executable, checks for missing models/binaries, builds, then starts.
     command: >
-      /notebooks/thereminq/thereminq-autoresearch/0-build/llama.orch/build/bin/llama-server
-      -m /notebooks/thereminq/thereminq-autoresearch/0-build/nvidia_Orchestrator-8B-Q6_K.gguf
+      bash -c "
+      chmod +x fetch_llamas.sh build_llama.sh &&
+      if [ ! -f nvidia_Orchestrator-8B-Q6_K.gguf ]; then ./fetch_llamas.sh; fi &&
+      if [ ! -f llama.orch/build/bin/llama-server ]; then ./build_llama.sh; fi &&
+      ./llama.orch/build/bin/llama-server
+      -m nvidia_Orchestrator-8B-Q6_K.gguf
       -ngl 99
       --no-cache-idle-slots
       --cache-ram 0
@@ -53,6 +58,7 @@ services:
       --host 0.0.0.0
       --port 8080
       --device VULKAN1
+      "
     restart: unless-stopped
 
   # ==============================================================================
@@ -61,13 +67,18 @@ services:
   worker-1:
     image: twobombs/thereminq-tensors:jupyter
     container_name: thereminq-worker-1
+    working_dir: /notebooks/thereminq/thereminq-autoresearch/0-build
     ports:
       - "8034:8034"
     devices:
       - /dev/dri:/dev/dri
     command: >
-      /notebooks/thereminq/thereminq-autoresearch/0-build/llama.cpp/build/bin/llama-server
-      -m /notebooks/thereminq/thereminq-autoresearch/0-build/Qwen3.5-9B-IQ4_XS.gguf
+      bash -c "
+      chmod +x fetch_llamas.sh build_llama.sh &&
+      if [ ! -f Qwen3.5-9B-IQ4_XS.gguf ]; then ./fetch_llamas.sh; fi &&
+      if [ ! -f llama.cpp/build/bin/llama-server ]; then ./build_llama.sh; fi &&
+      ./llama.cpp/build/bin/llama-server
+      -m Qwen3.5-9B-IQ4_XS.gguf
       -c 196608
       -np 2
       -ngl 999
@@ -85,6 +96,7 @@ services:
       --port 8034
       --tools all
       --fit off
+      "
     restart: always
 
   # ==============================================================================
@@ -93,13 +105,18 @@ services:
   worker-2:
     image: twobombs/thereminq-tensors:jupyter
     container_name: thereminq-worker-2
+    working_dir: /notebooks/thereminq/thereminq-autoresearch/0-build
     ports:
       - "8035:8035"
     devices:
       - /dev/dri:/dev/dri
     command: >
-      /notebooks/thereminq/thereminq-autoresearch/0-build/llama.cpp/build/bin/llama-server
-      -m /notebooks/thereminq/thereminq-autoresearch/0-build/Qwen3.5-9B-IQ4_XS.gguf
+      bash -c "
+      chmod +x fetch_llamas.sh build_llama.sh &&
+      if [ ! -f Qwen3.5-9B-IQ4_XS.gguf ]; then ./fetch_llamas.sh; fi &&
+      if [ ! -f llama.cpp/build/bin/llama-server ]; then ./build_llama.sh; fi &&
+      ./llama.cpp/build/bin/llama-server
+      -m Qwen3.5-9B-IQ4_XS.gguf
       -c 196608
       -np 2
       -ngl 999
@@ -117,4 +134,5 @@ services:
       --port 8035
       --tools all
       --fit off
+      "
     restart: always
