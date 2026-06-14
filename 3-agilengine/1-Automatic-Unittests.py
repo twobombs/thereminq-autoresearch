@@ -21,8 +21,7 @@ import requests
 # Map these ports to your llama.cpp instances bound to specific GPUs.
 # =====================================================================
 WORKER_ENDPOINTS = [
-    "http://192.168.2.137:8034/v1/chat/completions",  # Target: GPU 0
-    "http://192.168.2.137:8035/v1/chat/completions",  # Target: GPU 1
+    "http://localhost:8034/v1/chat/completions"
 ]
 
 # Configurable multiplier for concurrent requests per endpoint.
