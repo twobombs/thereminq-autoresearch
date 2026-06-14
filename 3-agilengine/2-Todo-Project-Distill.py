@@ -2,6 +2,7 @@ import os
 import argparse
 import logging
 import requests
+import subprocess
 from pathlib import Path
 
 # ==============================================================================
@@ -13,8 +14,8 @@ ORCHESTRATOR_ENDPOINT = os.getenv("ORCHESTRATOR_ENDPOINT", "http://192.168.2.137
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
 
 # Tuned for a 40k token context window (~3.5 chars per token = ~140,000 chars max)
-# Set to 120k to leave ample room for system prompts and output generation
-MAX_CONTEXT_CHARS = 120000
+# Scaled down to 60k to prevent KV cache thrashing and TTFT bottlenecks
+MAX_CONTEXT_CHARS = 60000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,7 +117,7 @@ def process_project_directory(project_dir: Path) -> bool:
 
     full_text = "\n\n".join(aggregated_content)
     
-    # Leverage the expanded 40k token context window
+    # Leverage the truncated 60k token context window for KV cache health
     if len(full_text) > MAX_CONTEXT_CHARS:
         log.warning(f"[{project_name}] Aggregated text exceeds {MAX_CONTEXT_CHARS} characters. Truncating.")
         full_text = full_text[:MAX_CONTEXT_CHARS] + "\n\n...[CONTENT TRUNCATED FOR CONTEXT LIMITS]..."
@@ -170,6 +171,32 @@ def main():
     log.info("\n==================================================")
     if success:
         log.info(f"DISTILLATION FINISHED SUCCESSFULLY")
+        
+        # --- AUTOMATED HANDOFF ---
+        # Calculate the absolute path to the macrotask script relative to THIS script's location
+        current_script_dir = Path(__file__).resolve().parent
+        macrotask_script = (current_script_dir.parent / "2-startcore" / "1-distill-macrotask.py").resolve()
+        
+        distilled_file = project_path / "DISTILLED_TASKS.md"
+        
+        if macrotask_script.exists():
+            log.info(f"Initiating seamless handoff to {macrotask_script.name}...")
+            try:
+                # Execute the macrotask script. 
+                # Pass the generated markdown file as an argument and lock the CWD to the project path.
+                subprocess.run(
+                    ["python3", str(macrotask_script), str(distilled_file)], 
+                    cwd=project_path, 
+                    check=True
+                )
+                log.info("Handoff pipeline completed successfully.")
+            except subprocess.CalledProcessError as e:
+                log.error(f"Macrotask script failed with exit code: {e.returncode}")
+            except Exception as e:
+                log.error(f"Execution error during handoff: {e}")
+        else:
+            log.warning(f"Could not locate {macrotask_script}. Skipping automated handoff.")
+            
     else:
         log.info(f"DISTILLATION FAILED OR SKIPPED")
     log.info("==================================================")
