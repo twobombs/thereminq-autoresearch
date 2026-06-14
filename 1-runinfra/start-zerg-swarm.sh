@@ -7,7 +7,7 @@
 # ==============================================================================
 
 # Configuration
-MODEL="/media/aryan/nvme/models/Qwen3.5-9B-IQ4_XS.gguf"
+MODEL="../0-build/Qwen3.5-9B-IQ4_XS.gguf"
 SERVER_BIN="../0-build/llama.cpp/build/bin/llama-server"
 LOG_DIR="./agent_logs"
 
