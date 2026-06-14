@@ -12,6 +12,7 @@ import argparse
 import time
 import queue
 import concurrent.futures
+import subprocess
 from pathlib import Path
 from typing import Tuple, List, Dict
 from openai import OpenAI
@@ -301,35 +302,58 @@ def main():
         print(f"    [!] Document fits within a single chunk ({len(raw_markdown):,} chars). Skipping LLM refinement.")
         print("[3] Saving unaltered document as-is...", flush=True)
         
-        with open(output_path, "w", encoding="utf-8") as f:
+        with open(output_path, "w", encoding="ascii", errors="ignore") as f:
             f.write(raw_markdown)
 
         print("\n==============================================================================")
         print("POST-PROCESSING COMPLETE (BYPASSED)")
         print(f"    Unaltered File Saved To: {output_path.absolute()}")
         print("==============================================================================\n")
-        return
-    # --------------------------------------------------------------------------
+        
+    else:
+        # Phase 3: Parallel Chunk Compression
+        distilled_skeleton = parallel_edit_chunks(chunks)
+        
+        # Phase 4: Global Consolidation Pass
+        global_inventory = list(protected_assets.keys())
+        final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
+        
+        # Phase 5: Code Re-injection
+        print("[5] Reassembling final polished document...", flush=True)
+        final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
 
-    # Phase 3: Parallel Chunk Compression
-    distilled_skeleton = parallel_edit_chunks(chunks)
+        with open(output_path, "w", encoding="ascii", errors="ignore") as f:
+            f.write(final_polished_markdown)
+
+        print("\n==============================================================================")
+        print("POST-PROCESSING COMPLETE")
+        print(f"    Cleaned File Saved To: {output_path.absolute()}")
+        print(f"    Size Reduction:        {len(raw_markdown):,} chars -> {len(final_polished_markdown):,} chars")
+        print("==============================================================================\n")
+
+    # ==============================================================================
+    # Phase 6: Automated Post-Processing Handoff to Unittests
+    # ==============================================================================
+    print("[6] AUTOMATED HANDOFF: Triggering Automatic Unittests...", flush=True)
     
-    # Phase 4: Global Consolidation Pass
-    global_inventory = list(protected_assets.keys())
-    final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
+    # Dynamically resolve the path to 1-Automatic-Unittests.py
+    current_script_dir = Path(__file__).resolve().parent
+    unittest_script = (current_script_dir.parent / "3-agilengine" / "1-Automatic-Unittests.py").resolve()
     
-    # Phase 5: Code Re-injection
-    print("[5] Reassembling final polished document...", flush=True)
-    final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(final_polished_markdown)
-
-    print("\n==============================================================================")
-    print("POST-PROCESSING COMPLETE")
-    print(f"    Cleaned File Saved To: {output_path.absolute()}")
-    print(f"    Size Reduction:        {len(raw_markdown):,} chars -> {len(final_polished_markdown):,} chars")
-    print("==============================================================================\n")
+    if unittest_script.exists():
+        try:
+            # Execute the unittest script, passing the generated POLISHED_SYNTHESIS.md file
+            subprocess.run(
+                ["python3", str(unittest_script), str(output_path.absolute())], 
+                check=True
+            )
+            print("    [+] Unittest pipeline completed successfully.", flush=True)
+        except subprocess.CalledProcessError as e:
+            print(f"    [!] Unittest script failed with exit code: {e.returncode}", flush=True)
+        except Exception as e:
+            print(f"    [!] Execution error during handoff: {e}", flush=True)
+    else:
+        print(f"    [!] Could not locate {unittest_script.name}. Skipping automated handoff.", flush=True)
 
 if __name__ == "__main__":
     main()
