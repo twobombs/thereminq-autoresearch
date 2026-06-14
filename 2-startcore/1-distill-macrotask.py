@@ -9,7 +9,7 @@ from openai import OpenAI
 # ==============================================================================
 
 # Using the same local LLM endpoint pattern as the Orchestrator
-DISTILLER_URL = os.getenv("DISTILLER_URL", "http://192.168.2.137:8080/v1")
+DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8080/v1")
 DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "nvidia_Orchestrator-8B-Q6_K.gguf")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
