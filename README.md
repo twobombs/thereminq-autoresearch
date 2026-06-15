@@ -16,7 +16,7 @@ docker run --gpus all --device=/dev/kfd --device=/dev/dri:/dev/dri -p 6080:6080 
 ```
 
 It is a good safety measure to also run the Inference engines with tooling enabled inside a container because 
-- preinstalled tooling and guardrails are provided by the Docker engine
+- preinstalled tooling and guardrails provided by the Docker engine
 
 
 <img width="2720" height="2480" alt="thereminq_autoresearch_architecture" src="https://github.com/user-attachments/assets/c6e71290-7cba-4c90-9524-c192f65346b4" />
