@@ -1800,8 +1800,15 @@ def main():
         for stat in sorted(worker_stats, key=lambda x: x['id']):
             stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} |\n"
         
+        total_prompt = p_tok + w_p + o_p
+        total_comp   = c_tok + w_c + o_c
+
         agg_md = "\n\n## Cluster Aggregate Statistics\n"
         agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
+        agg_md += f"- **Decompose Tokens:** {p_tok} prompt / {c_tok} completion\n"
+        agg_md += f"- **Worker Tokens:** {w_p} prompt / {w_c} completion\n"
+        agg_md += f"- **Orchestrator Tokens:** {o_p} prompt / {o_c} completion\n"
+        agg_md += f"- **Pipeline Total:** {total_prompt} prompt / {total_comp} completion / {total_prompt + total_comp} total\n"
         
         final_output += stats_md + agg_md
         
