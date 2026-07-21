@@ -1,7 +1,9 @@
 # ThereminQ-Autoresearch: A Hierarchical Multi-Agent Framework for Distributed, Context-Aware Automated Software Engineering
 
 **Abstract:**
-As large language models (LLMs) are increasingly integrated into automated software engineering, they face critical bottlenecks regarding context window degradation, catastrophic forgetting, and serial execution inefficiencies. We introduce `thereminq-autoresearch`, a distributed, multi-tier orchestration pipeline explicitly designed to maximize computational throughput on localized, self-hosted hardware. By implementing a hierarchical "pyramid" topology—segmenting agents into Apex (architectural synthesis), Orchestrator (map-reduce routing), and Worker (atomic execution) tiers—the framework overcomes single-LLM limitations. Operating across a strictly defined seven-phase pipeline, `thereminq-autoresearch` introduces robust methodologies for technical distillation, map-reduce chunking, rolling master stitching, and telemetry-driven autonomous testing. This report formalizes the architecture of the framework and grounds its approach in contemporary multi-agent and task decomposition literature.
+As large language models (LLMs) are increasingly integrated into automated software engineering, they face critical bottlenecks regarding context window degradation, catastrophic forgetting, and serial execution inefficiencies. We introduce `thereminq-autoresearch`, a distributed, multi-tier orchestration pipeline explicitly designed to maximize computational throughput on localized, self-hosted hardware. 
+
+By implementing a hierarchical "pyramid" topology—segmenting agents into Apex (architectural synthesis), Orchestrator (map-reduce routing), and Worker (atomic execution) tiers—the framework overcomes single-LLM limitations. Operating across a strictly defined seven-phase pipeline, `thereminq-autoresearch` introduces robust methodologies for technical distillation, map-reduce chunking, rolling master stitching, and telemetry-driven autonomous testing. This report formalizes the architecture of the framework and grounds its approach in contemporary multi-agent and task decomposition literature.
 
 ---
 
@@ -85,3 +87,6 @@ The `thereminq-autoresearch` framework represents a robust, highly pragmatic app
 4. Wang, L., Xu, W., Lan, Y., Hu, Z., Lan, Y., Lee, R. K. W., & Lim, E. P. (2023). **Plan-and-Solve Prompting: Improving Zero-Shot Chain-of-Thought Reasoning by Large Language Models**. *arXiv preprint arXiv:2305.04091*. Available at: [https://arxiv.org/abs/2305.04091](https://arxiv.org/abs/2305.04091)
 5. Shinn, N., Cassano, F., Gopinath, A., Narasimhan, K., & Yao, S. (2023). **Reflexion: Language Agents with Verbal Reinforcement Learning**. *arXiv preprint arXiv:2303.11366*. Available at: [https://arxiv.org/abs/2303.11366](https://arxiv.org/abs/2303.11366)
 6. Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., & Liang, P. (2023). **Lost in the Middle: How Language Models Use Long Contexts**. *arXiv preprint arXiv:2307.03172*. Available at: [https://arxiv.org/abs/2307.03172](https://arxiv.org/abs/2307.03172)
+
+<img width="2816" height="1536" alt="Gemini_Generated_Image_qn4hgqqn4hgqqn4h" src="https://github.com/user-attachments/assets/9b0d020e-b5b3-42c9-bc32-aca01af8ac16" />
+
