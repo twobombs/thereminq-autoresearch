@@ -90,6 +90,7 @@ The `thereminq-autoresearch` framework represents a robust, highly pragmatic app
 
 
 
-
 <img width="2816" height="1536" alt="Gemini_Generated_Image_qn4hgqqn4hgqqn4h" src="https://github.com/user-attachments/assets/9b0d020e-b5b3-42c9-bc32-aca01af8ac16" />
 
+
+note: this document has been generated
