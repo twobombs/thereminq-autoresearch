@@ -6,7 +6,7 @@
   -ngl 0 \
   --load-mode mmap \
   -fa on \
-  -t 96 -tb 96 \
+  -t 48 -tb 48 \
   --reasoning on \
   --reasoning-preserve \
   --host 0.0.0.0 \
