@@ -1,8 +1,7 @@
 # this script starts all requirements for autoresearch to start on a six gpu machine
 
 # 27B 'Apex' substitute - replace with GLM or fronteer Qwen variant
-GGML_VK_VISIBLE_DEVICES=0,1 /root/llama-vulkan/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.6-27B-UD-IQ3_XXS.gguf   --tools all   -c 65536   -np 1   -ngl 999   --load-mode mma
-p   -fa on   -t 48   -tb 48   --reasoning on   --reasoning-preserve   --host 0.0.0.0   --port 8081   --cors-origins "*"   -ctk q8_0   -ctv q4_0   --spec-type draft-mtp   --spec-draft-n-max 3 &
+GGML_VK_VISIBLE_DEVICES=0,1 /root/llama-vulkan/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.6-27B-UD-IQ3_XXS.gguf   --tools all   -c 65536   -np 1   -ngl 999   --load-mode mmap   -fa on   -t 48   -tb 48   --reasoning on   --reasoning-preserve   --host 0.0.0.0   --port 8081   --cors-origins "*"   -ctk q8_0   -ctv q4_0   --spec-type draft-mtp   --spec-draft-n-max 3 &
 
 # orchestrator
 GGML_VK_VISIBLE_DEVICES=2 /root/llama-vulkan-orchestrator/build/bin/llama-server   -m /media/aryan/nvme/models/nvidia_Orchestrator-8B-Q5_K_S.gguf   -ngl 99  --no-cache-idle-slots --cache-ram 0 -c 40960   -b 512   -ub 512   --parallel 1   --no-mmap   --tools all   --jinja   --kv-unified   -fa on   -ctk q8_0   -ctv q4_0   -fit off   --host 0.0.0.0   --port 8080 &
