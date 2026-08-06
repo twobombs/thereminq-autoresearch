@@ -306,6 +306,18 @@ def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
 
     return chunks
 
+def _format_eta(start_time: float, completed: int, total: int) -> str:
+    """Calculates rolling estimated time to completion formatted as a clean string."""
+    if completed == 0 or total == 0:
+        return "--:--"
+    elapsed = time.time() - start_time
+    eta_secs = (elapsed / completed) * (total - completed)
+    mins, secs = divmod(int(eta_secs), 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{hours}h {mins:02d}m"
+    return f"{mins:02d}:{secs:02d}"
+
 
 # ==============================================================================
 # Phase 1: Raw Content Generation
@@ -587,6 +599,8 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
             slot_queue.put(ep)
 
     results = [""] * total
+    completed_count = 0
+    start_time_progress = time.time()
 
     def wrapper(idx: int, payload):
         for _ in range(WORKER_RETRIES):
@@ -596,11 +610,10 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
                 if output and len(output.strip()) >= 20:
                     return output.strip()
             except Exception as e:
-                print(f"        [!] {label} {idx + 1}/{total} attempt failed: {e}", flush=True)
+                pass # Silent retry inline with Map-Reduce abstraction
             finally:
                 slot_queue.put(endpoint)
             time.sleep(2)
-        print(f"        [!] {label} {idx + 1}/{total} exhausted retries. Using bounded fallback.", flush=True)
         return fallback_fn(payload)
 
     pool_size = max(1, len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS)
@@ -608,11 +621,13 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
         future_to_idx = {executor.submit(wrapper, i, job): i for i, job in enumerate(jobs)}
         for future in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[future]
+            completed_count += 1
+            eta_str = _format_eta(start_time_progress, completed_count, total)
             try:
                 results[idx] = future.result()
-                print(f"        [+] {label} {idx + 1}/{total} complete.", flush=True)
+                print(f"        [+] {label} {completed_count}/{total} complete. | ETC: {eta_str}", flush=True)
             except Exception as e:
-                print(f"        [!] {label} {idx + 1}/{total} future raised exception: {e}. Using fallback.", flush=True)
+                print(f"        [!] {label} {completed_count}/{total} future raised exception: {e}. Using fallback. | ETC: {eta_str}", flush=True)
                 results[idx] = fallback_fn(jobs[idx])
     return results
 
@@ -1112,6 +1127,8 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     worker_threads = max(1, min(total_tasks, len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS))
     orch_threads = max(1, min(total_chunks, len(ORCHESTRATOR_ENDPOINTS) * ORCH_PARALLEL_SLOTS))
 
+    start_time_progress = time.time()
+
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_threads) as worker_exec, \
              concurrent.futures.ThreadPoolExecutor(max_workers=orch_threads) as orch_exec:
@@ -1173,7 +1190,8 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 filled = int((workers_finished / total_tasks) * bar_len)
                 bar = '#' * filled + '-' * (bar_len - filled)
                 percent = int((workers_finished / total_tasks) * 100)
-                sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks})")
+                eta_str = _format_eta(start_time_progress, workers_finished, total_tasks)
+                sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks}) | ETC: {eta_str}")
                 sys.stdout.flush()
 
         print() # Clear line format post-loop completion
@@ -1281,6 +1299,8 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
 
     print(f"    [*] Semantic Deduplication: Refining {total_chunks} chunk(s) across {pool_size} slot(s)...", flush=True)
 
+    start_time_progress = time.time()
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
         future_to_idx = {executor.submit(_edit_chunk_worker, i, chunk): i for i, chunk in enumerate(chunks)}
         completed = 0
@@ -1293,7 +1313,8 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
             filled = int((completed / total_chunks) * bar_len)
             bar = '#' * filled + '-' * (bar_len - filled)
             percent = int((completed / total_chunks) * 100)
-            sys.stdout.write(f"\r    [+] Progress: [{bar}] {percent}% ({completed}/{total_chunks})")
+            eta_str = _format_eta(start_time_progress, completed, total_chunks)
+            sys.stdout.write(f"\r    [+] Progress: [{bar}] {percent}% ({completed}/{total_chunks}) | ETC: {eta_str}")
             sys.stdout.flush()
             
     print() # newline after progress loop finishes
@@ -1599,8 +1620,8 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                     
                 with progress_lock:
                     progress_state["done"] += 1
-                    # Note: progress_state["total"] is read-only after initialization
-                    print(f"    [+] [{port}] Generated tests ({progress_state['done']}/{progress_state['total']}) -> {test_filename}")
+                    eta_str = _format_eta(progress_state["start_time"], progress_state["done"], progress_state["total"])
+                    print(f"    [+] [{port}] Generated tests ({progress_state['done']}/{progress_state['total']}) | ETC: {eta_str} -> {test_filename}")
                     
                 generation_metadata = {
                     "filename": test_filename,
@@ -1707,7 +1728,7 @@ def run_phase5_automatic_unittests(source_path: Path):
     testable_artifacts = [a for a in artifacts if a["language"].lower() in valid_langs]
 
     progress_lock = threading.Lock()
-    progress_state = {"done": 0, "total": len(testable_artifacts)}
+    progress_state = {"done": 0, "total": len(testable_artifacts), "start_time": time.time()}
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_gen_workers)
     generated_tests: list[dict] = []
 
