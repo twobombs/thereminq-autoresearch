@@ -1270,11 +1270,24 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
     total_slots = len(ORCHESTRATOR_ENDPOINTS) * CONCURRENT_SLOTS_PER_ENDPOINT
     pool_size = max(1, total_slots)
 
+    print(f"    [*] Semantic Deduplication: Refining {total_chunks} chunk(s) across {pool_size} slot(s)...", flush=True)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
         future_to_idx = {executor.submit(_edit_chunk_worker, i, chunk): i for i, chunk in enumerate(chunks)}
+        completed = 0
         for future in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[future]
             results[idx] = future.result()
+            
+            completed += 1
+            bar_len = 30
+            filled = int((completed / total_chunks) * bar_len)
+            bar = '#' * filled + '-' * (bar_len - filled)
+            percent = int((completed / total_chunks) * 100)
+            sys.stdout.write(f"\r    [+] Progress: [{bar}] {percent}% ({completed}/{total_chunks})")
+            sys.stdout.flush()
+            
+    print() # newline after progress loop finishes
 
     return "\n\n".join(results)
 
@@ -1319,7 +1332,10 @@ def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str],
         return smoothed_skeleton
 
 def global_consolidation_pass(full_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
+    print("    [*] Executive Editor Pass 1: Section Boundary Smoothing...", flush=True)
     smoothed_text = section_boundary_smoothing(full_skeleton, global_inventory, endpoint)
+    
+    print("    [*] Executive Editor Pass 2: Header Unification...", flush=True)
     final_text = header_unification_pass(smoothed_text, global_inventory, endpoint)
 
     missing_placeholders = [p for p in global_inventory if p not in final_text]
@@ -2007,8 +2023,7 @@ def main():
             print(f"[+] Document fits in single chunk. Bypassed LLM refinement. Saved to {output_path}")
         else:
             distilled_skeleton = parallel_edit_chunks(chunks)
-            global_inventory = [k for k in protected_assets.keys() if k != "[[PROTECTED_TELEMETRY_TABLE]]"]
-            final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
+            final_skeleton = global_consolidation_pass(distilled_skeleton, list(protected_assets.keys()), ORCHESTRATOR_ENDPOINTS[0])
             final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
 
             with open(output_path, "w", encoding="ascii", errors="ignore") as f:
