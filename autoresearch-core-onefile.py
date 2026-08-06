@@ -91,8 +91,8 @@ MAX_CONTEXT_CHARS = 60000
 MAX_CHUNK_CHARS = 40000
 
 # Phase 2: Distillation Config
-DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8080/v1")
-DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "nvidia_Orchestrator-8B-Q5_K.gguf")
+DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8081/v1")
+DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.6-27B-IQ3_XXS.gguf")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
 # Phase 3 & 4: Orchestrator Map-Reduce & Post-Processing Config
