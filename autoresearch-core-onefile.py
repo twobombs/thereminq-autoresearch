@@ -19,6 +19,8 @@ import shutil
 import urllib.parse
 import signal
 import random
+import atexit
+import ipaddress
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Tuple, List, Dict, Set, Optional, Union
@@ -113,7 +115,8 @@ WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 
 WORKER_PARALLEL_SLOTS = 2
 WORKER_RETRIES = 3
-ORCH_PARALLEL_SLOTS = 1  # Note: Increasing this requires the orchestrator endpoint to support concurrent inferencing sessions.
+WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "1800.0"))
+ORCH_PARALLEL_SLOTS = 1  
 SYNTHESIS_CHUNK_SIZE = 3
 
 CONCURRENT_SLOTS_PER_ENDPOINT = 1
@@ -258,10 +261,18 @@ _PROMPT_PHASE6_DISTILL = (
 # Global Utilities & State
 # ==============================================================================
 
-# Note: This architecture is explicitly designed for single-process, multi-threaded deployment. 
-# State arrays like `_active_clone_dirs` are not safe for cross-process memory sharing if migrated to `multiprocessing`.
 _active_clone_dirs: Set[Path] = set()
 _clone_dirs_lock = threading.Lock()
+_shutdown_requested = False
+
+def cleanup_clones():
+    with _clone_dirs_lock:
+        for clone_dir in list(_active_clone_dirs):
+            if clone_dir.exists():
+                shutil.rmtree(clone_dir, ignore_errors=True)
+        _active_clone_dirs.clear()
+
+atexit.register(cleanup_clones)
 
 def enforce_ascii(text: str) -> str:
     """Strip out non-ASCII characters immediately from LLM responses."""
@@ -290,12 +301,13 @@ def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
             if len(section) > max_chars:
                 paragraphs = section.split('\n\n')
                 for p in paragraphs:
-                    if len(current_chunk) + len(p) + 2 <= max_chars:
-                        current_chunk += p + "\n\n"
+                    safe_p = p[:max_chars] if len(p) > max_chars else p
+                    if len(current_chunk) + len(safe_p) + 2 <= max_chars:
+                        current_chunk += safe_p + "\n\n"
                     else:
                         if current_chunk.strip():
                             chunks.append(current_chunk.strip())
-                        current_chunk = p + "\n\n"
+                        current_chunk = safe_p + "\n\n"
             else:
                 if current_chunk.strip():
                     chunks.append(current_chunk.strip())
@@ -307,7 +319,6 @@ def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
     return chunks
 
 def _format_eta(start_time: float, completed: int, total: int) -> str:
-    """Calculates rolling estimated time to completion formatted as a clean string."""
     if completed == 0 or total == 0:
         return "--:--"
     elapsed = time.time() - start_time
@@ -317,7 +328,6 @@ def _format_eta(start_time: float, completed: int, total: int) -> str:
     if hours > 0:
         return f"{hours}h {mins:02d}m"
     return f"{mins:02d}:{secs:02d}"
-
 
 # ==============================================================================
 # Phase 1: Raw Content Generation
@@ -379,8 +389,32 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
 # Phase 0: Git Repository Intake
 # ==============================================================================
 
+def _is_private_host(host: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    except ValueError:
+        blocked = {"metadata.google.internal", "metadata.azure.internal", "localhost"}
+        return host.lower() in blocked
+
 def validate_git_url(git_url: str) -> bool:
-    return any(re.match(p, git_url) for p in GIT_URL_PATTERNS)
+    if not any(re.match(p, git_url) for p in GIT_URL_PATTERNS):
+        return False
+        
+    parsed = urllib.parse.urlparse(git_url)
+    host = parsed.hostname or ""
+    
+    if not host:
+        scp_match = re.match(r'^git@([\w.\-]+):', git_url)
+        if scp_match:
+            host = scp_match.group(1)
+        else:
+            return False 
+            
+    if _is_private_host(host):
+        return False
+        
+    return True
 
 def clone_git_repository(git_url: str) -> tuple:
     if shutil.which("git") is None:
@@ -400,7 +434,7 @@ def clone_git_repository(git_url: str) -> tuple:
     try:
         start_time = time.time()
         res = subprocess.run(cmd, capture_output=True, encoding="ascii",
-                             errors="ignore", timeout=GIT_CLONE_TIMEOUT, env=env)
+                             errors="replace", timeout=GIT_CLONE_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
         shutil.rmtree(clone_dir, ignore_errors=True)
         with _clone_dirs_lock:
@@ -420,11 +454,11 @@ def clone_git_repository(git_url: str) -> tuple:
     commit_hash, branch_name = "unknown", "unknown"
     try:
         h = subprocess.run(["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
-                           capture_output=True, encoding="ascii", errors="ignore", timeout=30)
+                           capture_output=True, encoding="ascii", errors="replace", timeout=30)
         if h.returncode == 0:
             commit_hash = h.stdout.strip()
         b = subprocess.run(["git", "-C", str(clone_dir), "rev-parse", "--abbrev-ref", "HEAD"],
-                           capture_output=True, encoding="ascii", errors="ignore", timeout=30)
+                           capture_output=True, encoding="ascii", errors="replace", timeout=30)
         if b.returncode == 0:
             branch_name = b.stdout.strip()
     except Exception:
@@ -490,6 +524,12 @@ def collect_repo_code_files(repo_dir: Path, sub_path: str = "") -> tuple:
         if size > REPO_MAX_FILE_BYTES:
             stats["skipped_large"] += 1
             continue
+            
+        if stats["total_chars"] + size > REPO_MAX_TOTAL_CHARS:
+            stats["capped"] = True
+            print(f"    [!] WARNING: Total ingest cap of {REPO_MAX_TOTAL_CHARS:,} characters reached pre-read. Remaining files skipped.", flush=True)
+            break
+            
         try:
             with open(path, "rb") as fb:
                 if b"\x00" in fb.read(8192):
@@ -503,10 +543,6 @@ def collect_repo_code_files(repo_dir: Path, sub_path: str = "") -> tuple:
         if content is None or not content.strip():
             stats["skipped_unreadable"] += 1
             continue
-        if stats["total_chars"] + len(content) > REPO_MAX_TOTAL_CHARS:
-            stats["capped"] = True
-            print(f"    [!] WARNING: Total ingest cap of {REPO_MAX_TOTAL_CHARS:,} characters reached. Remaining files skipped.", flush=True)
-            break
 
         stats["total_chars"] += len(content)
         stats["ingested"] += 1
@@ -565,13 +601,14 @@ def build_repo_manifest(git_url: str, repo_name: str, commit_hash: str,
     if len(manifest_paths) > REPO_MANIFEST_MAX_ENTRIES:
         lines.append(f"- ... and {len(manifest_paths) - REPO_MANIFEST_MAX_ENTRIES} more file segments")
     lines.append("")
-    return "\n".join(lines)
+    return enforce_ascii("\n".join(lines))
 
 def render_inline_source(entries: list) -> str:
     sections = ["## Source Files", ""]
     for entry in entries:
         lang = _REPO_EXT_LANG_MAP.get(entry.get("suffix", ""), "")
-        fence = "````" if "```" in entry["content"] else "```"
+        max_ticks = max((len(m.group(0)) for m in re.finditer(r'`+', entry["content"])), default=2)
+        fence = '`' * max(3, max_ticks + 1)
         sections.append(f"### {entry['path']}")
         sections.append(f"{fence}{lang}")
         sections.append(entry["content"].rstrip())
@@ -580,7 +617,7 @@ def render_inline_source(entries: list) -> str:
     return "\n".join(sections)
 
 def _repo_worker_call(system_prompt: str, user_prompt: str, endpoint: str) -> str:
-    client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=1800.0, max_retries=0)
+    client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
     response = client.chat.completions.create(
         model=WORKER_MODEL,
         messages=[{"role": "system", "content": system_prompt},
@@ -603,14 +640,15 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
     start_time_progress = time.time()
 
     def wrapper(idx: int, payload):
-        for _ in range(WORKER_RETRIES):
+        for attempt in range(1, WORKER_RETRIES + 1):
             endpoint = slot_queue.get()
             try:
                 output = job_fn(idx + 1, total, payload, endpoint)
                 if output and len(output.strip()) >= 20:
                     return output.strip()
             except Exception as e:
-                pass # Silent retry inline with Map-Reduce abstraction
+                if attempt < WORKER_RETRIES:
+                    print(f"        [!] {label} {idx+1}/{total} attempt {attempt} failed ({str(e)}), retrying...", flush=True)
             finally:
                 slot_queue.put(endpoint)
             time.sleep(2)
@@ -668,8 +706,10 @@ def reduce_repo_summaries(summaries: list, focus: str, char_budget: int) -> str:
         chunks = split_into_logical_chunks(combined, MAX_CHUNK_CHARS)
         merged = _parallel_repo_jobs(chunks, job_fn, fallback_fn, "Reduce chunk")
         new_combined = "\n\n".join(merged)
+        
         if len(new_combined) >= last_len * 0.95:
-            print("    [!] Reduce pass produced < 5% compression. Stopping reduction.", flush=True)
+            print("    [!] Reduce pass produced < 5% compression. Truncation will occur if budget is exceeded.", flush=True)
+            combined = new_combined
             break
         combined = new_combined
         last_len = len(combined)
@@ -682,7 +722,7 @@ def ingest_git_repository(git_url: str, target_dir: Path, focus: str = "", git_p
     print(f"\n[PHASE 0] GIT REPOSITORY INTAKE", flush=True)
 
     if not validate_git_url(git_url):
-        print(f"[!] Fatal: '{git_url}' does not look like a valid git URL (https/ssh/git).", flush=True)
+        print(f"[!] Fatal: '{git_url}' does not look like a valid git URL or references blocked subnets.", flush=True)
         sys.exit(1)
 
     clone_dir, commit_hash, branch_name = clone_git_repository(git_url)
@@ -735,7 +775,8 @@ def distill_document(raw_text: str) -> str:
     print(f"\n[PHASE 2] [*] Ingesting document ({char_count:,} characters)...", flush=True)
 
     if char_count > MAX_CONTEXT_CHARS:
-        print(f"    [!] WARNING: Document size exceeds {MAX_CONTEXT_CHARS:,} characters.", flush=True)
+        print(f"    [!] WARNING: Document size exceeds {MAX_CONTEXT_CHARS:,} characters. Truncating.", flush=True)
+        raw_text = raw_text[:MAX_CONTEXT_CHARS] + "\n\n...[TRUNCATED]..."
 
     try:
         response = distill_client.chat.completions.create(
@@ -776,30 +817,23 @@ def extract_json_array(raw_text: str) -> str:
     cleaned_text = re.sub(r'```json\s*', '', raw_text, flags=re.IGNORECASE)
     cleaned_text = re.sub(r'\n?```\s*', '', cleaned_text).strip()
 
-    try:
-        json.loads(cleaned_text)
-        return cleaned_text
-    except json.JSONDecodeError:
-        pass
-
     start_idx = cleaned_text.find('[')
-    if start_idx == -1:
+    if start_idx == -1: 
         return ""
-
+    
     depth = 0
     in_string = False
-    escape = False
-
-    for i in range(start_idx, len(cleaned_text)):
+    i = start_idx
+    while i < len(cleaned_text):
         char = cleaned_text[i]
-
-        if escape:
-            escape = False
-            continue
-
+        
         if char == '\\':
-            escape = True
-        elif char == '"':
+            i += 2
+            if i >= len(cleaned_text):
+                break
+            continue
+            
+        if char == '"':
             in_string = not in_string
         elif not in_string:
             if char == '[':
@@ -807,13 +841,19 @@ def extract_json_array(raw_text: str) -> str:
             elif char == ']':
                 depth -= 1
                 if depth == 0:
-                    return cleaned_text[start_idx:i+1]
+                    candidate = cleaned_text[start_idx:i+1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        pass
+        i += 1
     return ""
 
 def decompose_to_atomic_pieces(large_query: str) -> tuple:
     print(f"\n[PHASE 3] [1] INGRESS: Analyzing massive query...\n    Length: {len(large_query)} characters", flush=True)
 
-    client = OpenAI(base_url=ORCHESTRATOR_ENDPOINTS[0], api_key=ORCH_API_KEY, timeout=1800.0, max_retries=0)
+    client = OpenAI(base_url=ORCHESTRATOR_ENDPOINTS[0], api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
 
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"[2] DECOMPOSITION: Engaging atomic breakdown via {ORCHESTRATOR_ENDPOINTS[0]} (Attempt {attempt}/{MAX_RETRIES})...", flush=True)
@@ -874,8 +914,8 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
 
     return [large_query], estimate_tokens(large_query), 0
 
-def export_to_split_files(pieces: list, work_dir: Path) -> Path:
-    if len(pieces) <= 1: return work_dir
+def export_to_split_files(pieces: list, work_dir: Path) -> None:
+    if len(pieces) <= 1: return
     tasks_dir = work_dir / "tasks"
     tasks_dir.mkdir(exist_ok=True)
 
@@ -883,10 +923,9 @@ def export_to_split_files(pieces: list, work_dir: Path) -> Path:
         filepath = tasks_dir / f"task{idx:03d}.md"
         with open(filepath, "w", encoding="ascii", errors="ignore") as f:
             f.write(f"{piece.strip()}\n")
-    return work_dir
 
 def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: str, original_query: str, run_dir: Path) -> dict:
-    worker_client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=1800.0, max_retries=0)
+    worker_client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
     start_time = time.time()
 
     user_instruction = f"BACKGROUND CONTEXT:\n{original_query}\n\nYOUR SPECIFIC OBJECTIVE:\n{task_prompt}"
@@ -907,8 +946,10 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
         )
         result_text = enforce_ascii(response.choices[0].message.content.strip())
 
-        if "<file" in result_text and "</file>" not in result_text:
-            result_text += "\n</file>"
+        open_tags = len(re.findall(r'<file\b', result_text, re.IGNORECASE))
+        close_tags = len(re.findall(r'</file>', result_text, re.IGNORECASE))
+        if open_tags > close_tags:
+            result_text += "\n</file>" * (open_tags - close_tags)
 
         prompt_tokens = response.usage.prompt_tokens if response.usage else estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
         comp_tokens = response.usage.completion_tokens if response.usage else estimate_tokens(result_text)
@@ -942,7 +983,7 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
     }
 
 def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original_query: str) -> tuple:
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=1800.0, max_retries=0)
+    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
     batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
     user_prompt = f"ORIGINAL QUERY: {original_query}\n\nREPORTS TO MERGE:\n{batch_context}"
 
@@ -960,11 +1001,16 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
     return batch_id, res_content, p_tok, c_tok, elapsed
 
 def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, endpoint: str, original_query: str) -> tuple:
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=1800.0, max_retries=0)
+    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
 
-    tail_limit = MAX_CONTEXT_CHARS - 4000
-    if len(current_master) > tail_limit:
-        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + current_master[-tail_limit:]
+    NEW_CHUNK_BUDGET = 8000
+    MASTER_BUDGET = MAX_CONTEXT_CHARS - NEW_CHUNK_BUDGET - 2000
+
+    if len(new_chunk) > NEW_CHUNK_BUDGET:
+        new_chunk = new_chunk[:NEW_CHUNK_BUDGET] + "\n\n...[NEW CHUNK TRUNCATED]..."
+
+    if len(current_master) > MASTER_BUDGET:
+        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + current_master[-MASTER_BUDGET:]
     else:
         stitch_context = current_master
 
@@ -987,9 +1033,6 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     if not ORCHESTRATOR_ENDPOINTS or not WORKER_ENDPOINTS:
         print("\n[!] FATAL: Endpoints not defined for map-reduce cluster.", flush=True)
         sys.exit(1)
-
-    if ORCH_PARALLEL_SLOTS > 1:
-        print("\n[!] WARNING: ORCH_PARALLEL_SLOTS is > 1. Ensure your orchestrator server explicitly supports concurrent inferencing sessions.", flush=True)
 
     if not sub_tasks:
         return "", 0, 0, decomp_p_tok, decomp_c_tok, []
@@ -1029,7 +1072,8 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             endpoint, slot_name = worker_queue.get()
             try:
                 res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir)
-                accum_p_tok += res["prompt_tokens"]
+                accum_p_tok += res.get("prompt_tokens", 0)
+                accum_c_tok += res.get("completion_tokens", 0)
 
                 if res["status"] == "success":
                     if res.get("completion_tokens", 0) > MAX_WORKER_TOKENS:
@@ -1038,12 +1082,11 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                         res["completion_tokens"] = MAX_WORKER_TOKENS
 
                     res["prompt_tokens"] = accum_p_tok
-                    res["total_tokens"] = res["prompt_tokens"] + res["completion_tokens"]
+                    res["total_tokens"] = accum_p_tok + res.get("completion_tokens", 0)
 
                     event_queue.put(("worker", res))
                     return
 
-                accum_c_tok += res["completion_tokens"]
                 last_result = res
             except Exception as e:
                 last_result["result"] = f"Failed: {str(e)}"
@@ -1066,7 +1109,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
                 return
             except Exception as e:
-                pass # Silent retry inline with Map-Reduce abstraction
+                print(f"    [!] Chunk synthesis error on attempt {attempt}: {e}", flush=True)
             finally:
                 orch_queue.put((endpoint, slot_name))
             time.sleep(2)
@@ -1104,7 +1147,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                             stitch_c_tok += c
                             success = True
                             break
-                        except Exception as e:
+                        except Exception:
                             time.sleep(2)
                     if not success:
                         master_document += f"\n\n\n" + c_text
@@ -1136,9 +1179,19 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             for i, task in enumerate(sub_tasks):
                 worker_exec.submit(_map_reduce_worker, i + 1, task)
 
-            # Thread-safe event loop serialization
             while chunks_completed < total_chunks:
-                event = event_queue.get()
+                try:
+                    event = event_queue.get(timeout=30.0)
+                except queue.Empty:
+                    if _shutdown_requested:
+                        break
+                    if workers_finished >= total_tasks and chunks_completed < total_chunks:
+                        pending_chunks = len(submitted_chunks) - chunks_completed
+                        if pending_chunks == 0:
+                            print("    [!] Watchdog: Stalled with no pending chunk jobs. Forcing exit.", flush=True)
+                            break
+                    continue
+                    
                 if event[0] == "worker":
                     workers_finished += 1
                     task_res = event[1]
@@ -1162,7 +1215,6 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                             chunk_tasks = [results_dict.get(i) for i in range(expected_start, expected_end)]
                             orch_exec.submit(chunk_wrapper, chunk_idx, chunk_tasks)
 
-                    # Note: Safe fallback check because it operates entirely inside this serialized event loop thread
                     if workers_finished == total_tasks:
                         for chunk_idx in range(1, total_chunks + 1):
                             if chunk_idx not in submitted_chunks:
@@ -1185,7 +1237,6 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                         stitch_queue.put((next_stitch_id, stitch_text))
                         next_stitch_id += 1
 
-                # === MAP-REDUCE LIVE PROGRESS BAR ===
                 bar_len = 30
                 filled = int((workers_finished / total_tasks) * bar_len)
                 bar = '#' * filled + '-' * (bar_len - filled)
@@ -1194,7 +1245,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks}) | ETC: {eta_str}")
                 sys.stdout.flush()
 
-        print() # Clear line format post-loop completion
+        print()
 
     finally:
         stitch_queue.put(None)
@@ -1268,11 +1319,12 @@ def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, en
                 distilled_text += "\n\n### Recovered Chunk Artifacts\n" + "\n\n".join(missing_placeholders)
 
         return distilled_text
-    except Exception as e:
+    except Exception:
         return chunk_text
 
 def parallel_edit_chunks(chunks: List[str]) -> str:
     if not ORCHESTRATOR_ENDPOINTS:
+        print("    [!] WARNING: No orchestrator endpoints defined. Skipping deduplication.", flush=True)
         return "\n\n".join(chunks)
 
     total_chunks = len(chunks)
@@ -1317,12 +1369,12 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
             sys.stdout.write(f"\r    [+] Progress: [{bar}] {percent}% ({completed}/{total_chunks}) | ETC: {eta_str}")
             sys.stdout.flush()
             
-    print() # newline after progress loop finishes
+    print()
 
     return "\n\n".join(results)
 
 def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=1800.0, max_retries=1)
+    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=1)
     system_prompt = _PROMPT_PHASE4_SMOOTH
     
     if global_inventory:
@@ -1342,7 +1394,7 @@ def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], 
         return full_skeleton
 
 def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=1800.0, max_retries=1)
+    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=1)
     system_prompt = _PROMPT_PHASE4_UNIFY
     
     if global_inventory:
@@ -1394,7 +1446,7 @@ def _format_execution_report_as_markdown(report_data: list) -> str:
         lines.append(f"| {res.get('filename', '')} | {res.get('language', '')} | **{res.get('status', '')}** | {res.get('message', '')} |")
     return "\n".join(lines) + "\n\n"
 
-def _safe_output_path(detected_filename: str, output_dir: Path, seen_names: Set[str]) -> Path:
+def _safe_output_path(detected_filename: str, output_dir: Path, seen_paths: Set[str]) -> Path:
     normalised = detected_filename.replace("\\", "/")
     parts = [p for p in PurePosixPath(normalised).parts if p not in ("", ".", "..")]
     if not parts:
@@ -1407,11 +1459,11 @@ def _safe_output_path(detected_filename: str, output_dir: Path, seen_names: Set[
     suffix = candidate.suffix
     counter = 1
 
-    while candidate.name in seen_names or candidate.exists():
+    while str(candidate.resolve()) in seen_paths or candidate.exists():
         candidate = candidate.parent / f"{stem}_{counter}{suffix}"
         counter += 1
 
-    seen_names.add(candidate.name)
+    seen_paths.add(str(candidate.resolve()))
     return candidate
 
 def _strip_markdown_fences(text: str) -> str:
@@ -1471,7 +1523,7 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
     last_header: Optional[str] = None
     file_counter = 1
     extracted_artifacts = []
-    seen_names = set()
+    seen_paths = set()
     active_fence_len = 0
 
     while i < len(lines):
@@ -1518,7 +1570,7 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
                     detected_filename = next_line[2:].strip()
                     i += 1
         elif in_block:
-            if stripped_line.startswith("```") and (len(stripped_line) - len(stripped_line.lstrip('`'))) == active_fence_len:
+            if re.match(rf'^`{{{active_fence_len}}}\s*$', stripped_line):
                 in_block = False
                 content = "\n".join(current_block)
                 if not detected_filename:
@@ -1531,7 +1583,7 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
                 detected_filename = re.sub(r'[()\[\]{}]', '', detected_filename)
                 detected_filename = detected_filename.replace(" ", "_")
 
-                file_path = _safe_output_path(detected_filename, output_path, seen_names)
+                file_path = _safe_output_path(detected_filename, output_path, seen_paths)
 
                 with open(file_path, "w", encoding="ascii", errors="ignore") as f:
                     f.write(content + "\n")
@@ -1565,8 +1617,6 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
         return None
 
     endpoint_url = endpoint_queue.get()
-    parsed = urllib.parse.urlparse(endpoint_url)
-    port = parsed.port if parsed.port else "8034"
 
     try:
         code_content = artifact['content']
@@ -1592,7 +1642,7 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
         generation_metadata = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.post(endpoint_url, json=payload, timeout=600)
+                response = requests.post(endpoint_url, json=payload, timeout=WORKER_TIMEOUT_SECS)
                 response.raise_for_status()
                 result = response.json()
                 choices = result.get("choices")
@@ -1621,7 +1671,7 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                 with progress_lock:
                     progress_state["done"] += 1
                     eta_str = _format_eta(progress_state["start_time"], progress_state["done"], progress_state["total"])
-                    print(f"    [+] [{port}] Generated tests ({progress_state['done']}/{progress_state['total']}) | ETC: {eta_str} -> {test_filename}")
+                    print(f"    [+] [{endpoint_url}] Generated tests ({progress_state['done']}/{progress_state['total']}) | ETC: {eta_str} -> {test_filename}")
                     
                 generation_metadata = {
                     "filename": test_filename,
@@ -1631,7 +1681,7 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                 }
                 break
                 
-            except requests.exceptions.RequestException as exc:
+            except requests.exceptions.RequestException:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
                     
@@ -1785,7 +1835,7 @@ def run_phase5_automatic_unittests(source_path: Path):
 # ==============================================================================
 
 def extract_project_tasks(project_name: str, raw_content: str) -> Optional[str]:
-    client = OpenAI(base_url=ORCHESTRATOR_ENDPOINTS[0], api_key=ORCH_API_KEY, timeout=600.0, max_retries=0)
+    client = OpenAI(base_url=ORCHESTRATOR_ENDPOINTS[0], api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
     try:
         response = client.chat.completions.create(
             model=ORCHESTRATOR_MODEL,
@@ -1826,8 +1876,7 @@ def run_phase6_project_distillation(project_dir: Path):
             if file_path.stem in p6_exclude_names:
                 continue
                 
-            # Explicitly restrict json ingestion to prevent pulling undocumented/stray config files
-            if file_path.suffix == ".json" and "execution_report" not in file_path.name:
+            if file_path.suffix == ".json" and file_path.resolve() != report_json_path.resolve():
                 continue
                 
             if file_path.suffix in {".txt", ".md", ".csv", ".json"}:
@@ -1845,7 +1894,7 @@ def run_phase6_project_distillation(project_dir: Path):
     aggregated_content = []
     for file_path in raw_files:
         try:
-            with open(file_path, "r", encoding="ascii", errors="ignore") as f:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 if file_path.suffix == '.json' and 'execution_report' in file_path.name:
                     report_data = json.load(f)
                     md_table = _format_execution_report_as_markdown(report_data)
@@ -1874,14 +1923,13 @@ def run_phase6_project_distillation(project_dir: Path):
 # ==============================================================================
 
 def signal_handler(sig, frame):
-    with _clone_dirs_lock:
-        for clone_dir in list(_active_clone_dirs):
-            if clone_dir.exists():
-                shutil.rmtree(clone_dir, ignore_errors=True)
-            _active_clone_dirs.discard(clone_dir)
-            
-    print("\n[!] Graceful shutdown requested (SIGINT/SIGTERM). Force exiting immediately to prevent zombie threads.", flush=True)
-    os._exit(0)
+    global _shutdown_requested
+    if _shutdown_requested:
+        print("\n[!] Force exit triggered.", flush=True)
+        os._exit(1)
+        
+    _shutdown_requested = True
+    print("\n[!] Graceful shutdown requested (SIGINT/SIGTERM). Awaiting active threads to abort... (Press Ctrl+C again to force exit)", flush=True)
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
@@ -1911,7 +1959,7 @@ def main():
     if args.git_path and not args.git:
         parser.error("--git-path can only be used together with -g/--git.")
     if args.git and not validate_git_url(args.git):
-        parser.error(f"'{args.git}' does not look like a valid git URL (https/ssh/git).")
+        parser.error(f"'{args.git}' does not look like a valid git URL or resolves to a blocked private/IMDS network address.")
 
     target_prompt = ""
     if args.file:
@@ -1923,7 +1971,7 @@ def main():
         if target_prompt is None:
             print(f"[!] Error: Could not read prompt file '{args.file}'.")
             sys.exit(1)
-        target_prompt = target_prompt.strip()
+        target_prompt = enforce_ascii(target_prompt.strip())
     elif args.prompt:
         target_prompt = args.prompt
 
