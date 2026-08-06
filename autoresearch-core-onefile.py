@@ -1051,7 +1051,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
                 return
             except Exception as e:
-                print(f"        [!] chunk_wrapper attempt {attempt} failed: {e}", flush=True)
+                pass # Silent retry inline with Map-Reduce abstraction
             finally:
                 orch_queue.put((endpoint, slot_name))
             time.sleep(2)
@@ -1090,7 +1090,6 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                             success = True
                             break
                         except Exception as e:
-                            print(f"        [!] master_stitch attempt {attempt} failed: {e}", flush=True)
                             time.sleep(2)
                     if not success:
                         master_document += f"\n\n\n" + c_text
@@ -1168,6 +1167,16 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                         stitch_text = chunks_dict.pop(next_stitch_id)
                         stitch_queue.put((next_stitch_id, stitch_text))
                         next_stitch_id += 1
+
+                # === MAP-REDUCE LIVE PROGRESS BAR ===
+                bar_len = 30
+                filled = int((workers_finished / total_tasks) * bar_len)
+                bar = '#' * filled + '-' * (bar_len - filled)
+                percent = int((workers_finished / total_tasks) * 100)
+                sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks})")
+                sys.stdout.flush()
+
+        print() # Clear line format post-loop completion
 
     finally:
         stitch_queue.put(None)
@@ -2023,7 +2032,8 @@ def main():
             print(f"[+] Document fits in single chunk. Bypassed LLM refinement. Saved to {output_path}")
         else:
             distilled_skeleton = parallel_edit_chunks(chunks)
-            final_skeleton = global_consolidation_pass(distilled_skeleton, list(protected_assets.keys()), ORCHESTRATOR_ENDPOINTS[0])
+            global_inventory = [k for k in protected_assets.keys() if k != "[[PROTECTED_TELEMETRY_TABLE]]"]
+            final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
             final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
 
             with open(output_path, "w", encoding="ascii", errors="ignore") as f:
