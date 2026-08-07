@@ -262,7 +262,7 @@ _PROMPT_PHASE6_DISTILL = (
 
 _active_clone_dirs: Set[Path] = set()
 _clone_dirs_lock = threading.Lock()
-_shutdown_requested = False
+_shutdown_event = threading.Event()
 
 def cleanup_clones():
     with _clone_dirs_lock:
@@ -343,7 +343,7 @@ def generate_safe_filename(prompt_text: str) -> str:
 
 def generate_content(prompt: str, target_dir: Path) -> Path:
     print(f"\n[PHASE 1] [*] Generating content for: '{prompt[:50]}...'")
-    gen_client = OpenAI(base_url=GEN_API_BASE, api_key=GEN_API_KEY)
+    gen_client = OpenAI(base_url=GEN_API_BASE, api_key=GEN_API_KEY, timeout=WORKER_TIMEOUT_SECS)
 
     full_content = ""
     start_time = time.time()
@@ -640,7 +640,11 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
 
     def wrapper(idx: int, payload):
         for attempt in range(1, WORKER_RETRIES + 1):
-            endpoint = slot_queue.get()
+            try:
+                endpoint = slot_queue.get(timeout=5.0)
+            except queue.Empty:
+                continue
+            
             try:
                 output = job_fn(idx + 1, total, payload, endpoint)
                 if output and len(output.strip()) >= 20:
@@ -759,6 +763,7 @@ def ingest_git_repository(git_url: str, target_dir: Path, focus: str = "", git_p
         print(f"[+] Repository intake document saved to: {filepath.absolute()} ({len(document):,} chars)", flush=True)
         return filepath
     finally:
+        # Note: If clone_git_repository calls sys.exit(1) above, atexit handler covers this cleanup.
         if clone_dir and clone_dir.exists():
             shutil.rmtree(clone_dir, ignore_errors=True)
         with _clone_dirs_lock:
@@ -827,9 +832,9 @@ def extract_json_array(raw_text: str) -> str:
         char = cleaned_text[i]
         
         if char == '\\':
-            i += 2
-            if i >= len(cleaned_text):
+            if i + 1 >= len(cleaned_text):
                 break
+            i += 2
             continue
             
         if char == '"':
@@ -911,7 +916,7 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
             print(f"    [!] Decomposition Error: {e}", flush=True)
             time.sleep(2)
 
-    return [large_query], estimate_tokens(large_query), 0
+    return [large_query[:MAX_CHUNK_CHARS]], estimate_tokens(large_query[:MAX_CHUNK_CHARS]), 0
 
 def export_to_split_files(pieces: list, work_dir: Path) -> None:
     if len(pieces) <= 1: return
@@ -947,8 +952,10 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
 
         open_tags = len(re.findall(r'<file\b', result_text, re.IGNORECASE))
         close_tags = len(re.findall(r'</file>', result_text, re.IGNORECASE))
-        if open_tags > close_tags:
-            result_text += "\n</file>" * (open_tags - close_tags)
+        if open_tags != close_tags:
+            print(f"        [!] Warning: Thread{task_id:02d} emitted unbalanced <file> tags ({open_tags} open, {close_tags} close). Attempting basic repair.", flush=True)
+            if open_tags > close_tags:
+                result_text += "\n</file>" * (open_tags - close_tags)
 
         prompt_tokens = response.usage.prompt_tokens if response.usage else estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
         comp_tokens = response.usage.completion_tokens if response.usage else estimate_tokens(result_text)
@@ -1008,14 +1015,14 @@ def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, en
     """
     client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
 
-    NEW_CHUNK_BUDGET = 8000
-    MASTER_BUDGET = MAX_CONTEXT_CHARS - NEW_CHUNK_BUDGET - 2000
+    # Dynamic symmetric budget split
+    budget_each = (MAX_CONTEXT_CHARS - 2000) // 2
 
-    if len(new_chunk) > NEW_CHUNK_BUDGET:
-        new_chunk = new_chunk[:NEW_CHUNK_BUDGET] + "\n\n...[NEW CHUNK TRUNCATED]..."
+    if len(new_chunk) > budget_each:
+        new_chunk = new_chunk[:budget_each] + "\n\n...[NEW CHUNK TRUNCATED]..."
 
-    if len(current_master) > MASTER_BUDGET:
-        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + current_master[-MASTER_BUDGET:]
+    if len(current_master) > budget_each:
+        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + current_master[-budget_each:]
     else:
         stitch_context = current_master
 
@@ -1049,6 +1056,8 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
 
     Complexity: O(log2 N) sequential rounds, each fully parallelised across
     len(ORCHESTRATOR_ENDPOINTS) * ORCH_PARALLEL_SLOTS concurrent slots.
+    Total merge count is always exactly N-1 (each merge removes one node),
+    so overall progress and ETA are computable up front.
 
     Example with 8 chunks and 4 orchestrator slots:
         Round 1 : 4 merges in parallel  -> 4 nodes
@@ -1066,6 +1075,7 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
         return "", 0, 0
 
     if len(ordered_chunks) == 1:
+        print("    [*] Single chunk - no stitching required.", flush=True)
         return ordered_chunks[0], 0, 0
 
     # Build a flat, rotating endpoint pool shared across all rounds.
@@ -1077,11 +1087,43 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
     for ep in endpoint_pool:
         ep_queue.put(ep)
 
+    # ---- Pre-compute the reduction plan so progress/ETA are exact ----
+    total_merges = len(ordered_chunks) - 1
+    total_rounds = 0
+    _nodes = len(ordered_chunks)
+    while _nodes > 1:
+        total_rounds += 1
+        _nodes = (_nodes // 2) + (_nodes % 2)
+
+    print(
+        f"    [*] Stitch plan: {total_merges} merge(s) over {total_rounds} round(s) "
+        f"using {len(endpoint_pool)} concurrent slot(s).",
+        flush=True,
+    )
+
     total_stitch_p_tok = 0
     total_stitch_c_tok = 0
-    merge_counter = [0]          # shared mutable counter across all rounds
+    merges_done = [0]            # global merge counter (drives progress bar)
+    merge_counter = [0]          # monotonic merge ID for logging
+    progress_lock = threading.Lock()
+    stitch_start = time.time()
     current_nodes = list(ordered_chunks)
     round_num = 0
+
+    def _render_progress(active_round: int) -> None:
+        """Redraw the single-line stitch progress bar. Caller holds progress_lock."""
+        bar_len = 30
+        done = merges_done[0]
+        filled = int((done / total_merges) * bar_len) if total_merges else bar_len
+        bar = "#" * filled + "-" * (bar_len - filled)
+        percent = int((done / total_merges) * 100) if total_merges else 100
+        eta_str = _format_eta(stitch_start, done, total_merges)
+        sys.stdout.write(
+            f"\r    [+] Stitch Progress: [{bar}] {percent}% "
+            f"(Merges: {done}/{total_merges} | Round: {active_round}/{total_rounds}) "
+            f"| ETC: {eta_str}"
+        )
+        sys.stdout.flush()
 
     while len(current_nodes) > 1:
         round_num += 1
@@ -1092,23 +1134,29 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
         passthrough = [current_nodes[-1]] if n % 2 == 1 else []
 
         print(
-            f"    [STITCH] Round {round_num}: {len(pairs)} parallel merge(s)"
-            + (" + 1 passthrough node" if passthrough else ""),
+            f"    [STITCH] Round {round_num}/{total_rounds}: {len(pairs)} parallel merge(s)"
+            + (" + 1 passthrough node" if passthrough else "")
+            + f" ({n} -> {len(pairs) + len(passthrough)} nodes)",
             flush=True,
         )
 
         merge_results: List[Optional[str]] = [None] * len(pairs)
-        round_lock = threading.Lock()
         round_p_acc = [0]
         round_c_acc = [0]
         round_start = time.time()
 
+        with progress_lock:
+            _render_progress(round_num)
+
         def _merge_pair(pair_idx: int, left: str, right: str) -> None:
             """Merge one pair; falls back to concatenation if all retries fail."""
             for attempt in range(1, MAX_RETRIES + 1):
-                endpoint = ep_queue.get()
                 try:
-                    with round_lock:
+                    endpoint = ep_queue.get(timeout=5.0)
+                except queue.Empty:
+                    continue
+                try:
+                    with progress_lock:
                         merge_counter[0] += 1
                         cid = merge_counter[0]
 
@@ -1116,32 +1164,41 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
                         cid, left, right, endpoint, original_query
                     )
 
-                    with round_lock:
+                    with progress_lock:
+                        merge_results[pair_idx] = merged_text
                         round_p_acc[0] += p
                         round_c_acc[0] += c
-
-                    merge_results[pair_idx] = merged_text
-                    print(
-                        f"        [+] Merge {cid} complete "
-                        f"(round {round_num}, pair {pair_idx + 1}/{len(pairs)}, "
-                        f"ep={endpoint}, {elapsed:.1f}s)",
-                        flush=True,
-                    )
+                        merges_done[0] += 1
+                        _render_progress(round_num)
                     return
 
                 except Exception as exc:
-                    print(
-                        f"        [!] Merge {pair_idx + 1} round {round_num} "
-                        f"attempt {attempt}/{MAX_RETRIES} failed: {exc}",
-                        flush=True,
-                    )
+                    with progress_lock:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        print(
+                            f"        [!] Merge round {round_num} pair "
+                            f"{pair_idx + 1}/{len(pairs)} attempt {attempt}/{MAX_RETRIES} "
+                            f"failed on {endpoint}: {exc}",
+                            flush=True,
+                        )
                     if attempt == MAX_RETRIES:
                         # Hard fallback: plain concatenation so nothing is lost.
-                        merge_results[pair_idx] = left + "\n\n" + right
+                        with progress_lock:
+                            merge_results[pair_idx] = left + "\n\n" + right
+                            print(
+                                f"        [!] Merge round {round_num} pair "
+                                f"{pair_idx + 1} exhausted retries - "
+                                f"falling back to raw concatenation.",
+                                flush=True,
+                            )
+                            merges_done[0] += 1
+                            _render_progress(round_num)
                 finally:
                     ep_queue.put(endpoint)
 
-                time.sleep(2)
+                if attempt < MAX_RETRIES:
+                    time.sleep(2)
 
         # Fan out every pair in this round simultaneously.
         max_workers = max(1, min(len(pairs), len(endpoint_pool)))
@@ -1156,16 +1213,24 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
         total_stitch_p_tok += round_p_acc[0]
         total_stitch_c_tok += round_c_acc[0]
 
+        sys.stdout.write("\n")
+        sys.stdout.flush()
         print(
-            f"    [STITCH] Round {round_num} complete in {round_elapsed}s. "
-            f"Nodes: {n} -> {len(pairs) + len(passthrough)}",
+            f"    [STITCH] Round {round_num}/{total_rounds} complete in {round_elapsed}s "
+            f"({round_c_acc[0]} completion tokens).",
             flush=True,
         )
 
         current_nodes = [r if r is not None else "" for r in merge_results] + passthrough
 
-    return current_nodes[0], total_stitch_p_tok, total_stitch_c_tok
+    total_elapsed = round(time.time() - stitch_start, 2)
+    print(
+        f"    [+] Stitch complete: {total_merges} merge(s) in {total_elapsed}s. "
+        f"Final document: {len(current_nodes[0]):,} chars.",
+        flush=True,
+    )
 
+    return current_nodes[0], total_stitch_p_tok, total_stitch_c_tok
 
 def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir: Path, decomp_p_tok: int = 0, decomp_c_tok: int = 0) -> tuple:
     """Full Phase 3 map-reduce pipeline with parallelised tree-reduction stitching.
@@ -1219,7 +1284,11 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         accum_c_tok = 0
 
         for _ in range(WORKER_RETRIES):
-            endpoint, slot_name = worker_queue.get()
+            try:
+                endpoint, slot_name = worker_queue.get(timeout=5.0)
+            except queue.Empty:
+                continue
+                
             try:
                 res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir)
                 accum_p_tok += res.get("prompt_tokens", 0)
@@ -1253,7 +1322,11 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     def chunk_wrapper(batch_id: int, tasks: list):
         tasks = [t for t in tasks if t is not None]
         for attempt in range(1, MAX_RETRIES + 1):
-            endpoint, slot_name = orch_queue.get()
+            try:
+                endpoint, slot_name = orch_queue.get(timeout=5.0)
+            except queue.Empty:
+                continue
+                
             try:
                 b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
                 event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
@@ -1294,15 +1367,26 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
 
         while chunks_completed < total_chunks:
             try:
-                event = event_queue.get(timeout=30.0)
+                event = event_queue.get(timeout=2.0)
             except queue.Empty:
-                if _shutdown_requested:
+                if _shutdown_event.is_set():
                     break
                 if workers_finished >= total_tasks and chunks_completed < total_chunks:
-                    pending_chunks = len(submitted_chunks) - chunks_completed
-                    if pending_chunks == 0:
-                        print("    [!] Watchdog: Stalled with no pending chunk jobs. Forcing exit.", flush=True)
-                        break
+                    pending_chunks = total_chunks - chunks_completed
+                    if pending_chunks > 0:
+                        # Sweep for any missed chunks during event race condition
+                        for chunk_idx in range(1, total_chunks + 1):
+                            if chunk_idx not in submitted_chunks:
+                                expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
+                                expected_end = min(expected_start + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
+                                available = [results_dict.get(i) for i in range(expected_start, expected_end) if i in results_dict]
+                                if available:
+                                    submitted_chunks.add(chunk_idx)
+                                    orch_exec.submit(chunk_wrapper, chunk_idx, available)
+                        
+                        if len(submitted_chunks) == chunks_completed:
+                            print(f"    [!] Watchdog: Stalled with {pending_chunks} chunks missing. Forcing exit.", flush=True)
+                            break
                 continue
                 
             if event[0] == "worker":
@@ -1364,6 +1448,9 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     ordered_chunk_texts = [
         synthesized_chunks[cid] for cid in sorted(synthesized_chunks.keys())
     ]
+    
+    if len(ordered_chunk_texts) < total_chunks:
+        print(f"    [!] WARNING: Map-Reduce completed but {total_chunks - len(ordered_chunk_texts)} chunks were lost.", flush=True)
 
     print(
         f"\n[5] TREE-REDUCTION STITCH: Assembling {len(ordered_chunk_texts)} chunk(s) "
@@ -1454,14 +1541,20 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
     endpoint_queue = queue.Queue()
     for ep in ORCHESTRATOR_ENDPOINTS:
         parsed = urllib.parse.urlparse(ep)
-        ip_tail = parsed.hostname.split('.')[-1] if parsed.hostname and '.' in parsed.hostname else "local"
+        ip_tail = parsed.hostname if parsed.hostname else "local"
+        if parsed.port:
+            ip_tail += f":{parsed.port}"
+            
         for i in range(CONCURRENT_SLOTS_PER_ENDPOINT):
             slot_name = f"Node-{ip_tail}-Slot-{i+1}"
             endpoint_queue.put((ep, slot_name))
 
     results = [""] * total_chunks
     def _edit_chunk_worker(chunk_idx: int, chunk_content: str):
-        endpoint, slot_name = endpoint_queue.get()
+        try:
+            endpoint, slot_name = endpoint_queue.get(timeout=5.0)
+        except queue.Empty:
+            return chunk_content
         try:
             return semantic_deduplication(chunk_content, chunk_idx + 1, total_chunks, endpoint, slot_name)
         except Exception:
@@ -1570,6 +1663,9 @@ def _format_execution_report_as_markdown(report_data: list) -> str:
     return "\n".join(lines) + "\n\n"
 
 def _safe_output_path(detected_filename: str, output_dir: Path, seen_paths: Set[str]) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     normalised = detected_filename.replace("\\", "/")
     parts = [p for p in PurePosixPath(normalised).parts if p not in ("", ".", "..")]
     if not parts:
@@ -1739,7 +1835,10 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
         print(f"    [!] Skipping unsupported unit-test language generation: {artifact['language']}", flush=True)
         return None
 
-    endpoint_url = endpoint_queue.get()
+    try:
+        endpoint_url = endpoint_queue.get(timeout=5.0)
+    except queue.Empty:
+        return None
 
     try:
         code_content = artifact['content']
@@ -1999,6 +2098,7 @@ def run_phase6_project_distillation(project_dir: Path):
             if file_path.stem in p6_exclude_names:
                 continue
                 
+            # If a report JSON exists, it was added above. Skip any OTHER json files.
             if file_path.suffix == ".json" and file_path.resolve() != report_json_path.resolve():
                 continue
                 
@@ -2046,12 +2146,11 @@ def run_phase6_project_distillation(project_dir: Path):
 # ==============================================================================
 
 def signal_handler(sig, frame):
-    global _shutdown_requested
-    if _shutdown_requested:
+    if _shutdown_event.is_set():
         print("\n[!] Force exit triggered.", flush=True)
         os._exit(1)
         
-    _shutdown_requested = True
+    _shutdown_event.set()
     print("\n[!] Graceful shutdown requested (SIGINT/SIGTERM). Awaiting active threads to abort... (Press Ctrl+C again to force exit)", flush=True)
 
 def main():
