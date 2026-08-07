@@ -99,7 +99,8 @@ DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
 # Phase 3 & 4: Orchestrator Map-Reduce & Post-Processing Config
 ORCHESTRATOR_ENDPOINTS = [
-    "http://localhost:8080/v1"
+    "http://localhost:8080/v1",
+    "http://localhost:8079/v1"
 ]
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "nvidia_Orchestrator-8B-Q5_K.gguf")
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
@@ -107,8 +108,7 @@ MAX_RETRIES = 3
 
 WORKER_ENDPOINTS = [
     "http://localhost:8033/v1",
-    "http://localhost:8034/v1",
-    "http://localhost:8035/v1"
+    "http://localhost:8034/v1"
 ]
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.5-9B-IQ4_XS.gguf")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
@@ -125,8 +125,7 @@ MAX_WORKER_TOKENS = 12288
 # Phase 5: Automatic Unittests Config
 TEST_WORKER_ENDPOINTS = [
     "http://localhost:8033/v1/chat/completions",
-    "http://localhost:8034/v1/chat/completions",
-    "http://localhost:8035/v1/chat/completions"
+    "http://localhost:8034/v1/chat/completions"
 ]
 CONCURRENT_REQS_PER_ENDPOINT = 2
 MAX_OUTPUT_TOKENS = 16384
