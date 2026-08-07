@@ -2190,4 +2190,65 @@ def main():
         stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|-----------|\n"
         for stat in sorted(worker_stats, key=lambda x: x['id']):
             estimated_flag = "Yes" if stat.get('is_estimated') else "No"
-            stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_t
+            stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} | {estimated_flag} |\n"
+
+        agg_md = "\n### Cluster Aggregate Statistics\n"
+        agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
+        agg_md += f"- **Worker Prompt Tokens:** {w_p}\n"
+        agg_md += f"- **Worker Completion Tokens:** {w_c}\n"
+        agg_md += f"- **Total Orchestrator + Decomposition Prompt Tokens:** {o_p}\n"
+        agg_md += f"- **Total Orchestrator + Decomposition Completion Tokens:** {o_c}\n"
+
+        final_output += stats_md + agg_md
+
+        with open(final_file_path, "w", encoding="ascii", errors="ignore") as f:
+            f.write(final_output)
+
+    # ---------------------------------------------------------
+    # PHASE 4: POST-PROCESS EDITORIAL
+    if args.resume and output_path.exists():
+        print(f"[PHASE 4] Bypassed. Resuming from existing POLISHED_SYNTHESIS.md")
+    else:
+        print("\n[PHASE 4] STARTING DISTRIBUTED SYNTHESIS POLISH", flush=True)
+        raw_markdown = read_file_content_safe(final_file_path)
+        if raw_markdown is None:
+            print(f"[!] Fatal: Could not read {final_file_path}.", flush=True)
+            sys.exit(1)
+
+        skeleton_text, protected_assets = extract_and_protect_blocks(raw_markdown)
+        chunks = split_into_logical_chunks(skeleton_text, MAX_CHUNK_CHARS)
+
+        if len(chunks) <= 1:
+            with open(output_path, "w", encoding="ascii", errors="ignore") as f:
+                f.write(raw_markdown)
+            print(f"[+] Document fits in single chunk. Bypassed LLM refinement. Saved to {output_path}")
+        else:
+            distilled_skeleton = parallel_edit_chunks(chunks)
+            global_inventory = [k for k in protected_assets.keys() if k != "[[PROTECTED_TELEMETRY_TABLE]]"]
+            final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
+            final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
+
+            with open(output_path, "w", encoding="ascii", errors="ignore") as f:
+                f.write(final_polished_markdown)
+            print(f"[+] Cleaned File Saved To: {output_path.absolute()}")
+
+    # ---------------------------------------------------------
+    # PHASE 5: AUTOMATED UNITTESTS
+    if args.resume and report_path.exists():
+        print(f"[PHASE 5] Bypassed. Resuming from existing execution_report.json")
+    else:
+        run_phase5_automatic_unittests(output_path)
+
+    # ---------------------------------------------------------
+    # PHASE 6: PROJECT DISTILLATION
+    if args.resume and distilled_tasks_path.exists():
+        print(f"[PHASE 6] Bypassed. DISTILLED_TASKS.md already exists.")
+    else:
+        run_phase6_project_distillation(output_path.parent)
+
+    print("\n==============================================================================")
+    print("PIPELINE COMPLETE")
+    print("==============================================================================\n")
+
+if __name__ == "__main__":
+    main()
