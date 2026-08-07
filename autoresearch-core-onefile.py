@@ -113,7 +113,7 @@ STITCHER_ENDPOINTS = [
 ]
 STITCHER_MODEL = os.getenv("STITCHER_MODEL", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
 STITCHER_API_KEY = os.getenv("STITCHER_API_KEY", "local-sk")
-STITCH_PARALLEL_SLOTS = 1
+STITCH_PARALLEL_SLOTS = 2
 
 # Gemma 4 E4B has a 128k token context window.
 # 100,000 chars input (~25k tokens) leaves ~103k tokens of headroom;
