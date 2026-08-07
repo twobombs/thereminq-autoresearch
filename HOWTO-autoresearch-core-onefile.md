@@ -8,6 +8,7 @@ Before running the pipeline, ensure the ThereminQ local LLM swarm is online. The
 - **Generation API (Phase 1):** Default `http://localhost:8081/v1`
 - **Distiller API (Phase 2):** Default `http://localhost:8081/v1`
 - **Orchestrator Nodes (Phase 3/4/6):** Default `http://localhost:8080/v1` and `http://localhost:8079/v1`
+- **Stitcher Nodes (Phase 3):** Default `http://localhost:8070/v1` and `http://localhost:8071/v1`
 - **Worker Nodes (Phase 3/5):** Default `http://localhost:8033/v1` and `http://localhost:8034/v1`
 
 These endpoints are typically started using the `1-runinfra/start-zerg-swarm.sh` and related startup scripts.
@@ -61,7 +62,7 @@ If a prompt is provided instead of a git repository, a generative model is used 
 Ingests the raw content (from Phase 0 or 1) and distills it. A Lead Engineer persona agent strips away fluff and extracts a succinct, highly structured Markdown list of explicit TO-DOs, architectural requirements, and implementation tasks.
 
 ### Phase 3: Distributed Orchestrator Cluster (Map-Reduce)
-The core of the engine. The orchestrator breaks down the distilled query into atomic, independent sub-tasks (Decomposition). These sub-tasks are pushed to a parallel queue where multiple worker nodes independently execute them, generating code, configs, or documentation snippets. The orchestrator then merges these micro-reports back into a single cohesive document via sequential chunk synthesis and a rolling master stitch.
+The core of the engine. The orchestrator breaks down the distilled query into atomic, independent sub-tasks (Decomposition). These sub-tasks are pushed to a parallel queue where multiple worker nodes independently execute them, generating code, configs, or documentation snippets. The orchestrator then merges these micro-reports back into a single cohesive document via sequential chunk synthesis and a rolling master stitch using a dedicated stitcher cluster via parallel tree reduction.
 
 ### Phase 4: Distributed Parallel Post-Processing
 Acts as an executive editor. The massive document generated in Phase 3 is split into chunks. Orchestrator nodes perform semantic deduplication, boundary smoothing, and header unification to clean up the merged document, while strictly protecting generated code blocks.
