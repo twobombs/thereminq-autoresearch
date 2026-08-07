@@ -113,13 +113,14 @@ STITCHER_ENDPOINTS = [
 ]
 STITCHER_MODEL = os.getenv("STITCHER_MODEL", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
 STITCHER_API_KEY = os.getenv("STITCHER_API_KEY", "local-sk")
-STITCH_PARALLEL_SLOTS = 2
-MAX_RETRIES = 3
+STITCH_PARALLEL_SLOTS = 1
 
-# Tuned for ~8k context window models. 16,000 chars is ~4,000 tokens,
-# leaving a comfortable 4,096 tokens for the completion payload.
-MAX_STITCH_TOKENS = int(os.getenv("MAX_STITCH_TOKENS", "4096"))
-MAX_STITCH_CONTEXT_CHARS = int(os.getenv("MAX_STITCH_CONTEXT_CHARS", "16000"))
+# Gemma 4 E4B has a 128k token context window.
+# 100,000 chars input (~25k tokens) leaves ~103k tokens of headroom;
+# completion is capped at 32k tokens to keep per-merge latency bounded.
+# Both values are env-overridable for model swaps.
+MAX_STITCH_TOKENS = int(os.getenv("MAX_STITCH_TOKENS", "32768"))
+MAX_STITCH_CONTEXT_CHARS = int(os.getenv("MAX_STITCH_CONTEXT_CHARS", "100000"))
 
 WORKER_ENDPOINTS = [
     "http://localhost:8033/v1",
