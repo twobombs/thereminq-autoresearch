@@ -86,15 +86,15 @@ _REPO_EXT_LANG_MAP = {
 # Phase 1: Raw Generation Config
 GEN_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8081/v1")
 GEN_API_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-27B-IQ3_XXS.gguf")
+LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.5-122B-A10B-UD-IQ1_M.gguf")
 
 # Unified Context Limits
 MAX_CONTEXT_CHARS = 60000
 MAX_CHUNK_CHARS = 40000
 
 # Phase 2: Distillation Config
-DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8081/v1")
-DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.6-27B-IQ3_XXS.gguf")
+DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8082/v1")
+DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.5-122B-A10B-UD-IQ1_M.gguf")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
 # Phase 3 & 4: Orchestrator Map-Reduce & Post-Processing Config
@@ -106,6 +106,20 @@ ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "nvidia_Orchestrator-8B-Q5_
 ORCH_API_KEY = os.getenv("ORCH_API_KEY", "local-sk")
 MAX_RETRIES = 3
 
+# Phase 3b: Dedicated Stitcher Cluster (tree-reduction merge nodes)
+STITCHER_ENDPOINTS = [
+    "http://localhost:8070/v1",
+    "http://localhost:8071/v1"
+]
+STITCHER_MODEL = os.getenv("STITCHER_MODEL", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
+STITCHER_API_KEY = os.getenv("STITCHER_API_KEY", "local-sk")
+STITCH_PARALLEL_SLOTS = 1
+
+# Tuned for ~8k context window models. 16,000 chars is ~4,000 tokens,
+# leaving a comfortable 4,096 tokens for the completion payload.
+MAX_STITCH_TOKENS = int(os.getenv("MAX_STITCH_TOKENS", "4096"))
+MAX_STITCH_CONTEXT_CHARS = int(os.getenv("MAX_STITCH_CONTEXT_CHARS", "16000"))
+
 WORKER_ENDPOINTS = [
     "http://localhost:8033/v1",
     "http://localhost:8034/v1"
@@ -116,7 +130,7 @@ WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 WORKER_PARALLEL_SLOTS = 2
 WORKER_RETRIES = 3
 WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "1800.0"))
-ORCH_PARALLEL_SLOTS = 1  
+ORCH_PARALLEL_SLOTS = 1
 SYNTHESIS_CHUNK_SIZE = 3
 
 CONCURRENT_SLOTS_PER_ENDPOINT = 1
@@ -291,7 +305,7 @@ def read_file_content_safe(file_path: Path) -> Optional[str]:
 def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
     chunks = []
     current_chunk = ""
-    sections = [s for s in re.split(r'(?=\n## )', text) if s.strip()]
+    sections = [s for s in re.split(r'(?=\n#{2,3} )', text) if s.strip()]
 
     for section in sections:
         if len(current_chunk) + len(section) <= max_chars:
@@ -374,7 +388,7 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
         filename = generate_safe_filename(prompt)
         filepath = target_dir / filename
 
-        with open(filepath, "w", encoding="ascii", errors="ignore") as f:
+        with open(filepath, "w", encoding="ascii") as f:
             f.write(ascii_content.strip())
 
         print(f"[+] Saved raw content to: {filepath.absolute()}")
@@ -399,20 +413,20 @@ def _is_private_host(host: str) -> bool:
 def validate_git_url(git_url: str) -> bool:
     if not any(re.match(p, git_url) for p in GIT_URL_PATTERNS):
         return False
-        
+
     parsed = urllib.parse.urlparse(git_url)
     host = parsed.hostname or ""
-    
+
     if not host:
         scp_match = re.match(r'^git@([\w.\-]+):', git_url)
         if scp_match:
             host = scp_match.group(1)
         else:
-            return False 
-            
+            return False
+
     if _is_private_host(host):
         return False
-        
+
     return True
 
 def clone_git_repository(git_url: str) -> tuple:
@@ -423,7 +437,7 @@ def clone_git_repository(git_url: str) -> tuple:
     clone_dir = Path(tempfile.mkdtemp(prefix="autoresearch_repo_"))
     with _clone_dirs_lock:
         _active_clone_dirs.add(clone_dir)
-        
+
     print(f"[*] Cloning repository (depth={GIT_CLONE_DEPTH}): {git_url}", flush=True)
 
     env = os.environ.copy()
@@ -523,12 +537,7 @@ def collect_repo_code_files(repo_dir: Path, sub_path: str = "") -> tuple:
         if size > REPO_MAX_FILE_BYTES:
             stats["skipped_large"] += 1
             continue
-            
-        if stats["total_chars"] + size > REPO_MAX_TOTAL_CHARS:
-            stats["capped"] = True
-            print(f"    [!] WARNING: Total ingest cap of {REPO_MAX_TOTAL_CHARS:,} characters reached pre-read. Remaining files skipped.", flush=True)
-            break
-            
+
         try:
             with open(path, "rb") as fb:
                 if b"\x00" in fb.read(8192):
@@ -543,7 +552,13 @@ def collect_repo_code_files(repo_dir: Path, sub_path: str = "") -> tuple:
             stats["skipped_unreadable"] += 1
             continue
 
-        stats["total_chars"] += len(content)
+        char_len = len(content)
+        if stats["total_chars"] + char_len > REPO_MAX_TOTAL_CHARS:
+            stats["capped"] = True
+            print(f"    [!] WARNING: Total ingest cap of {REPO_MAX_TOTAL_CHARS:,} characters reached. Remaining files skipped.", flush=True)
+            break
+
+        stats["total_chars"] += char_len
         stats["ingested"] += 1
         rel_str = str(rel).replace("\\", "/")
 
@@ -644,7 +659,7 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
                 endpoint = slot_queue.get(timeout=5.0)
             except queue.Empty:
                 continue
-            
+
             try:
                 output = job_fn(idx + 1, total, payload, endpoint)
                 if output and len(output.strip()) >= 20:
@@ -709,7 +724,7 @@ def reduce_repo_summaries(summaries: list, focus: str, char_budget: int) -> str:
         chunks = split_into_logical_chunks(combined, MAX_CHUNK_CHARS)
         merged = _parallel_repo_jobs(chunks, job_fn, fallback_fn, "Reduce chunk")
         new_combined = "\n\n".join(merged)
-        
+
         if len(new_combined) >= last_len * 0.95:
             print("    [!] Reduce pass produced < 5% compression. Truncation will occur if budget is exceeded.", flush=True)
             combined = new_combined
@@ -728,8 +743,9 @@ def ingest_git_repository(git_url: str, target_dir: Path, focus: str = "", git_p
         print(f"[!] Fatal: '{git_url}' does not look like a valid git URL or references blocked subnets.", flush=True)
         sys.exit(1)
 
-    clone_dir, commit_hash, branch_name = clone_git_repository(git_url)
+    clone_dir = None
     try:
+        clone_dir, commit_hash, branch_name = clone_git_repository(git_url)
         entries, stats = collect_repo_code_files(clone_dir, git_path)
         if not entries:
             path_err = f" at path '{git_path}'" if git_path else ""
@@ -757,13 +773,12 @@ def ingest_git_repository(git_url: str, target_dir: Path, focus: str = "", git_p
         document = f"{header}\n{body}"
         filename = generate_safe_filename(f"git repo analysis {repo_name}")
         filepath = target_dir / filename
-        with open(filepath, "w", encoding="ascii", errors="ignore") as f:
+        with open(filepath, "w", encoding="ascii") as f:
             f.write(document.strip() + "\n")
 
         print(f"[+] Repository intake document saved to: {filepath.absolute()} ({len(document):,} chars)", flush=True)
         return filepath
     finally:
-        # Note: If clone_git_repository calls sys.exit(1) above, atexit handler covers this cleanup.
         if clone_dir and clone_dir.exists():
             shutil.rmtree(clone_dir, ignore_errors=True)
         with _clone_dirs_lock:
@@ -803,7 +818,7 @@ def save_distilled_output(output_text: str, original_path: Path) -> Path:
     output_path = original_path.parent / output_filename
 
     try:
-        with open(output_path, "w", encoding="ascii", errors="ignore") as f:
+        with open(output_path, "w", encoding="ascii") as f:
             f.write(output_text)
         return output_path
     except Exception as e:
@@ -822,21 +837,24 @@ def extract_json_array(raw_text: str) -> str:
     cleaned_text = re.sub(r'\n?```\s*', '', cleaned_text).strip()
 
     start_idx = cleaned_text.find('[')
-    if start_idx == -1: 
+    if start_idx == -1:
         return ""
-    
+
     depth = 0
     in_string = False
     i = start_idx
     while i < len(cleaned_text):
         char = cleaned_text[i]
-        
+
         if char == '\\':
             if i + 1 >= len(cleaned_text):
                 break
-            i += 2
+            if cleaned_text[i+1] == 'u':
+                i += 6
+            else:
+                i += 2
             continue
-            
+
         if char == '"':
             in_string = not in_string
         elif not in_string:
@@ -903,7 +921,7 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
             atomic_pieces = json.loads(cleaned_output)
             if not isinstance(atomic_pieces, list) or not all(isinstance(x, str) for x in atomic_pieces):
                 raise ValueError(f"Decomposition produced non-string items: {type(atomic_pieces)}")
-                
+
             if prompt_tokens == 0 and comp_tokens == 0:
                 prompt_tokens = estimate_tokens(_PROMPT_PHASE3_DECOMPOSE + large_query)
                 comp_tokens = estimate_tokens(raw_output)
@@ -925,7 +943,7 @@ def export_to_split_files(pieces: list, work_dir: Path) -> None:
 
     for idx, piece in enumerate(pieces, start=1):
         filepath = tasks_dir / f"task{idx:03d}.md"
-        with open(filepath, "w", encoding="ascii", errors="ignore") as f:
+        with open(filepath, "w", encoding="ascii") as f:
             f.write(f"{piece.strip()}\n")
 
 def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: str, original_query: str, run_dir: Path) -> dict:
@@ -938,6 +956,7 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
     status = "success"
     prompt_tokens, comp_tokens = 0, 0
     is_estimated = True
+    malformed_tags = False
 
     try:
         response = worker_client.chat.completions.create(
@@ -953,23 +972,23 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
         open_tags = len(re.findall(r'<file\b', result_text, re.IGNORECASE))
         close_tags = len(re.findall(r'</file>', result_text, re.IGNORECASE))
         if open_tags != close_tags:
-            print(f"        [!] Warning: Thread{task_id:02d} emitted unbalanced <file> tags ({open_tags} open, {close_tags} close). Attempting basic repair.", flush=True)
-            if open_tags > close_tags:
-                result_text += "\n</file>" * (open_tags - close_tags)
+            print(f"        [!] Warning: Thread{task_id:02d} emitted unbalanced <file> tags ({open_tags} open, {close_tags} close). Skipping artifact extraction to prevent corruption.", flush=True)
+            malformed_tags = True
 
         prompt_tokens = response.usage.prompt_tokens if response.usage else estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
         comp_tokens = response.usage.completion_tokens if response.usage else estimate_tokens(result_text)
         is_estimated = response.usage is None
 
-        file_matches = re.finditer(r'<file\s+path="([^"]+)">([\s\S]*?)</file>', result_text, re.IGNORECASE)
-        for match in file_matches:
-            file_path, file_content = match.group(1).strip(), match.group(2).strip()
-            safe_filename = os.path.basename(file_path)
-            artifact_dir = run_dir / "artifacts" / f"thread{task_id:02d}"
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            with open(artifact_dir / safe_filename, "w", encoding="ascii", errors="ignore") as af:
-                af.write(file_content)
-            saved_artifacts.append(safe_filename)
+        if not malformed_tags:
+            file_matches = re.finditer(r'<file\s+path="([^"]+)">([\s\S]*?)</file>', result_text, re.IGNORECASE)
+            for match in file_matches:
+                file_path, file_content = match.group(1).strip(), match.group(2).strip()
+                safe_filename = os.path.basename(file_path)
+                artifact_dir = run_dir / "artifacts" / f"thread{task_id:02d}"
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                with open(artifact_dir / safe_filename, "w", encoding="ascii") as af:
+                    af.write(file_content)
+                saved_artifacts.append(safe_filename)
 
         if len(result_text) < 20: status = "failed_validation"
 
@@ -1006,37 +1025,43 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
     c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
     return batch_id, res_content, p_tok, c_tok, elapsed
 
-def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, endpoint: str, original_query: str) -> tuple:
-    """Merge new_chunk into current_master via one orchestrator LLM call.
+def rolling_master_stitch(chunk_id: int, left_doc: str, right_doc: str, endpoint: str, original_query: str) -> tuple:
+    """Merge right_doc into left_doc via one stitcher LLM call.
 
-    This is the atomic merge unit consumed by tree_reduce_stitch. Both text
-    arguments are treated symmetrically so the tree caller can pass any pair
-    of nodes without special-casing left vs. right.
+    Runs on the dedicated STITCHER_ENDPOINTS pool (STITCHER_MODEL), not the
+    orchestrator pool. This is the atomic merge unit consumed by
+    tree_reduce_stitch. Both text arguments are treated symmetrically so the
+    tree caller can pass any pair of nodes without special-casing left vs.
+    right.
+
+    Context budgeting is sized against MAX_STITCH_CONTEXT_CHARS rather than
+    the global MAX_CONTEXT_CHARS, because the stitcher model runs a much
+    smaller window than the 8B orchestrator it replaces.
     """
-    client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
+    client = OpenAI(base_url=endpoint, api_key=STITCHER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
 
-    # Dynamic symmetric budget split
-    budget_each = (MAX_CONTEXT_CHARS - 2000) // 2
+    # Dynamic symmetric budget split, sized to the stitcher context window.
+    budget_each = max(2000, (MAX_STITCH_CONTEXT_CHARS - 2000) // 2)
 
-    if len(new_chunk) > budget_each:
-        new_chunk = new_chunk[:budget_each] + "\n\n...[NEW CHUNK TRUNCATED]..."
+    if len(right_doc) > budget_each:
+        right_doc = right_doc[:budget_each] + "\n\n...[NEW CHUNK TRUNCATED]..."
 
-    if len(current_master) > budget_each:
-        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + current_master[-budget_each:]
+    if len(left_doc) > budget_each:
+        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + left_doc[-budget_each:]
     else:
-        stitch_context = current_master
+        stitch_context = left_doc
 
     user_prompt = (
         f"ORIGINAL QUERY: {original_query}\n\n"
         f"--- CURRENT MASTER DOCUMENT ---\n{stitch_context}\n\n"
-        f"--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{new_chunk}"
+        f"--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{right_doc}"
     )
 
     start_time = time.time()
     response = client.chat.completions.create(
-        model=ORCHESTRATOR_MODEL,
+        model=STITCHER_MODEL,
         messages=[{"role": "system", "content": _PROMPT_PHASE3_STITCH}, {"role": "user", "content": user_prompt}],
-        temperature=0.3, max_tokens=65536
+        temperature=0.3, max_tokens=MAX_STITCH_TOKENS
     )
     elapsed = round(time.time() - start_time, 2)
 
@@ -1049,17 +1074,17 @@ def rolling_master_stitch(chunk_id: int, current_master: str, new_chunk: str, en
 def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[str, int, int]:
     """Hierarchical parallel document assembly via pairwise tree reduction.
 
-    Replaces the old sequential master_stitch_consumer thread. Instead of
-    pushing chunks one-at-a-time through a single orchestrator, every round
-    merges all available pairs simultaneously across the full orchestrator
-    endpoint pool, then feeds the merged nodes into the next round.
+    Runs entirely on the dedicated stitcher cluster (STITCHER_ENDPOINTS x
+    STITCH_PARALLEL_SLOTS). Every round merges all available pairs
+    simultaneously across the full stitcher endpoint pool, then feeds the
+    merged nodes into the next round.
 
     Complexity: O(log2 N) sequential rounds, each fully parallelised across
-    len(ORCHESTRATOR_ENDPOINTS) * ORCH_PARALLEL_SLOTS concurrent slots.
+    len(STITCHER_ENDPOINTS) * STITCH_PARALLEL_SLOTS concurrent slots.
     Total merge count is always exactly N-1 (each merge removes one node),
     so overall progress and ETA are computable up front.
 
-    Example with 8 chunks and 4 orchestrator slots:
+    Example with 8 chunks and 4 stitcher slots:
         Round 1 : 4 merges in parallel  -> 4 nodes
         Round 2 : 2 merges in parallel  -> 2 nodes
         Round 3 : 1 merge               -> 1 node  (final document)
@@ -1080,8 +1105,12 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
 
     # Build a flat, rotating endpoint pool shared across all rounds.
     endpoint_pool: List[str] = [
-        ep for ep in ORCHESTRATOR_ENDPOINTS for _ in range(ORCH_PARALLEL_SLOTS)
+        ep for ep in STITCHER_ENDPOINTS for _ in range(STITCH_PARALLEL_SLOTS)
     ]
+
+    if not endpoint_pool:
+        print("    [!] WARNING: No stitcher endpoints defined. Falling back to raw concatenation.", flush=True)
+        return "\n\n".join(ordered_chunks), 0, 0
 
     ep_queue: queue.Queue = queue.Queue()
     for ep in endpoint_pool:
@@ -1097,7 +1126,7 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
 
     print(
         f"    [*] Stitch plan: {total_merges} merge(s) over {total_rounds} round(s) "
-        f"using {len(endpoint_pool)} concurrent slot(s).",
+        f"using {len(endpoint_pool)} concurrent stitcher slot(s).",
         flush=True,
     )
 
@@ -1148,7 +1177,7 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
         with progress_lock:
             _render_progress(round_num)
 
-        def _merge_pair(pair_idx: int, left: str, right: str) -> None:
+        def _merge_pair(pair_idx: int, left: str, right: str, current_round: int) -> None:
             """Merge one pair; falls back to concatenation if all retries fail."""
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
@@ -1169,7 +1198,7 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
                         round_p_acc[0] += p
                         round_c_acc[0] += c
                         merges_done[0] += 1
-                        _render_progress(round_num)
+                        _render_progress(current_round)
                     return
 
                 except Exception as exc:
@@ -1177,7 +1206,7 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
                         sys.stdout.write("\n")
                         sys.stdout.flush()
                         print(
-                            f"        [!] Merge round {round_num} pair "
+                            f"        [!] Merge round {current_round} pair "
                             f"{pair_idx + 1}/{len(pairs)} attempt {attempt}/{MAX_RETRIES} "
                             f"failed on {endpoint}: {exc}",
                             flush=True,
@@ -1187,24 +1216,39 @@ def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[
                         with progress_lock:
                             merge_results[pair_idx] = left + "\n\n" + right
                             print(
-                                f"        [!] Merge round {round_num} pair "
+                                f"        [!] Merge round {current_round} pair "
                                 f"{pair_idx + 1} exhausted retries - "
                                 f"falling back to raw concatenation.",
                                 flush=True,
                             )
                             merges_done[0] += 1
-                            _render_progress(round_num)
+                            _render_progress(current_round)
                 finally:
                     ep_queue.put(endpoint)
 
                 if attempt < MAX_RETRIES:
                     time.sleep(2)
 
+            # Terminal guard: every attempt hit queue.Empty, so the retry loop
+            # never acquired an endpoint and never reached its own fallback.
+            # Without this the slot stays None and BOTH input nodes are
+            # silently dropped from the document by the caller.
+            with progress_lock:
+                if merge_results[pair_idx] is None:
+                    merge_results[pair_idx] = left + "\n\n" + right
+                    print(
+                        f"        [!] Merge round {current_round} pair {pair_idx + 1} "
+                        f"never acquired a stitcher slot - falling back to raw concatenation.",
+                        flush=True,
+                    )
+                    merges_done[0] += 1
+                    _render_progress(current_round)
+
         # Fan out every pair in this round simultaneously.
         max_workers = max(1, min(len(pairs), len(endpoint_pool)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [
-                pool.submit(_merge_pair, i, left, right)
+                pool.submit(_merge_pair, i, left, right, round_num)
                 for i, (left, right) in enumerate(pairs)
             ]
             concurrent.futures.wait(futures)
@@ -1239,15 +1283,23 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     Reduce phase : chunk-synthesis orchestrators merge worker outputs into
                    synthesized chunks in parallel.
     Stitch phase : tree_reduce_stitch assembles synthesized chunks into the
-                   master document using O(log N) parallel merge rounds instead
-                   of the former O(N) sequential consumer thread.
+                   master document on the dedicated stitcher cluster, using
+                   O(log N) parallel merge rounds.
+
+    Returns:
+        (master_document, worker_p, worker_c, orch_p, orch_c,
+         stitch_p, stitch_c, worker_stats_log)
+
+    Stitcher token counts are reported separately from the orchestrator
+    totals because they come from a different model on different hardware;
+    folding them together would make both figures meaningless.
     """
-    if not ORCHESTRATOR_ENDPOINTS or not WORKER_ENDPOINTS:
-        print("\n[!] FATAL: Endpoints not defined for map-reduce cluster.", flush=True)
+    if not ORCHESTRATOR_ENDPOINTS or not WORKER_ENDPOINTS or not STITCHER_ENDPOINTS:
+        print("\n[!] FATAL: Endpoints not defined for map-reduce cluster (need orchestrator, worker, and stitcher pools).", flush=True)
         sys.exit(1)
 
     if not sub_tasks:
-        return "", 0, 0, decomp_p_tok, decomp_c_tok, []
+        return "", 0, 0, decomp_p_tok, decomp_c_tok, 0, 0, []
 
     total_tasks = len(sub_tasks)
     total_chunks = (total_tasks + SYNTHESIS_CHUNK_SIZE - 1) // SYNTHESIS_CHUNK_SIZE
@@ -1288,7 +1340,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 endpoint, slot_name = worker_queue.get(timeout=5.0)
             except queue.Empty:
                 continue
-                
+
             try:
                 res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir)
                 accum_p_tok += res.get("prompt_tokens", 0)
@@ -1326,7 +1378,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 endpoint, slot_name = orch_queue.get(timeout=5.0)
             except queue.Empty:
                 continue
-                
+
             try:
                 b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
                 event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
@@ -1336,10 +1388,10 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             finally:
                 orch_queue.put((endpoint, slot_name))
             time.sleep(2)
-            
+
         batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
         fallback_text = f"\n--- [RAW CHUNK {batch_id}] ---\n" + batch_context
-        
+
         user_prompt = f"ORIGINAL QUERY: {original_query}\n\nREPORTS TO MERGE:\n{batch_context}"
         est_p_tok = estimate_tokens(_PROMPT_PHASE3_SYNTHESIS + user_prompt)
         est_c_tok = estimate_tokens(fallback_text)
@@ -1358,6 +1410,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     orch_threads = max(1, min(total_chunks, len(ORCHESTRATOR_ENDPOINTS) * ORCH_PARALLEL_SLOTS))
 
     start_time_progress = time.time()
+    last_event_time = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_threads) as worker_exec, \
          concurrent.futures.ThreadPoolExecutor(max_workers=orch_threads) as orch_exec:
@@ -1368,12 +1421,16 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         while chunks_completed < total_chunks:
             try:
                 event = event_queue.get(timeout=2.0)
+                last_event_time = time.time()
             except queue.Empty:
                 if _shutdown_event.is_set():
                     break
                 if workers_finished >= total_tasks and chunks_completed < total_chunks:
                     pending_chunks = total_chunks - chunks_completed
                     if pending_chunks > 0:
+                        if time.time() - last_event_time > 60.0:
+                            print(f"    [!] Watchdog: Stalled for 60s with {pending_chunks} chunks missing. Forcing exit.", flush=True)
+                            break
                         # Sweep for any missed chunks during event race condition
                         for chunk_idx in range(1, total_chunks + 1):
                             if chunk_idx not in submitted_chunks:
@@ -1383,12 +1440,8 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                                 if available:
                                     submitted_chunks.add(chunk_idx)
                                     orch_exec.submit(chunk_wrapper, chunk_idx, available)
-                        
-                        if len(submitted_chunks) == chunks_completed:
-                            print(f"    [!] Watchdog: Stalled with {pending_chunks} chunks missing. Forcing exit.", flush=True)
-                            break
                 continue
-                
+
             if event[0] == "worker":
                 workers_finished += 1
                 task_res = event[1]
@@ -1430,9 +1483,10 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                 chunks_completed += 1
 
             bar_len = 30
-            filled = int((workers_finished / total_tasks) * bar_len)
+            total_tasks_safe = total_tasks if total_tasks > 0 else 1
+            filled = int((workers_finished / total_tasks_safe) * bar_len)
             bar = '#' * filled + '-' * (bar_len - filled)
-            percent = int((workers_finished / total_tasks) * 100)
+            percent = int((workers_finished / total_tasks_safe) * 100)
             eta_str = _format_eta(start_time_progress, workers_finished, total_tasks)
             sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks}) | ETC: {eta_str}")
             sys.stdout.flush()
@@ -1440,21 +1494,22 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     print()
 
     # ------------------------------------------------------------------
-    # Stitch phase: hierarchical parallel tree reduction.
-    # Chunks are assembled in chunk_id order so document coherence is
-    # maintained; the tree reduction halves the node list each round and
-    # uses every available orchestrator endpoint concurrently per round.
+    # Stitch phase: hierarchical parallel tree reduction on the dedicated
+    # stitcher cluster. Chunks are assembled in chunk_id order so document
+    # coherence is maintained; the tree reduction halves the node list each
+    # round and uses every available stitcher endpoint concurrently.
     # ------------------------------------------------------------------
     ordered_chunk_texts = [
         synthesized_chunks[cid] for cid in sorted(synthesized_chunks.keys())
     ]
-    
+
     if len(ordered_chunk_texts) < total_chunks:
         print(f"    [!] WARNING: Map-Reduce completed but {total_chunks - len(ordered_chunk_texts)} chunks were lost.", flush=True)
 
     print(
         f"\n[5] TREE-REDUCTION STITCH: Assembling {len(ordered_chunk_texts)} chunk(s) "
-        f"across {len(ORCHESTRATOR_ENDPOINTS)} endpoint(s) x {ORCH_PARALLEL_SLOTS} slot(s)...",
+        f"across {len(STITCHER_ENDPOINTS)} stitcher endpoint(s) x {STITCH_PARALLEL_SLOTS} slot(s) "
+        f"[{STITCHER_MODEL}]...",
         flush=True,
     )
 
@@ -1462,10 +1517,11 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         ordered_chunk_texts, original_query
     )
 
-    total_orch_p = chunk_p_tok + stitch_p_tok + decomp_p_tok
-    total_orch_c = chunk_c_tok + stitch_c_tok + decomp_c_tok
+    total_orch_p = chunk_p_tok + decomp_p_tok
+    total_orch_c = chunk_c_tok + decomp_c_tok
 
-    return master_document, worker_p_tok, worker_c_tok, total_orch_p, total_orch_c, worker_stats_log
+    return (master_document, worker_p_tok, worker_c_tok, total_orch_p, total_orch_c,
+            stitch_p_tok, stitch_c_tok, worker_stats_log)
 
 # ==============================================================================
 # Phase 4: Distributed Parallel Post-Processing
@@ -1544,16 +1600,21 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
         ip_tail = parsed.hostname if parsed.hostname else "local"
         if parsed.port:
             ip_tail += f":{parsed.port}"
-            
+
         for i in range(CONCURRENT_SLOTS_PER_ENDPOINT):
             slot_name = f"Node-{ip_tail}-Slot-{i+1}"
             endpoint_queue.put((ep, slot_name))
 
     results = [""] * total_chunks
     def _edit_chunk_worker(chunk_idx: int, chunk_content: str):
-        try:
-            endpoint, slot_name = endpoint_queue.get(timeout=5.0)
-        except queue.Empty:
+        endpoint, slot_name = None, None
+        while not _shutdown_event.is_set():
+            try:
+                endpoint, slot_name = endpoint_queue.get(timeout=2.0)
+                break
+            except queue.Empty:
+                continue
+        if endpoint is None:
             return chunk_content
         try:
             return semantic_deduplication(chunk_content, chunk_idx + 1, total_chunks, endpoint, slot_name)
@@ -1575,16 +1636,17 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
         for future in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[future]
             results[idx] = future.result()
-            
+
             completed += 1
             bar_len = 30
-            filled = int((completed / total_chunks) * bar_len)
+            total_chunks_safe = total_chunks if total_chunks > 0 else 1
+            filled = int((completed / total_chunks_safe) * bar_len)
             bar = '#' * filled + '-' * (bar_len - filled)
-            percent = int((completed / total_chunks) * 100)
+            percent = int((completed / total_chunks_safe) * 100)
             eta_str = _format_eta(start_time_progress, completed, total_chunks)
             sys.stdout.write(f"\r    [+] Progress: [{bar}] {percent}% ({completed}/{total_chunks}) | ETC: {eta_str}")
             sys.stdout.flush()
-            
+
     print()
 
     return "\n\n".join(results)
@@ -1592,7 +1654,7 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
 def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
     client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=1)
     system_prompt = _PROMPT_PHASE4_SMOOTH
-    
+
     if global_inventory:
         system_prompt += f"\n\nCRITICAL ARTIFACT INVENTORY: {', '.join(global_inventory)}\nYou MUST retain EVERY SINGLE placeholder."
 
@@ -1612,7 +1674,7 @@ def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], 
 def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
     client = OpenAI(base_url=endpoint, api_key=ORCH_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=1)
     system_prompt = _PROMPT_PHASE4_UNIFY
-    
+
     if global_inventory:
         system_prompt += f"\n\nCRITICAL ARTIFACT INVENTORY: {', '.join(global_inventory)}\nYou MUST retain EVERY SINGLE placeholder."
 
@@ -1632,7 +1694,7 @@ def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str],
 def global_consolidation_pass(full_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
     print("    [*] Executive Editor Pass 1: Section Boundary Smoothing...", flush=True)
     smoothed_text = section_boundary_smoothing(full_skeleton, global_inventory, endpoint)
-    
+
     print("    [*] Executive Editor Pass 2: Header Unification...", flush=True)
     final_text = header_unification_pass(smoothed_text, global_inventory, endpoint)
 
@@ -1665,7 +1727,7 @@ def _format_execution_report_as_markdown(report_data: list) -> str:
 def _safe_output_path(detected_filename: str, output_dir: Path, seen_paths: Set[str]) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     normalised = detected_filename.replace("\\", "/")
     parts = [p for p in PurePosixPath(normalised).parts if p not in ("", ".", "..")]
     if not parts:
@@ -1760,7 +1822,7 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
             detected_filename = xml_match.group(1)
             i += 1
             continue
-            
+
         header_match = re.match(r'^###?\s+([a-zA-Z0-9_\-\.]+.*)$', line)
         if header_match and not in_block:
             potential_name = header_match.group(1).strip()
@@ -1776,7 +1838,7 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
             last_header = potential_name
             i += 1
             continue
-            
+
         stripped_line = line.lstrip()
         if not in_block and stripped_line.startswith("```"):
             in_block = True
@@ -1804,7 +1866,7 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
 
                 file_path = _safe_output_path(detected_filename, output_path, seen_paths)
 
-                with open(file_path, "w", encoding="ascii", errors="ignore") as f:
+                with open(file_path, "w", encoding="ascii") as f:
                     f.write(content + "\n")
                 extracted_artifacts.append({
                     "filename": file_path.name,
@@ -1821,12 +1883,12 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
             else:
                 current_block.append(line)
         i += 1
-        
+
     if in_block and current_block:
         content = "\n".join(current_block)
         fallback_name = f"artifact_{file_counter}_partial.txt"
         file_path = output_path / fallback_name
-        with open(file_path, "w", encoding="ascii", errors="ignore") as f:
+        with open(file_path, "w", encoding="ascii") as f:
             f.write(content + "\n")
     return extracted_artifacts
 
@@ -1868,33 +1930,33 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                 response.raise_for_status()
                 result = response.json()
                 choices = result.get("choices")
-                
+
                 if not choices:
                     print(f"    [!] Endpoint {endpoint_url} returned no choices (attempt {attempt}). Raw: {result}", flush=True)
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
                         continue
                     break
-                    
+
                 test_code = choices[0].get("message", {}).get("content", "")
                 if not test_code:
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
                     continue
-                    
+
                 test_code = enforce_ascii(_strip_markdown_fences(test_code))
                 test_output_dir.mkdir(parents=True, exist_ok=True)
                 test_filename = f"test_{artifact['filename']}"
                 test_filepath = test_output_dir / test_filename
-                
-                with open(test_filepath, "w", encoding="ascii", errors="ignore") as f:
+
+                with open(test_filepath, "w", encoding="ascii") as f:
                     f.write(test_code + "\n")
-                    
+
                 with progress_lock:
                     progress_state["done"] += 1
                     eta_str = _format_eta(progress_state["start_time"], progress_state["done"], progress_state["total"])
                     print(f"    [+] [{endpoint_url}] Generated tests ({progress_state['done']}/{progress_state['total']}) | ETC: {eta_str} -> {test_filename}")
-                    
+
                 generation_metadata = {
                     "filename": test_filename,
                     "test_filepath": str(test_filepath),
@@ -1902,11 +1964,11 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                     "artifact_filepath": artifact["filepath"],
                 }
                 break
-                
+
             except requests.exceptions.RequestException:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
-                    
+
         return generation_metadata
     finally:
         endpoint_queue.put(endpoint_url)
@@ -1945,13 +2007,13 @@ def execute_test_artifact(test_meta: dict) -> dict:
             try:
                 with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
                     binary_path = Path(tmp.name)
-                    
+
                 compile_cmd = [compiler, "-I", str(artifact_path.parent), str(test_path), "-o", str(binary_path)]
                 comp_res = subprocess.run(compile_cmd, capture_output=True, encoding="ascii", errors="ignore", timeout=20)
                 if comp_res.returncode != 0:
                     result["status"], result["message"] = "COMPILE_ERROR", _extract_error_line(comp_res.stderr, lang)
                     return result
-                    
+
                 start_time = time.time()
                 res = subprocess.run([str(binary_path)], capture_output=True, encoding="ascii", errors="ignore", timeout=30)
                 duration = time.time() - start_time
@@ -2045,9 +2107,9 @@ def run_phase5_automatic_unittests(source_path: Path):
         REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         json_report_path = REPORT_OUTPUT_DIR / "execution_report.json"
         csv_report_path  = REPORT_OUTPUT_DIR / "execution_report.csv"
-        with open(json_report_path, "w", encoding="ascii", errors="ignore") as f:
+        with open(json_report_path, "w", encoding="ascii") as f:
             json.dump(execution_results, f, indent=4)
-        with open(csv_report_path, "w", newline="", encoding="ascii", errors="ignore") as f:
+        with open(csv_report_path, "w", newline="", encoding="ascii") as f:
             writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(execution_results)
@@ -2081,7 +2143,7 @@ def run_phase6_project_distillation(project_dir: Path):
 
     raw_files = []
     seen_paths = set()
-    
+
     report_json_path = project_dir / "reports" / "execution_report.json"
     if report_json_path.exists():
         raw_files.append(report_json_path)
@@ -2094,14 +2156,14 @@ def run_phase6_project_distillation(project_dir: Path):
             file_path = root_path / f
             if file_path.is_symlink():
                 continue
-                
+
             if file_path.stem in p6_exclude_names:
                 continue
-                
+
             # If a report JSON exists, it was added above. Skip any OTHER json files.
             if file_path.suffix == ".json" and file_path.resolve() != report_json_path.resolve():
                 continue
-                
+
             if file_path.suffix in {".txt", ".md", ".csv", ".json"}:
                 resolved_path = file_path.resolve()
                 if resolved_path not in seen_paths:
@@ -2117,12 +2179,13 @@ def run_phase6_project_distillation(project_dir: Path):
     aggregated_content = []
     for file_path in raw_files:
         try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                if file_path.suffix == '.json' and 'execution_report' in file_path.name:
+            if file_path.suffix == '.json' and 'execution_report' in file_path.name:
+                with open(file_path, "r", encoding="utf-8", errors="strict") as f:
                     report_data = json.load(f)
                     md_table = _format_execution_report_as_markdown(report_data)
                     aggregated_content.append(f"--- SOURCE: {file_path.name} ---\n{md_table}")
-                else:
+            else:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                     aggregated_content.append(f"--- SOURCE: {file_path.name} ---\n{f.read()}")
         except Exception as e:
             print(f"    [!] Could not parse {file_path.name}: {e}", flush=True)
@@ -2135,7 +2198,7 @@ def run_phase6_project_distillation(project_dir: Path):
     if distilled_markdown:
         output_file = project_dir / "DISTILLED_TASKS.md"
         try:
-            with open(output_file, "w", encoding="ascii", errors="ignore") as f:
+            with open(output_file, "w", encoding="ascii") as f:
                 f.write(f"# Distilled Tasks: {project_name}\n\n{distilled_markdown}\n")
             print(f"[{project_name}] Successfully saved distilled tasks to {output_file.name}", flush=True)
         except Exception as e:
@@ -2149,7 +2212,7 @@ def signal_handler(sig, frame):
     if _shutdown_event.is_set():
         print("\n[!] Force exit triggered.", flush=True)
         os._exit(1)
-        
+
     _shutdown_event.set()
     print("\n[!] Graceful shutdown requested (SIGINT/SIGTERM). Awaiting active threads to abort... (Press Ctrl+C again to force exit)", flush=True)
 
@@ -2172,6 +2235,7 @@ def main():
 
     args = parser.parse_args()
 
+    # manual check required since -r is outside the mutually exclusive group
     if args.resume and (args.prompt or args.file or args.git):
         parser.error("--resume cannot be combined with -p, -f, or -g.")
     if not args.resume and not args.prompt and not args.file and not args.git:
@@ -2280,7 +2344,8 @@ def main():
         fragments, p_tok, c_tok = decompose_to_atomic_pieces(target_query)
 
         export_to_split_files(fragments, target_directory)
-        final_output, w_p, w_c, o_p, o_c, worker_stats = execute_continuous_map_reduce(fragments, target_query, target_directory, decomp_p_tok=p_tok, decomp_c_tok=c_tok)
+        (final_output, w_p, w_c, o_p, o_c, s_p, s_c, worker_stats) = execute_continuous_map_reduce(
+            fragments, target_query, target_directory, decomp_p_tok=p_tok, decomp_c_tok=c_tok)
 
         master_elapsed_time = time.time() - master_start_time
 
@@ -2297,10 +2362,14 @@ def main():
         agg_md += f"- **Worker Completion Tokens:** {w_c}\n"
         agg_md += f"- **Total Orchestrator + Decomposition Prompt Tokens:** {o_p}\n"
         agg_md += f"- **Total Orchestrator + Decomposition Completion Tokens:** {o_c}\n"
+        agg_md += f"- **Stitcher Prompt Tokens:** {s_p}\n"
+        agg_md += f"- **Stitcher Completion Tokens:** {s_c}\n"
+        agg_md += f"- **Stitcher Model:** {STITCHER_MODEL}\n"
+        agg_md += f"- **Stitcher Endpoints:** {', '.join(STITCHER_ENDPOINTS)}\n"
 
         final_output += stats_md + agg_md
 
-        with open(final_file_path, "w", encoding="ascii", errors="ignore") as f:
+        with open(final_file_path, "w", encoding="ascii") as f:
             f.write(final_output)
 
     # ---------------------------------------------------------
@@ -2318,7 +2387,7 @@ def main():
         chunks = split_into_logical_chunks(skeleton_text, MAX_CHUNK_CHARS)
 
         if len(chunks) <= 1:
-            with open(output_path, "w", encoding="ascii", errors="ignore") as f:
+            with open(output_path, "w", encoding="ascii") as f:
                 f.write(raw_markdown)
             print(f"[+] Document fits in single chunk. Bypassed LLM refinement. Saved to {output_path}")
         else:
@@ -2327,7 +2396,7 @@ def main():
             final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory, ORCHESTRATOR_ENDPOINTS[0])
             final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
 
-            with open(output_path, "w", encoding="ascii", errors="ignore") as f:
+            with open(output_path, "w", encoding="ascii") as f:
                 f.write(final_polished_markdown)
             print(f"[+] Cleaned File Saved To: {output_path.absolute()}")
 
