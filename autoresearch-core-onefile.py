@@ -93,7 +93,7 @@ MAX_CONTEXT_CHARS = 60000
 MAX_CHUNK_CHARS = 40000
 
 # Phase 2: Distillation Config
-DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8082/v1")
+DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8081/v1")
 DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.5-122B-A10B-UD-IQ1_M.gguf")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
@@ -113,7 +113,8 @@ STITCHER_ENDPOINTS = [
 ]
 STITCHER_MODEL = os.getenv("STITCHER_MODEL", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
 STITCHER_API_KEY = os.getenv("STITCHER_API_KEY", "local-sk")
-STITCH_PARALLEL_SLOTS = 1
+STITCH_PARALLEL_SLOTS = 2
+MAX_RETRIES = 3
 
 # Tuned for ~8k context window models. 16,000 chars is ~4,000 tokens,
 # leaving a comfortable 4,096 tokens for the completion payload.
