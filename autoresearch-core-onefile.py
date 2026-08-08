@@ -135,6 +135,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-27B-UD-IQ3_XXS.gguf")
 # the clamp only prevents a raised override from overflowing port 8081.
 CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "3.5"))
 APEX_MAX_OUTPUT_TOKENS = int(os.getenv("APEX_MAX_OUTPUT_TOKENS", "8192"))
+APEX_GEN_TOKENS = int(os.getenv("APEX_GEN_TOKENS", "4096"))
 APEX_RESERVE_TOKENS = int(os.getenv("APEX_RESERVE_TOKENS", "2048"))
 
 _apex_input_chars = int(
@@ -195,6 +196,13 @@ STITCH_MERGE_CHARS_EACH = int(os.getenv(
     )))
 ))
 
+# The editor passes must reproduce their whole input, so they are output-bound.
+# Anything larger than the model can emit would be silently truncated.
+STITCH_ECHO_MAX_CHARS = int(os.getenv(
+    "STITCH_ECHO_MAX_CHARS",
+    str(int(MAX_STITCH_TOKENS * STITCH_CHARS_PER_TOKEN * 0.9))
+))
+
 # Phase 3 & 4: Worker Config
 WORKER_ENDPOINTS = [
     "http://localhost:8033/v1",
@@ -210,7 +218,11 @@ WORKER_PARALLEL_SLOTS = min(
     WORKER_SERVER_NP
 )
 WORKER_RETRIES = 3
-WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "1800.0"))
+
+# Streaming timeout parameters (Max gap between tokens, not total block read length)
+WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "300.0"))
+STITCH_TIMEOUT_SECS = float(os.getenv("STITCH_TIMEOUT_SECS", "300.0"))
+
 SYNTHESIS_CHUNK_SIZE = int(os.getenv("SYNTHESIS_CHUNK_SIZE", "2"))
 
 WORKER_RESERVE_TOKENS = int(os.getenv("WORKER_RESERVE_TOKENS", "2048"))
@@ -220,14 +232,23 @@ MAX_WORKER_TOKENS = min(
         - int(MAX_CONTEXT_CHARS / CHARS_PER_TOKEN))
 )
 
+# Absolute ceiling on one streaming worker call. The gap timeout above catches a
+# dead server; this catches one that dribbles tokens indefinitely.
+WORKER_MIN_DECODE_TPS = float(os.getenv("WORKER_MIN_DECODE_TPS", "4.0"))
+WORKER_MAX_WALL_SECS = float(os.getenv(
+    "WORKER_MAX_WALL_SECS",
+    str(max(600.0, MAX_WORKER_TOKENS / WORKER_MIN_DECODE_TPS + 120.0))))
+
 # Phase 5: Automatic Unittests Config
 TEST_WORKER_ENDPOINTS = [
     "http://localhost:8033/v1/chat/completions",
     "http://localhost:8034/v1/chat/completions"
 ]
 CONCURRENT_REQS_PER_ENDPOINT = WORKER_PARALLEL_SLOTS
+# Unit tests are deliberately compact; the prompt demands minimal code. A large
+# clamp only buys a runaway generation and a multi-minute wall-clock timeout.
 MAX_OUTPUT_TOKENS = min(
-    int(os.getenv("MAX_OUTPUT_TOKENS", "16384")),
+    int(os.getenv("MAX_OUTPUT_TOKENS", "4096")),
     max(1024, WORKER_CONTEXT_TOKENS - WORKER_RESERVE_TOKENS
         - int(MAX_CONTEXT_CHARS / CHARS_PER_TOKEN))
 )
@@ -239,6 +260,13 @@ RETRY_BASE_DELAY = 2.0
 RETRY_JITTER = 0.5
 MAX_EXEC_WORKERS = 4
 EXECUTION_RESULT_FIELDS = ["filename", "language", "status", "message"]
+
+# Test calls remain standard requests.post mapping wall-clock budgets
+TEST_MIN_DECODE_TPS = float(os.getenv("TEST_MIN_DECODE_TPS", "10.0"))
+TEST_TIMEOUT_SECS = float(os.getenv(
+    "TEST_TIMEOUT_SECS",
+    str(max(300.0, MAX_OUTPUT_TOKENS / TEST_MIN_DECODE_TPS + 60.0))
+))
 
 # ==============================================================================
 # Global Prompts
@@ -462,7 +490,7 @@ def next_stitcher_endpoint() -> str:
         _stitcher_rr_idx += 1
     return endpoint
 
-def stitcher_client(endpoint: Optional[str] = None, timeout: float = WORKER_TIMEOUT_SECS,
+def stitcher_client(endpoint: Optional[str] = None, timeout: float = STITCH_TIMEOUT_SECS,
                     max_retries: int = 0) -> OpenAI:
     return OpenAI(
         base_url=endpoint or next_stitcher_endpoint(),
@@ -470,6 +498,85 @@ def stitcher_client(endpoint: Optional[str] = None, timeout: float = WORKER_TIME
         timeout=timeout,
         max_retries=max_retries,
     )
+
+def _stitch_completion(client: OpenAI, system_prompt: str, user_prompt: str,
+                       max_tokens: int, temperature: float,
+                       presence_penalty: Optional[float] = None) -> Tuple[str, int, int]:
+    """Streaming stitcher call. Returns (text, prompt_tokens, completion_tokens)."""
+    kwargs = dict(
+        model=STITCHER_MODEL,
+        messages=[{"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_prompt}],
+        temperature=temperature, max_tokens=max_tokens, stream=True,
+        stream_options={"include_usage": True},
+    )
+    if presence_penalty is not None:
+        kwargs["presence_penalty"] = presence_penalty
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        low = str(e).lower()
+        if "stream_options" in low or "unrecognized" in low or "400" in low:
+            kwargs.pop("stream_options")
+            response = client.chat.completions.create(**kwargs)
+        else:
+            raise
+
+    text, p_tok, c_tok = "", 0, 0
+    try:
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content is not None:
+                text += chunk.choices[0].delta.content
+            if getattr(chunk, "usage", None) is not None:
+                p_tok, c_tok = chunk.usage.prompt_tokens, chunk.usage.completion_tokens
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+            
+    text = enforce_ascii(text.strip())
+    if not p_tok and not c_tok:
+        p_tok, c_tok = estimate_tokens(system_prompt + user_prompt), estimate_tokens(text)
+    return text, p_tok, c_tok
+
+def verify_server_props(endpoints: List[str], label: str, expect_ctx: int, expect_np: int) -> None:
+    for ep in endpoints:
+        try:
+            base = ep.rsplit("/v1", 1)[0]
+            props_url = f"{base}/props"
+            resp = requests.get(props_url, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                default_props = data.get("default_generation_settings", {})
+                n_ctx = default_props.get("n_ctx", 0)
+                slots = data.get("total_slots") or default_props.get("n_parallel") or 0
+                note = "ok"
+                per_slot = int(expect_ctx) // max(1, int(expect_np))
+                if expect_ctx and n_ctx and int(n_ctx) not in (int(expect_ctx), per_slot):
+                    note = "MISMATCH: constant says -c {} (per-slot {})".format(expect_ctx, per_slot)
+                elif expect_np and slots and int(slots) != int(expect_np):
+                    note = "MISMATCH: constant says -np {}".format(expect_np)
+                print("    [+] {} {} n_ctx={} slots={} :: {}".format(label, ep, n_ctx, slots, note), flush=True)
+            else:
+                print(f"    [!] {label} {ep} /props check returned HTTP {resp.status_code}", flush=True)
+        except Exception as exc:
+            print(f"    [!] {label} {ep} /props check failed: {str(exc)[:120]}", flush=True)
+
+def ping_tier(endpoints: List[str], model: str, api_key: str, label: str, timeout: float = 90.0) -> bool:
+    ok = True
+    for ep in endpoints:
+        try:
+            c = OpenAI(base_url=ep, api_key=api_key, timeout=timeout, max_retries=0)
+            t0 = time.time()
+            c.chat.completions.create(model=model,
+                                      messages=[{"role": "user", "content": "ping"}],
+                                      max_tokens=4, temperature=0.0)
+            print("    [+] {} {} responded in {:.1f}s".format(label, ep, time.time() - t0), flush=True)
+        except Exception as exc:
+            print("    [!] WARNING: {} {} smoke test failed: {}".format(label, ep, str(exc)[:160]), flush=True)
+            ok = False
+    return ok
 
 def clamp_stitch_tokens(requested: int) -> int:
     return max(256, min(int(requested), MAX_STITCH_TOKENS))
@@ -479,6 +586,8 @@ def fit_stitch_context(text: str, budget: Optional[int] = None,
     limit = MAX_STITCH_CONTEXT_CHARS if budget is None else budget
     if len(text) <= limit:
         return text
+    print("    [!] fit_stitch_context dropped {:,} of {:,} chars.".format(
+        len(text) - limit, len(text)), flush=True)
     return text[:limit] + f"\n\n{note}"
 
 def build_stitcher_slot_queue(prefix: str = "S-Slot") -> Tuple[queue.Queue, int]:
@@ -502,7 +611,7 @@ def describe_budget_alignment() -> str:
         f"  -> {APEX_CONTEXT_TOKENS//1024}k tok/req"
         f" | input<={MAX_CONTEXT_CHARS:,} chars"
         f" (~{int(MAX_CONTEXT_CHARS/CHARS_PER_TOKEN)//1024}k tok)"
-        f" | out<={APEX_MAX_OUTPUT_TOKENS//1024}k tok"
+        f" | out<={APEX_GEN_TOKENS//1024}k gen / {APEX_MAX_OUTPUT_TOKENS//1024}k distil"
     )
     lines.append(
         f"    stitcher:8070/1 -c {STITCH_SERVER_CTX} -np {STITCH_SERVER_NP}"
@@ -511,12 +620,19 @@ def describe_budget_alignment() -> str:
         f" | input<={MAX_STITCH_CONTEXT_CHARS:,} chars"
         f" | out<={MAX_STITCH_TOKENS//1024}k tok"
         f" | merge<={STITCH_MERGE_CHARS_EACH:,} chars/side"
+        f" | echo<={STITCH_ECHO_MAX_CHARS:,} chars"
+        f" | gap_to={int(STITCH_TIMEOUT_SECS)}s"
     )
     lines.append(
         f"    worker  :8033/4 -c {WORKER_SERVER_CTX} -np {WORKER_SERVER_NP}"
         f"  -> {WORKER_CONTEXT_TOKENS//1024}k tok/req"
         f" | input<={MAX_CONTEXT_CHARS:,} chars"
         f" | out<={MAX_WORKER_TOKENS//1024}k tok"
+        f" | gap={int(WORKER_TIMEOUT_SECS)}s wall={int(WORKER_MAX_WALL_SECS)}s"
+    )
+    lines.append(
+        f"    tests   :8033/4 out<={MAX_OUTPUT_TOKENS//1024}k tok"
+        f" | min_tps={TEST_MIN_DECODE_TPS} | timeout={int(TEST_TIMEOUT_SECS)}s"
     )
 
     peak_stitch = (
@@ -570,6 +686,16 @@ def _render_stitch_progress(done: int, total: int, current_round: int, total_rou
     )
     sys.stdout.flush()
 
+def _render_map_progress(workers_finished: int, total_tasks: int, chunks_completed: int, total_chunks: int, start_time: float) -> None:
+    bar_len = 30
+    total_tasks_safe = total_tasks if total_tasks > 0 else 1
+    filled = int((workers_finished / total_tasks_safe) * bar_len)
+    bar = '#' * filled + '-' * (bar_len - filled)
+    percent = int((workers_finished / total_tasks_safe) * 100)
+    eta_str = _format_eta(start_time, workers_finished, total_tasks)
+    sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks}) | ETC: {eta_str}")
+    sys.stdout.flush()
+
 # ==============================================================================
 # Phase 1: Raw Content Generation
 # ==============================================================================
@@ -598,13 +724,19 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
-            max_tokens=4096,
+            max_tokens=APEX_GEN_TOKENS,
             stream=True
         )
 
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content is not None:
-                full_content += chunk.choices[0].delta.content
+        try:
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content is not None:
+                    full_content += chunk.choices[0].delta.content
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
 
         elapsed = round(time.time() - start_time, 2)
         print(f"[+] Generation complete in {elapsed} seconds.")
@@ -871,15 +1003,20 @@ def render_inline_source(entries: list) -> str:
 
 def _repo_worker_call(system_prompt: str, user_prompt: str, endpoint: str) -> str:
     client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
-    response = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=WORKER_MODEL,
         messages=[{"role": "system", "content": system_prompt},
                   {"role": "user", "content": user_prompt}],
-        temperature=0.2,
-        max_tokens=MAX_WORKER_TOKENS
-    )
-    raw = response.choices[0].message.content.strip()
-    return enforce_ascii(raw)
+        temperature=0.2, max_tokens=MAX_WORKER_TOKENS, stream=True)
+    try:
+        out = "".join(c.choices[0].delta.content for c in stream
+                      if c.choices and c.choices[0].delta.content is not None)
+        return enforce_ascii(out.strip())
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
     total = len(jobs)
@@ -1029,7 +1166,7 @@ def ingest_git_repository(git_url: str, target_dir: Path, focus: str = "", git_p
 # ==============================================================================
 
 def distill_document(raw_text: str) -> str:
-    distill_client = OpenAI(base_url=DISTILLER_URL, api_key=DISTILLER_API_KEY)
+    distill_client = OpenAI(base_url=DISTILLER_URL, api_key=DISTILLER_API_KEY, timeout=WORKER_TIMEOUT_SECS)
     char_count = len(raw_text)
     print(f"\n[PHASE 2] [*] Ingesting document ({char_count:,} characters)...", flush=True)
 
@@ -1045,9 +1182,21 @@ def distill_document(raw_text: str) -> str:
                 {"role": "user", "content": f"Extract the actionable tasks from this document:\n\n{raw_text}"}
             ],
             temperature=0.3,
-            max_tokens=8192
+            max_tokens=APEX_MAX_OUTPUT_TOKENS,
+            stream=True
         )
-        return enforce_ascii(response.choices[0].message.content.strip())
+        out = ""
+        try:
+            for c in response:
+                if c.choices and c.choices[0].delta.content is not None:
+                    out += c.choices[0].delta.content
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+                
+        return enforce_ascii(out.strip())
 
     except Exception as e:
         print(f"[!] Error during distillation: {e}", flush=True)
@@ -1070,7 +1219,7 @@ def save_distilled_output(output_text: str, original_path: Path) -> Path:
 # ==============================================================================
 
 def estimate_tokens(text: str) -> int:
-    return len(str(text)) // 4
+    return int(len(str(text)) / CHARS_PER_TOKEN)
 
 def extract_json_array(raw_text: str) -> str:
     cleaned_text = re.sub(r'```json\s*', '', raw_text, flags=re.IGNORECASE)
@@ -1125,52 +1274,18 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
         endpoint = next_stitcher_endpoint()
         client = stitcher_client(endpoint)
         print(f"[2] DECOMPOSITION: Engaging atomic breakdown via {endpoint} [{STITCHER_MODEL}] (Attempt {attempt}/{MAX_RETRIES})...", flush=True)
-        raw_output = ""
-        prompt_tokens, comp_tokens = 0, 0
-
         try:
             start_time = time.time()
-            try:
-                response = client.chat.completions.create(
-                    model=STITCHER_MODEL,
-                    messages=[
-                        {"role": "system", "content": _PROMPT_PHASE3_DECOMPOSE},
-                        {"role": "user", "content": user_content}
-                    ],
-                    temperature=0.7, max_tokens=MAX_STITCH_TOKENS, stream=True,
-                    stream_options={"include_usage": True}
-                )
-            except Exception as e:
-                if "stream_options" in str(e).lower() or "unrecognized" in str(e).lower() or "400" in str(e):
-                    response = client.chat.completions.create(
-                        model=STITCHER_MODEL,
-                        messages=[
-                            {"role": "system", "content": _PROMPT_PHASE3_DECOMPOSE},
-                            {"role": "user", "content": user_content}
-                        ],
-                        temperature=0.7, max_tokens=MAX_STITCH_TOKENS, stream=True
-                    )
-                else:
-                    raise e
+            raw_output, prompt_tokens, comp_tokens = _stitch_completion(
+                client, _PROMPT_PHASE3_DECOMPOSE, user_content, MAX_STITCH_TOKENS, 0.7
+            )
 
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content is not None:
-                    raw_output += chunk.choices[0].delta.content
-                if hasattr(chunk, 'usage') and chunk.usage is not None:
-                    prompt_tokens = chunk.usage.prompt_tokens
-                    comp_tokens = chunk.usage.completion_tokens
-
-            raw_output = enforce_ascii(raw_output)
             cleaned_output = extract_json_array(raw_output)
             if not cleaned_output: raise ValueError("Could not locate JSON array.")
 
             atomic_pieces = json.loads(cleaned_output)
             if not isinstance(atomic_pieces, list) or not all(isinstance(x, str) for x in atomic_pieces):
                 raise ValueError(f"Decomposition produced non-string items: {type(atomic_pieces)}")
-
-            if prompt_tokens == 0 and comp_tokens == 0:
-                prompt_tokens = estimate_tokens(_PROMPT_PHASE3_DECOMPOSE + user_content)
-                comp_tokens = estimate_tokens(raw_output)
 
             elapsed = round(time.time() - start_time, 2)
             print(f"    [+] Success! Shattered into {len(atomic_pieces)} distinct micro-pieces in {elapsed}s.", flush=True)
@@ -1192,7 +1307,8 @@ def export_to_split_files(pieces: list, work_dir: Path) -> None:
         with open(filepath, "w", encoding="ascii") as f:
             f.write(f"{piece.strip()}\n")
 
-def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: str, original_query: str, run_dir: Path) -> dict:
+def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: str,
+                    original_query: str, run_dir: Path, on_progress=None) -> dict:
     worker_client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
     start_time = time.time()
 
@@ -1203,17 +1319,69 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
     prompt_tokens, comp_tokens = 0, 0
     is_estimated = True
     malformed_tags = False
+    result_text = ""
+    truncated = False
 
     try:
-        response = worker_client.chat.completions.create(
-            model=WORKER_MODEL,
-            messages=[{"role": "system", "content": _PROMPT_PHASE3_WORKER}, {"role": "user", "content": user_instruction}],
-            temperature=0.4,
-            max_tokens=MAX_WORKER_TOKENS,
-            frequency_penalty=1.1,
-            presence_penalty=0.5
-        )
-        result_text = enforce_ascii(response.choices[0].message.content.strip())
+        try:
+            response = worker_client.chat.completions.create(
+                model=WORKER_MODEL,
+                messages=[{"role": "system", "content": _PROMPT_PHASE3_WORKER}, {"role": "user", "content": user_instruction}],
+                temperature=0.4,
+                max_tokens=MAX_WORKER_TOKENS,
+                frequency_penalty=1.1,
+                presence_penalty=0.5,
+                stream=True,
+                stream_options={"include_usage": True}
+            )
+        except Exception as e:
+            if "stream_options" in str(e).lower() or "unrecognized" in str(e).lower() or "400" in str(e):
+                response = worker_client.chat.completions.create(
+                    model=WORKER_MODEL,
+                    messages=[{"role": "system", "content": _PROMPT_PHASE3_WORKER}, {"role": "user", "content": user_instruction}],
+                    temperature=0.4,
+                    max_tokens=MAX_WORKER_TOKENS,
+                    frequency_penalty=1.1,
+                    presence_penalty=0.5,
+                    stream=True
+                )
+            else:
+                raise e
+
+        first_token_at = None
+        last_ping = time.time()
+
+        try:
+            for chunk in response:
+                now = time.time()
+                if now - start_time > WORKER_MAX_WALL_SECS:
+                    result_text += "\n\n...[OUTPUT TRUNCATED: MAX WALL CLOCK EXCEEDED]..."
+                    if on_progress:
+                        on_progress(task_id, "wallclock", f"Max wall clock exceeded after {now - start_time:.0f}s, truncating stream.")
+                    truncated = True
+                    break
+
+                if chunk.choices and chunk.choices[0].delta.content is not None:
+                    result_text += chunk.choices[0].delta.content
+                    if first_token_at is None:
+                        first_token_at = now
+                        if on_progress:
+                            on_progress(task_id, "ttft", f"ttft {now - start_time:.1f}s")
+                    elif on_progress and now - last_ping > 15.0:
+                        last_ping = now
+                        on_progress(task_id, "ping", f"{len(result_text)} chars")
+
+                if hasattr(chunk, 'usage') and chunk.usage is not None:
+                    prompt_tokens = chunk.usage.prompt_tokens
+                    comp_tokens = chunk.usage.completion_tokens
+                    is_estimated = False
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        result_text = enforce_ascii(result_text.strip())
 
         open_tags = len(re.findall(r'<file\b', result_text, re.IGNORECASE))
         close_tags = len(re.findall(r'</file>', result_text, re.IGNORECASE))
@@ -1221,9 +1389,9 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
             print(f"        [!] Warning: Thread{task_id:02d} emitted unbalanced <file> tags ({open_tags} open, {close_tags} close). Skipping artifact extraction to prevent corruption.", flush=True)
             malformed_tags = True
 
-        prompt_tokens = response.usage.prompt_tokens if response.usage else estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
-        comp_tokens = response.usage.completion_tokens if response.usage else estimate_tokens(result_text)
-        is_estimated = response.usage is None
+        if is_estimated:
+            prompt_tokens = estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
+            comp_tokens = estimate_tokens(result_text)
 
         if not malformed_tags:
             file_matches = re.finditer(r'<file\s+path="([^"]+)">([\s\S]*?)</file>', result_text, re.IGNORECASE)
@@ -1240,7 +1408,7 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
 
     except Exception as e:
         result_text, status = f"Worker Error: {str(e)}", "error"
-        is_estimated = False
+        is_estimated = True
 
     elapsed = round(time.time() - start_time, 2)
     return {
@@ -1250,7 +1418,8 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
         "total_tokens": prompt_tokens + comp_tokens, "elapsed": elapsed,
         "tps": round(comp_tokens / elapsed, 2) if elapsed > 0 else 0,
         "slot": slot_name,
-        "is_estimated": is_estimated
+        "is_estimated": is_estimated,
+        "truncated": truncated
     }
 
 def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original_query: str) -> tuple:
@@ -1261,16 +1430,10 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
     )
 
     start_time = time.time()
-    response = client.chat.completions.create(
-        model=STITCHER_MODEL,
-        messages=[{"role": "system", "content": _PROMPT_PHASE3_SYNTHESIS}, {"role": "user", "content": user_prompt}],
-        temperature=0.3, max_tokens=MAX_STITCH_TOKENS
+    res_content, p_tok, c_tok = _stitch_completion(
+        client, _PROMPT_PHASE3_SYNTHESIS, user_prompt, MAX_STITCH_TOKENS, 0.3
     )
     elapsed = round(time.time() - start_time, 2)
-
-    res_content = enforce_ascii(response.choices[0].message.content.strip())
-    p_tok = response.usage.prompt_tokens if response.usage else estimate_tokens(_PROMPT_PHASE3_SYNTHESIS + user_prompt)
-    c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
     return batch_id, res_content, p_tok, c_tok, elapsed
 
 def rolling_master_stitch(chunk_id: int, left_doc: str, right_doc: str, endpoint: str, original_query: str) -> tuple:
@@ -1292,16 +1455,10 @@ def rolling_master_stitch(chunk_id: int, left_doc: str, right_doc: str, endpoint
     )
 
     start_time = time.time()
-    response = client.chat.completions.create(
-        model=STITCHER_MODEL,
-        messages=[{"role": "system", "content": _PROMPT_PHASE3_STITCH}, {"role": "user", "content": user_prompt}],
-        temperature=0.3, max_tokens=MAX_STITCH_TOKENS
+    res_content, p_tok, c_tok = _stitch_completion(
+        client, _PROMPT_PHASE3_STITCH, user_prompt, MAX_STITCH_TOKENS, 0.3
     )
     elapsed = round(time.time() - start_time, 2)
-
-    res_content = enforce_ascii(response.choices[0].message.content.strip())
-    p_tok = response.usage.prompt_tokens if response.usage else estimate_tokens(_PROMPT_PHASE3_STITCH + user_prompt)
-    c_tok = response.usage.completion_tokens if response.usage else estimate_tokens(res_content)
     return res_content, p_tok, c_tok, elapsed
 
 def _merge_pair(pair_idx: int, left: str, right: str, current_round: int,
@@ -1522,29 +1679,37 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
 
     synthesized_chunks: Dict[int, str] = {}
 
-    def _map_reduce_worker(tid: int, prompt: str):
+    def _map_reduce_worker(tid: int, prompt: str, on_progress=None):
         last_result = {
             "id": tid, "status": "error", "result": "Worker execution failed completely.",
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-            "elapsed": 0, "tps": 0, "slot": "Unknown", "is_estimated": False
+            "elapsed": 0, "tps": 0, "slot": "Unknown", "is_estimated": True, "truncated": False
         }
         accum_p_tok = 0
         accum_c_tok = 0
 
-        for _ in range(WORKER_RETRIES):
-            try:
-                endpoint, slot_name = worker_queue.get(timeout=5.0)
-            except queue.Empty:
-                continue
+        for attempt in range(WORKER_RETRIES):
+            endpoint, slot_name = None, None
+            while not _shutdown_event.is_set():
+                try:
+                    endpoint, slot_name = worker_queue.get(timeout=5.0)
+                    break
+                except queue.Empty:
+                    continue
+            
+            if not endpoint:
+                last_result["result"] = "Aborted due to shutdown event."
+                event_queue.put(("worker", last_result))
+                return
 
             try:
-                res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir)
+                res = process_subtask(tid, prompt, endpoint, slot_name, original_query, run_dir, on_progress=on_progress)
                 accum_p_tok += res.get("prompt_tokens", 0)
                 accum_c_tok += res.get("completion_tokens", 0)
 
                 if res["status"] == "success":
                     if res.get("completion_tokens", 0) > MAX_WORKER_TOKENS:
-                        safe_char_limit = MAX_WORKER_TOKENS * 4
+                        safe_char_limit = int(MAX_WORKER_TOKENS * CHARS_PER_TOKEN)
                         res["result"] = res["result"][:safe_char_limit] + "\n\n...[OUTPUT TRUNCATED DUE TO LENGTH LIMIT]..."
                         res["completion_tokens"] = MAX_WORKER_TOKENS
 
@@ -1554,10 +1719,17 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                     event_queue.put(("worker", res))
                     return
 
+                if on_progress and res["status"] != "success":
+                    on_progress(tid, "retry", "retry {}/{} on {} status={} :: {}".format(
+                        attempt + 1, WORKER_RETRIES, slot_name, res["status"],
+                        str(res.get("result", ""))[:80]))
                 last_result = res
             except Exception as e:
                 last_result["result"] = f"Failed: {str(e)}"
                 last_result["slot"] = slot_name
+                last_result["is_estimated"] = True
+                if on_progress:
+                    on_progress(tid, "retry", "retry {}/{} after {}".format(attempt + 1, WORKER_RETRIES, str(e)[:40]))
             finally:
                 worker_queue.put((endpoint, slot_name))
             time.sleep(2)
@@ -1565,6 +1737,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         last_result["prompt_tokens"] = accum_p_tok
         last_result["completion_tokens"] = accum_c_tok
         last_result["total_tokens"] = accum_p_tok + accum_c_tok
+        last_result["is_estimated"] = True
         event_queue.put(("worker", last_result))
 
     def chunk_wrapper(batch_id: int, tasks: list):
@@ -1605,14 +1778,24 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     worker_threads = max(1, min(total_tasks, len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS))
     synth_threads = max(1, min(total_chunks, synth_slot_count))
 
+    MAP_HEARTBEAT_SECS = 30.0
+    MAP_STALL_TIMEOUT = float(os.getenv(
+        "MAP_STALL_TIMEOUT",
+        str(WORKER_RETRIES * WORKER_TIMEOUT_SECS + 120.0)))
+        
+    last_heartbeat = time.time()
     start_time_progress = time.time()
     last_event_time = time.time()
+    last_completion_time = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_threads) as worker_exec, \
-         concurrent.futures.ThreadPoolExecutor(max_workers=synth_threads) as synth_exec:
+    aborted = False
+    worker_exec = concurrent.futures.ThreadPoolExecutor(max_workers=worker_threads)
+    synth_exec = concurrent.futures.ThreadPoolExecutor(max_workers=synth_threads)
 
+    try:
         for i, task in enumerate(sub_tasks):
-            worker_exec.submit(_map_reduce_worker, i + 1, task)
+            p_cb = lambda t_id, kind, note: event_queue.put(("progress", t_id, kind, note))
+            worker_exec.submit(_map_reduce_worker, i + 1, task, p_cb)
 
         while chunks_completed < total_chunks:
             try:
@@ -1621,23 +1804,48 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             except queue.Empty:
                 if _shutdown_event.is_set():
                     break
+                    
+                idle = time.time() - last_event_time
+                if time.time() - last_heartbeat > MAP_HEARTBEAT_SECS:
+                    last_heartbeat = time.time()
+                    sys.stdout.write("\n")
+                    last_done = time.time() - last_completion_time
+                    print("    [~] Map status: workers {}/{} chunks {}/{} | {:.0f}s since last completion | "
+                          "free worker slots {} | free stitch slots {}".format(
+                              workers_finished, total_tasks, chunks_completed,
+                              total_chunks, last_done, worker_queue.qsize(),
+                              synth_queue.qsize()), flush=True)
+                    
+                    _render_map_progress(workers_finished, total_tasks, chunks_completed, total_chunks, start_time_progress)
+                              
+                if idle > MAP_STALL_TIMEOUT:
+                    print("\n    [!] Watchdog: no map/reduce events for {}s. Aborting phase.".format(
+                        int(idle)), flush=True)
+                    aborted = True
+                    break
+                    
                 if workers_finished >= total_tasks and chunks_completed < total_chunks:
-                    pending_chunks = total_chunks - chunks_completed
-                    if pending_chunks > 0:
-                        if time.time() - last_event_time > 60.0:
-                            print(f"    [!] Watchdog: Stalled for 60s with {pending_chunks} chunks missing. Forcing exit.", flush=True)
-                            break
-                        for chunk_idx in range(1, total_chunks + 1):
-                            if chunk_idx not in submitted_chunks:
-                                expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
-                                expected_end = min(expected_start + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
-                                available = [results_dict.get(i) for i in range(expected_start, expected_end) if i in results_dict]
-                                if available:
-                                    submitted_chunks.add(chunk_idx)
-                                    synth_exec.submit(chunk_wrapper, chunk_idx, available)
+                    for chunk_idx in range(1, total_chunks + 1):
+                        if chunk_idx not in submitted_chunks:
+                            expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
+                            expected_end = min(expected_start + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
+                            available = [results_dict.get(i) for i in range(expected_start, expected_end) if i in results_dict]
+                            if available:
+                                submitted_chunks.add(chunk_idx)
+                                synth_exec.submit(chunk_wrapper, chunk_idx, available)
+                continue
+
+            if event[0] == "progress":
+                _, t_id, kind, note = event
+                if kind != "ping":
+                    sys.stdout.write("\n")
+                    print(f"    [~] Thread{t_id:02d} {note}", flush=True)
+                    _render_map_progress(workers_finished, total_tasks, chunks_completed, total_chunks, start_time_progress)
                 continue
 
             if event[0] == "worker":
+                last_completion_time = time.time()
+                last_heartbeat = time.time()
                 workers_finished += 1
                 task_res = event[1]
 
@@ -1671,20 +1879,26 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                                 synth_exec.submit(chunk_wrapper, chunk_idx, available)
 
             elif event[0] == "chunk":
+                last_completion_time = time.time()
+                last_heartbeat = time.time()
                 _, b_id, text, p_tok, c_tok, elap, slot_name = event
                 synthesized_chunks[b_id] = text
                 chunk_p_tok += p_tok
                 chunk_c_tok += c_tok
                 chunks_completed += 1
 
-            bar_len = 30
-            total_tasks_safe = total_tasks if total_tasks > 0 else 1
-            filled = int((workers_finished / total_tasks_safe) * bar_len)
-            bar = '#' * filled + '-' * (bar_len - filled)
-            percent = int((workers_finished / total_tasks_safe) * 100)
-            eta_str = _format_eta(start_time_progress, workers_finished, total_tasks)
-            sys.stdout.write(f"\r    [+] Map-Reduce Progress: [{bar}] {percent}% (Workers: {workers_finished}/{total_tasks} | Chunks: {chunks_completed}/{total_chunks}) | ETC: {eta_str}")
-            sys.stdout.flush()
+            _render_map_progress(workers_finished, total_tasks, chunks_completed, total_chunks, start_time_progress)
+
+    finally:
+        worker_exec.shutdown(wait=False, cancel_futures=True)
+        synth_exec.shutdown(wait=False, cancel_futures=True)
+
+    if aborted:
+        print("\n    [!] Map-reduce aborted after {} of {} chunks. Waiting up to {}s for "
+              "in-flight requests to time out, then exiting; re-run with -r to resume.".format(
+                  chunks_completed, total_chunks, int(max(WORKER_TIMEOUT_SECS, STITCH_TIMEOUT_SECS))),
+              flush=True)
+        sys.exit(2)
 
     print()
 
@@ -1694,6 +1908,10 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
 
     if len(ordered_chunk_texts) < total_chunks:
         print(f"    [!] WARNING: Map-Reduce completed but {total_chunks - len(ordered_chunk_texts)} chunks were lost.", flush=True)
+
+    if not ordered_chunk_texts:
+        print("    [!] Map-reduce produced no output chunks. Aborting.", flush=True)
+        sys.exit(2)
 
     print(
         f"\n[5] TREE-REDUCTION STITCH: Assembling {len(ordered_chunk_texts)} chunk(s) "
@@ -1740,13 +1958,14 @@ def extract_and_protect_blocks(markdown_text: str) -> Tuple[str, Dict[str, str]]
 
     return text_without_code, protected_blocks
 
-def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, endpoint: str, slot_name: str) -> str:
+def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, endpoint: str, slot_name: str) -> Tuple[str, bool]:
+    original = chunk_text
     placeholder_pattern = r'\[\[PROTECTED_[A-Z_]+?\d{3,}\]\]|\[\[PROTECTED_TELEMETRY_TABLE\]\]'
     chunk_inventory = re.findall(placeholder_pattern, chunk_text)
 
-    chunk_text = fit_stitch_context(chunk_text)
+    fitted_chunk_text = fit_stitch_context(chunk_text)
 
-    client = stitcher_client(endpoint, timeout=1200.0, max_retries=2)
+    client = stitcher_client(endpoint, max_retries=0)
 
     system_prompt = _PROMPT_PHASE4_DEDUP
 
@@ -1759,33 +1978,37 @@ def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, en
             f"Even if you summarize the surrounding text, do NOT drop these placeholders. They represent vital code blocks."
         )
 
-    try:
-        response = client.chat.completions.create(
-            model=STITCHER_MODEL,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": chunk_text}],
-            temperature=0.1, max_tokens=clamp_stitch_tokens(16384), presence_penalty=0.2
-        )
-        distilled_text = enforce_ascii(response.choices[0].message.content.strip())
+    for attempt in range(1, 4):
+        try:
+            distilled_text, _, _ = _stitch_completion(
+                client, system_prompt, fitted_chunk_text, clamp_stitch_tokens(16384), 0.1, presence_penalty=0.2
+            )
 
-        if chunk_inventory:
-            missing_placeholders = [p for p in chunk_inventory if p not in distilled_text]
-            if missing_placeholders:
-                distilled_text += "\n\n### Recovered Chunk Artifacts\n" + "\n\n".join(missing_placeholders)
+            if chunk_inventory:
+                missing_placeholders = [p for p in chunk_inventory if p not in distilled_text]
+                if missing_placeholders:
+                    distilled_text += "\n\n### Recovered Chunk Artifacts\n" + "\n\n".join(missing_placeholders)
 
-        return distilled_text
-    except Exception:
-        return chunk_text
+            return distilled_text, True
+        except Exception as exc:
+            print(f"\n    [!] Dedup chunk {chunk_id}/{total_chunks} failed on {slot_name} (attempt {attempt}/3): {str(exc)[:120]}", flush=True)
+            time.sleep(2)
+            
+    print(f"    [!] Dedup chunk {chunk_id}/{total_chunks} exhausted retries. Passing through unedited.", flush=True)
+    return original, False
 
-def parallel_edit_chunks(chunks: List[str]) -> str:
+def parallel_edit_chunks(chunks: List[str]) -> Tuple[str, int]:
     if not STITCHER_ENDPOINTS:
         print("    [!] WARNING: No stitcher endpoints defined. Skipping deduplication.", flush=True)
-        return "\n\n".join(chunks)
+        return "\n\n".join(chunks), len(chunks)
 
     total_chunks = len(chunks)
     endpoint_queue, total_slots = build_stitcher_slot_queue(prefix="Edit-Slot")
 
     results = [""] * total_chunks
-    def _edit_chunk_worker(chunk_idx: int, chunk_content: str):
+    failures = 0
+    
+    def _edit_chunk_worker(chunk_idx: int, chunk_content: str) -> Tuple[str, bool]:
         endpoint, slot_name = None, None
         while not _shutdown_event.is_set():
             try:
@@ -1794,11 +2017,12 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
             except queue.Empty:
                 continue
         if endpoint is None:
-            return chunk_content
+            return chunk_content, False
         try:
             return semantic_deduplication(chunk_content, chunk_idx + 1, total_chunks, endpoint, slot_name)
-        except Exception:
-            return chunk_content
+        except Exception as exc:
+            print(f"\n    [!] Edit chunk worker failed unexpectedly: {str(exc)[:120]}", flush=True)
+            return chunk_content, False
         finally:
             endpoint_queue.put((endpoint, slot_name))
 
@@ -1813,7 +2037,10 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
         completed = 0
         for future in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[future]
-            results[idx] = future.result()
+            res, success = future.result()
+            results[idx] = res
+            if not success:
+                failures += 1
 
             completed += 1
             bar_len = 30
@@ -1826,62 +2053,78 @@ def parallel_edit_chunks(chunks: List[str]) -> str:
             sys.stdout.flush()
 
     print()
+    
+    if failures > 0:
+        print(f"    [!] {failures} of {total_chunks} chunks passed through unedited.", flush=True)
 
-    return "\n\n".join(results)
+    return "\n\n".join(results), failures
 
-def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
-    client = stitcher_client(endpoint, max_retries=1)
+def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], endpoint: str) -> Tuple[str, bool]:
+    client = stitcher_client(endpoint, max_retries=0)
     system_prompt = _PROMPT_PHASE4_SMOOTH
 
     if global_inventory:
         system_prompt += f"\n\nCRITICAL ARTIFACT INVENTORY: {', '.join(global_inventory)}\nYou MUST retain EVERY SINGLE placeholder."
 
-    full_skeleton = fit_stitch_context(full_skeleton)
+    fitted_skeleton = fit_stitch_context(full_skeleton)
 
-    try:
-        response = client.chat.completions.create(
-            model=STITCHER_MODEL,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": full_skeleton}],
-            temperature=0.2, max_tokens=clamp_stitch_tokens(32768), presence_penalty=0.1
-        )
-        return enforce_ascii(response.choices[0].message.content.strip())
-    except Exception:
-        return full_skeleton
+    for attempt in range(1, 3):
+        try:
+            text, _, _ = _stitch_completion(
+                client, system_prompt, fitted_skeleton, clamp_stitch_tokens(32768), 0.2, presence_penalty=0.1
+            )
+            return text, True
+        except Exception as exc:
+            print(f"\n    [!] Section boundary smoothing failed on {endpoint} (attempt {attempt}/2): {str(exc)[:120]}", flush=True)
+            time.sleep(2)
+            
+    print("    [!] Section boundary smoothing exhausted retries. Passing through unedited.", flush=True)
+    return full_skeleton, False
 
-def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str], endpoint: str) -> str:
-    client = stitcher_client(endpoint, max_retries=1)
+def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str], endpoint: str) -> Tuple[str, bool]:
+    client = stitcher_client(endpoint, max_retries=0)
     system_prompt = _PROMPT_PHASE4_UNIFY
 
     if global_inventory:
         system_prompt += f"\n\nCRITICAL ARTIFACT INVENTORY: {', '.join(global_inventory)}\nYou MUST retain EVERY SINGLE placeholder."
 
-    smoothed_skeleton = fit_stitch_context(smoothed_skeleton)
+    fitted_skeleton = fit_stitch_context(smoothed_skeleton)
 
-    try:
-        response = client.chat.completions.create(
-            model=STITCHER_MODEL,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": smoothed_skeleton}],
-            temperature=0.2, max_tokens=clamp_stitch_tokens(32768), presence_penalty=0.1
-        )
-        return enforce_ascii(response.choices[0].message.content.strip())
-    except Exception:
-        return smoothed_skeleton
+    for attempt in range(1, 3):
+        try:
+            text, _, _ = _stitch_completion(
+                client, system_prompt, fitted_skeleton, clamp_stitch_tokens(32768), 0.2, presence_penalty=0.1
+            )
+            return text, True
+        except Exception as exc:
+            print(f"\n    [!] Header unification failed on {endpoint} (attempt {attempt}/2): {str(exc)[:120]}", flush=True)
+            time.sleep(2)
+            
+    print("    [!] Header unification exhausted retries. Passing through unedited.", flush=True)
+    return smoothed_skeleton, False
 
 def global_consolidation_pass(full_skeleton: str, global_inventory: List[str],
-                              endpoint: Optional[str] = None) -> str:
+                              endpoint: Optional[str] = None) -> Tuple[str, bool, bool]:
     endpoint = endpoint or next_stitcher_endpoint()
 
+    if len(full_skeleton) > STITCH_ECHO_MAX_CHARS:
+        print("    [!] Skipping executive editor passes: skeleton is {:,} chars but the "
+              "stitcher can only emit ~{:,}. Per-chunk dedup output is kept as-is rather "
+              "than truncating the document.".format(
+                  len(full_skeleton), STITCH_ECHO_MAX_CHARS), flush=True)
+        return full_skeleton, False, False
+
     print("    [*] Executive Editor Pass 1: Section Boundary Smoothing...", flush=True)
-    smoothed_text = section_boundary_smoothing(full_skeleton, global_inventory, endpoint)
+    smoothed_text, smooth_ok = section_boundary_smoothing(full_skeleton, global_inventory, endpoint)
 
     print("    [*] Executive Editor Pass 2: Header Unification...", flush=True)
-    final_text = header_unification_pass(smoothed_text, global_inventory, endpoint)
+    final_text, unify_ok = header_unification_pass(smoothed_text, global_inventory, endpoint)
 
     missing_placeholders = [p for p in global_inventory if p not in final_text]
     if missing_placeholders:
         final_text += "\n\n### Recovered Global Artifacts\n" + "\n\n".join(missing_placeholders)
 
-    return final_text
+    return final_text, smooth_ok, unify_ok
 
 def reassemble_document(distilled_text: str, protected_blocks: Dict[str, str]) -> str:
     final_text = distilled_text
@@ -2106,7 +2349,7 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
         generation_metadata = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.post(endpoint_url, json=payload, timeout=WORKER_TIMEOUT_SECS)
+                response = requests.post(endpoint_url, json=payload, timeout=TEST_TIMEOUT_SECS)
                 response.raise_for_status()
                 result = response.json()
                 choices = result.get("choices")
@@ -2396,15 +2639,9 @@ def run_phase6_project_distillation(project_dir: Path, iterate: bool = False):
 
     distilled_markdown = None
     try:
-        response = client.chat.completions.create(
-            model=STITCHER_MODEL,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0.2, max_tokens=clamp_stitch_tokens(8192)
+        distilled_markdown, _, _ = _stitch_completion(
+            client, sys_prompt, user_content, clamp_stitch_tokens(8192), 0.2
         )
-        distilled_markdown = enforce_ascii(response.choices[0].message.content.strip())
     except Exception as e:
         print(f"[!] Stitcher inference failed: {e}", flush=True)
 
@@ -2497,6 +2734,18 @@ def main():
 
     print(describe_budget_alignment(), flush=True)
 
+    verify_server_props([GEN_API_BASE], "Apex", APEX_SERVER_CTX, APEX_SERVER_NP)
+    verify_server_props(WORKER_ENDPOINTS, "Worker", WORKER_SERVER_CTX, WORKER_SERVER_NP)
+    verify_server_props(STITCHER_ENDPOINTS, "Stitcher", STITCH_SERVER_CTX, STITCH_SERVER_NP)
+
+    apex_ok = ping_tier([GEN_API_BASE], LLM_MODEL, GEN_API_KEY, "Apex", timeout=90.0)
+    worker_ok = ping_tier(WORKER_ENDPOINTS, WORKER_MODEL, WORKER_API_KEY, "Worker", timeout=90.0)
+    stitch_ok = ping_tier(STITCHER_ENDPOINTS, STITCHER_MODEL, STITCHER_API_KEY, "Stitcher", timeout=90.0)
+
+    if not worker_ok or not stitch_ok:
+        print("\n[!] Critical cluster tiers (Worker/Stitcher) failed smoke tests. Aborting.", flush=True)
+        sys.exit(1)
+
     raw_filepath = None
     distilled_filepath = None
     final_file_path = target_directory / "FINAL_SYNTHESIS.md"
@@ -2529,11 +2778,19 @@ def main():
     elif args.git:
         raw_filepath = ingest_git_repository(args.git, target_directory, args.focus, args.git_path)
     else:
+        if not apex_ok:
+            print("\n[!] Apex tier offline and generation required. Aborting.", flush=True)
+            sys.exit(1)
         raw_filepath = generate_content(target_prompt, target_directory)
 
     if args.resume and distilled_filepath and distilled_filepath.exists():
         print(f"[PHASE 2] Bypassed. Resuming from existing distilled file: {distilled_filepath.name}")
     else:
+        if not apex_ok:
+            print("\n[!] Apex tier offline; Phase 2 distillation cannot run. "
+                  "Re-run with -r once 8081 is healthy.", flush=True)
+            sys.exit(1)
+            
         raw_content = read_file_content_safe(raw_filepath)
         if raw_content is None:
             print(f"[!] Fatal: Could not read {raw_filepath}.", flush=True)
@@ -2558,12 +2815,17 @@ def main():
 
         master_elapsed_time = time.time() - master_start_time
 
+        truncated_count = sum(1 for s in worker_stats if s.get("truncated"))
+        if truncated_count > 0:
+            print(f"    [!] WARNING: {truncated_count} workers were truncated due to exceeding MAX_WALL_SECS.", flush=True)
+
         stats_md = "\n\n---\n## Execution Telemetry\n### Worker Execution Statistics\n"
-        stats_md += "| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens | Estimated |\n"
-        stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|-----------|\n"
+        stats_md += "| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens | Estimated | Truncated |\n"
+        stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|-----------|-----------|\n"
         for stat in sorted(worker_stats, key=lambda x: x['id']):
             estimated_flag = "Yes" if stat.get('is_estimated') else "No"
-            stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} | {estimated_flag} |\n"
+            truncated_flag = "Yes" if stat.get('truncated') else "No"
+            stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} | {estimated_flag} | {truncated_flag} |\n"
 
         agg_md = "\n### Cluster Aggregate Statistics\n"
         agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
@@ -2580,6 +2842,7 @@ def main():
         agg_md += f"- **Stitcher Endpoints:** {', '.join(STITCHER_ENDPOINTS)} "
         agg_md += f"(x{STITCH_PARALLEL_SLOTS} slot(s))\n"
         agg_md += f"- **Stitcher Budget:** {describe_stitch_budget()}\n"
+        agg_md += f"- **Workers Truncated (wall clock):** {truncated_count} of {len(worker_stats)}\n"
 
         final_output += stats_md + agg_md
 
@@ -2603,10 +2866,20 @@ def main():
                 f.write(raw_markdown)
             print(f"[+] Document fits in single chunk. Bypassed LLM refinement. Saved to {output_path}")
         else:
-            distilled_skeleton = parallel_edit_chunks(chunks)
+            distilled_skeleton, dedup_failures = parallel_edit_chunks(chunks)
             global_inventory = [k for k in protected_assets.keys() if k != "[[PROTECTED_TELEMETRY_TABLE]]"]
-            final_skeleton = global_consolidation_pass(distilled_skeleton, global_inventory)
+            final_skeleton, smooth_ok, unify_ok = global_consolidation_pass(distilled_skeleton, global_inventory)
             final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
+
+            if dedup_failures == len(chunks) and not smooth_ok and not unify_ok:
+                print("    [!] WARNING: Every Phase 4 pass failed. POLISHED_SYNTHESIS.md is "
+                      "effectively a copy of FINAL_SYNTHESIS.md.", flush=True)
+            elif dedup_failures or not smooth_ok or not unify_ok:
+                print("    [!] Phase 4 partially degraded: {}/{} chunks unedited, "
+                      "smoothing={}, unification={}.".format(
+                          dedup_failures, len(chunks),
+                          "ok" if smooth_ok else "FAILED",
+                          "ok" if unify_ok else "FAILED"), flush=True)
 
             with open(output_path, "w", encoding="ascii") as f:
                 f.write(final_polished_markdown)
