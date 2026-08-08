@@ -84,14 +84,72 @@ _REPO_EXT_LANG_MAP = {
     ".cmake": "cmake", ".tf": "hcl"
 }
 
+# ==============================================================================
+# Server Context Alignment
+# ------------------------------------------------------------------------------
+# These constants MUST mirror the -c / -np flags in start-zerg-all.sh.
+#
+# llama-server semantics:
+#   * -c N is the TOTAL KV budget for the process, not a per-request guarantee.
+#   * With --kv-unified (default on recent builds) the KV cells are SHARED
+#     across the -np slots. A lone sequence may address up to N, but the SUM
+#     over concurrently active slots must stay <= N.
+#   * The concurrency-safe per-request window is therefore N // np.
+#   * That window is additionally capped by the model's native n_ctx_train;
+#     going past it is rope extrapolation, not free context.
+#
+# Every downstream char budget in this file is derived from these numbers.
+# Change the server flags and these constants together, never one alone.
+# ==============================================================================
+
+# Apex / generation / distillation node (port 8081): -c 65536 -np 1
+APEX_SERVER_CTX = int(os.getenv("APEX_SERVER_CTX", "65536"))
+APEX_SERVER_NP = int(os.getenv("APEX_SERVER_NP", "1"))
+
+# Stitcher cluster (ports 8070, 8071): -c 196608 -np 2 --kv-unified
+STITCH_SERVER_CTX = int(os.getenv("STITCH_SERVER_CTX", "196608"))
+STITCH_SERVER_NP = int(os.getenv("STITCH_SERVER_NP", "2"))
+# gemma-4-E4B native training window. Caps the usable slot even if KV allows more.
+STITCH_MODEL_NATIVE_CTX = int(os.getenv("STITCH_MODEL_NATIVE_CTX", "131072"))
+
+# Worker cluster (ports 8033, 8034): -c 196608 -np 2 --kv-unified
+WORKER_SERVER_CTX = int(os.getenv("WORKER_SERVER_CTX", "196608"))
+WORKER_SERVER_NP = int(os.getenv("WORKER_SERVER_NP", "2"))
+
+# Concurrency-safe per-request windows.
+APEX_CONTEXT_TOKENS = max(4096, APEX_SERVER_CTX // max(1, APEX_SERVER_NP))
+WORKER_CONTEXT_TOKENS = max(4096, WORKER_SERVER_CTX // max(1, WORKER_SERVER_NP))
+STITCH_CONTEXT_TOKENS = int(os.getenv("STITCH_CONTEXT_TOKENS", str(min(
+    max(4096, STITCH_SERVER_CTX // max(1, STITCH_SERVER_NP)),
+    STITCH_MODEL_NATIVE_CTX
+))))
+
 # Phase 1: Raw Generation Config
 GEN_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8081/v1")
 GEN_API_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-27B-UD-IQ3_XXS.gguf")
 
 # Unified Context Limits
-MAX_CONTEXT_CHARS = 60000
-MAX_CHUNK_CHARS = 40000
+# Ceiling is the apex window minus the largest apex completion (8192, Phase 2)
+# minus prompt/template overhead. The default stays at the tuned 60000 chars;
+# the clamp only prevents a raised override from overflowing port 8081.
+CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "3.5"))
+APEX_MAX_OUTPUT_TOKENS = int(os.getenv("APEX_MAX_OUTPUT_TOKENS", "8192"))
+APEX_RESERVE_TOKENS = int(os.getenv("APEX_RESERVE_TOKENS", "2048"))
+
+_apex_input_chars = int(
+    max(4096, APEX_CONTEXT_TOKENS - APEX_MAX_OUTPUT_TOKENS - APEX_RESERVE_TOKENS)
+    * CHARS_PER_TOKEN
+)
+
+MAX_CONTEXT_CHARS = min(
+    int(os.getenv("MAX_CONTEXT_CHARS", "60000")),
+    _apex_input_chars
+)
+MAX_CHUNK_CHARS = min(
+    int(os.getenv("MAX_CHUNK_CHARS", "40000")),
+    MAX_CONTEXT_CHARS
+)
 
 # Phase 2: Distillation Config
 DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8081/v1")
@@ -107,12 +165,17 @@ STITCHER_ENDPOINTS = [
 ]
 STITCHER_MODEL = os.getenv("STITCHER_MODEL", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
 STITCHER_API_KEY = os.getenv("STITCHER_API_KEY", "local-sk")
-STITCH_PARALLEL_SLOTS = int(os.getenv("STITCH_PARALLEL_SLOTS", "2"))
+# Must not exceed the server's -np, or the surplus lanes just queue behind the
+# real slots and inflate tail latency while telemetry reports phantom parallelism.
+STITCH_PARALLEL_SLOTS = min(
+    int(os.getenv("STITCH_PARALLEL_SLOTS", str(STITCH_SERVER_NP))),
+    STITCH_SERVER_NP
+)
 MAX_RETRIES = 3
 
-STITCH_CONTEXT_TOKENS = int(os.getenv("STITCH_CONTEXT_TOKENS", "131072"))
+# STITCH_CONTEXT_TOKENS is derived in the Server Context Alignment block above.
 MAX_STITCH_TOKENS = int(os.getenv("MAX_STITCH_TOKENS", "32768"))
-STITCH_CHARS_PER_TOKEN = float(os.getenv("STITCH_CHARS_PER_TOKEN", "3.5"))
+STITCH_CHARS_PER_TOKEN = float(os.getenv("STITCH_CHARS_PER_TOKEN", str(CHARS_PER_TOKEN)))
 STITCH_RESERVE_TOKENS = int(os.getenv("STITCH_RESERVE_TOKENS", "4096"))
 
 _stitch_input_tokens = max(
@@ -140,19 +203,34 @@ WORKER_ENDPOINTS = [
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.5-9B-IQ4_XS.gguf")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 
-WORKER_PARALLEL_SLOTS = 2
+# Mirrors the worker server's -np. Over-subscribing here does not create
+# parallelism; llama-server simply queues the surplus requests.
+WORKER_PARALLEL_SLOTS = min(
+    int(os.getenv("WORKER_PARALLEL_SLOTS", str(WORKER_SERVER_NP))),
+    WORKER_SERVER_NP
+)
 WORKER_RETRIES = 3
 WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "1800.0"))
 SYNTHESIS_CHUNK_SIZE = int(os.getenv("SYNTHESIS_CHUNK_SIZE", "2"))
-MAX_WORKER_TOKENS = int(os.getenv("MAX_WORKER_TOKENS", "8192"))
+
+WORKER_RESERVE_TOKENS = int(os.getenv("WORKER_RESERVE_TOKENS", "2048"))
+MAX_WORKER_TOKENS = min(
+    int(os.getenv("MAX_WORKER_TOKENS", "8192")),
+    max(1024, WORKER_CONTEXT_TOKENS - WORKER_RESERVE_TOKENS
+        - int(MAX_CONTEXT_CHARS / CHARS_PER_TOKEN))
+)
 
 # Phase 5: Automatic Unittests Config
 TEST_WORKER_ENDPOINTS = [
     "http://localhost:8033/v1/chat/completions",
     "http://localhost:8034/v1/chat/completions"
 ]
-CONCURRENT_REQS_PER_ENDPOINT = 2
-MAX_OUTPUT_TOKENS = 16384
+CONCURRENT_REQS_PER_ENDPOINT = WORKER_PARALLEL_SLOTS
+MAX_OUTPUT_TOKENS = min(
+    int(os.getenv("MAX_OUTPUT_TOKENS", "16384")),
+    max(1024, WORKER_CONTEXT_TOKENS - WORKER_RESERVE_TOKENS
+        - int(MAX_CONTEXT_CHARS / CHARS_PER_TOKEN))
+)
 LLM_TEMPERATURE = 0.1
 LLM_TOP_P = 0.95
 LLM_FREQUENCY_PENALTY = 0.5
@@ -415,6 +493,49 @@ def build_stitcher_slot_queue(prefix: str = "S-Slot") -> Tuple[queue.Queue, int]
             slot_queue.put((ep, f"{prefix}{slot_idx:02d}-{host_tail}"))
             slot_idx += 1
     return slot_queue, max(0, slot_idx - 1)
+
+def describe_budget_alignment() -> str:
+    lines = []
+    lines.append("[BUDGET] Server context alignment")
+    lines.append(
+        f"    apex    :8081  -c {APEX_SERVER_CTX} -np {APEX_SERVER_NP}"
+        f"  -> {APEX_CONTEXT_TOKENS//1024}k tok/req"
+        f" | input<={MAX_CONTEXT_CHARS:,} chars"
+        f" (~{int(MAX_CONTEXT_CHARS/CHARS_PER_TOKEN)//1024}k tok)"
+        f" | out<={APEX_MAX_OUTPUT_TOKENS//1024}k tok"
+    )
+    lines.append(
+        f"    stitcher:8070/1 -c {STITCH_SERVER_CTX} -np {STITCH_SERVER_NP}"
+        f"  -> {STITCH_CONTEXT_TOKENS//1024}k tok/req"
+        f" (native cap {STITCH_MODEL_NATIVE_CTX//1024}k)"
+        f" | input<={MAX_STITCH_CONTEXT_CHARS:,} chars"
+        f" | out<={MAX_STITCH_TOKENS//1024}k tok"
+        f" | merge<={STITCH_MERGE_CHARS_EACH:,} chars/side"
+    )
+    lines.append(
+        f"    worker  :8033/4 -c {WORKER_SERVER_CTX} -np {WORKER_SERVER_NP}"
+        f"  -> {WORKER_CONTEXT_TOKENS//1024}k tok/req"
+        f" | input<={MAX_CONTEXT_CHARS:,} chars"
+        f" | out<={MAX_WORKER_TOKENS//1024}k tok"
+    )
+
+    peak_stitch = (
+        int(MAX_STITCH_CONTEXT_CHARS / STITCH_CHARS_PER_TOKEN)
+        + MAX_STITCH_TOKENS + STITCH_RESERVE_TOKENS
+    )
+    concurrent_stitch = peak_stitch * STITCH_PARALLEL_SLOTS
+    if concurrent_stitch > STITCH_SERVER_CTX:
+        lines.append(
+            f"    [!] Stitcher over-subscribed: {STITCH_PARALLEL_SLOTS} slot(s) x "
+            f"{peak_stitch} tok = {concurrent_stitch} > -c {STITCH_SERVER_CTX}. "
+            "Lower MAX_STITCH_TOKENS, lower -np, or raise -c."
+        )
+    if STITCH_SERVER_CTX // max(1, STITCH_SERVER_NP) > STITCH_MODEL_NATIVE_CTX:
+        lines.append(
+            f"    [!] Stitcher slot ({STITCH_SERVER_CTX // max(1, STITCH_SERVER_NP)}) "
+            f"exceeds native {STITCH_MODEL_NATIVE_CTX}; excess is rope extrapolation."
+        )
+    return "\n".join(lines)
 
 def describe_stitch_budget() -> str:
     return (
@@ -2373,6 +2494,8 @@ def main():
         run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         target_directory = category_dir / run_id
         target_directory.mkdir(parents=True, exist_ok=True)
+
+    print(describe_budget_alignment(), flush=True)
 
     raw_filepath = None
     distilled_filepath = None
