@@ -308,13 +308,23 @@ _PROMPT_PHASE3_WORKER = (
     "CRITICAL: If your task involves writing code, creating configurations, or generating files, "
     "you MUST output the file contents wrapped exactly in these XML tags:\n"
     '<file path="filename.ext">\n[YOUR FILE CONTENT HERE]\n</file>\n'
+    "RULES FOR FILE TAGS:\n"
+    "1. Every opening <file path=\"...\"> tag MUST have exactly one matching </file> closing tag.\n"
+    "2. Do NOT use <file> tags in prose, explanations, or code examples. "
+    "Only use them to wrap actual file output.\n"
+    "3. If you reference a filename in text, write it as plain text or in backticks, "
+    "never as an XML tag.\n"
+    "4. Never nest <file> tags inside other <file> tags.\n"
 )
 
 _PROMPT_PHASE3_SYNTHESIS = (
     "You are a Level-1 Synthesis Node in a distributed cluster. "
     "Merge the following sequential worker reports into a coherent, deduplicated section. "
     "Retain all code blocks, configurations, and critical technical data. "
-    "Output strictly in standard ASCII."
+    "Output strictly in standard ASCII.\n"
+    "IMPORTANT: If the input contains <file path=\"...\">...</file> blocks, "
+    "preserve them exactly as-is including both opening and closing tags. "
+    "Do not add new <file> tags in your synthesis output."
 )
 
 _PROMPT_PHASE3_STITCH = (
@@ -1312,7 +1322,6 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
     status = "success"
     prompt_tokens, comp_tokens = 0, 0
     is_estimated = True
-    malformed_tags = False
     result_text = ""
     truncated = False
 
@@ -1377,18 +1386,29 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
 
         result_text = enforce_ascii(result_text.strip())
 
-        open_tags = len(re.findall(r'<file\b', result_text, re.IGNORECASE))
-        close_tags = len(re.findall(r'</file>', result_text, re.IGNORECASE))
-        if open_tags != close_tags:
-            print(f"        [!] Warning: Thread{task_id:02d} emitted unbalanced <file> tags ({open_tags} open, {close_tags} close). Skipping artifact extraction to prevent corruption.", flush=True)
-            malformed_tags = True
+        # Strip fenced code blocks before counting structural tags.
+        # <file> strings inside code fences are content, not pipeline tags.
+        _text_stripped = re.sub(r'```[\s\S]*?```', '', result_text)
+        _text_stripped = re.sub(r'`[^`\n]+`', '', _text_stripped)
+
+        open_tags = len(re.findall(r'<file\s+path="[^"]*"', _text_stripped, re.IGNORECASE))
+        close_tags = len(re.findall(r'</file\s*>', _text_stripped, re.IGNORECASE))
 
         if is_estimated:
             prompt_tokens = estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
             comp_tokens = estimate_tokens(result_text)
 
-        if not malformed_tags:
-            file_matches = re.finditer(r'<file\s+path="([^"]+)">([\s\S]*?)</file>', result_text, re.IGNORECASE)
+        if open_tags > close_tags + 2:
+            print(f"        [!] Warning: Thread{task_id:02d} has {open_tags - close_tags} unclosed "
+                  f"<file> tags. Skipping artifact extraction to prevent runaway content capture.", flush=True)
+        else:
+            if open_tags != close_tags:
+                print(f"        [!] Warning: Thread{task_id:02d} tag count mismatch "
+                      f"({open_tags} open, {close_tags} close). Extracting matched pairs only.", flush=True)
+            
+            file_matches = re.finditer(
+                r'<file\s+path="([^"]+)">([\s\S]*?)</file>', result_text, re.IGNORECASE
+            )
             for match in file_matches:
                 file_path, file_content = match.group(1).strip(), match.group(2).strip()
                 safe_filename = os.path.basename(file_path)
