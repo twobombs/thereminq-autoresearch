@@ -170,6 +170,10 @@ STITCH_PARALLEL_SLOTS = min(
 MAX_RETRIES = 3
 
 MAX_STITCH_TOKENS = int(os.getenv("MAX_STITCH_TOKENS", "32768"))
+# Chunk-level synthesis output ceiling. Each Level-1 synthesis node merges
+# SYNTHESIS_CHUNK_SIZE worker reports; it never needs a full 32k emission and a
+# smaller ceiling keeps per-chunk wall time bounded.
+MAX_STITCH_MERGE_TOKENS = int(os.getenv("MAX_STITCH_MERGE_TOKENS", str(min(MAX_STITCH_TOKENS, 16384))))
 STITCH_CHARS_PER_TOKEN = float(os.getenv("STITCH_CHARS_PER_TOKEN", str(CHARS_PER_TOKEN)))
 STITCH_RESERVE_TOKENS = int(os.getenv("STITCH_RESERVE_TOKENS", "4096"))
 
@@ -183,14 +187,6 @@ _stitch_input_tokens = max(
 MAX_STITCH_CONTEXT_CHARS = int(os.getenv(
     "MAX_STITCH_CONTEXT_CHARS",
     str(int(_stitch_input_tokens * STITCH_CHARS_PER_TOKEN))
-))
-
-STITCH_MERGE_CHARS_EACH = int(os.getenv(
-    "STITCH_MERGE_CHARS_EACH",
-    str(max(2000, min(
-        (MAX_STITCH_CONTEXT_CHARS - 2000) // 2,
-        int(MAX_STITCH_TOKENS * STITCH_CHARS_PER_TOKEN * 0.9) // 2,
-    )))
 ))
 
 # Echo passes must fit within the input window, not the output window.
@@ -216,7 +212,7 @@ WORKER_RETRIES = 3
 WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "300.0"))
 STITCH_TIMEOUT_SECS = float(os.getenv("STITCH_TIMEOUT_SECS", "300.0"))
 
-SYNTHESIS_CHUNK_SIZE = int(os.getenv("SYNTHESIS_CHUNK_SIZE", "2"))
+SYNTHESIS_CHUNK_SIZE = int(os.getenv("SYNTHESIS_CHUNK_SIZE", "5"))
 
 WORKER_RESERVE_TOKENS = int(os.getenv("WORKER_RESERVE_TOKENS", "2048"))
 MAX_WORKER_TOKENS = min(
@@ -229,6 +225,10 @@ WORKER_MIN_DECODE_TPS = float(os.getenv("WORKER_MIN_DECODE_TPS", "4.0"))
 WORKER_MAX_WALL_SECS = float(os.getenv(
     "WORKER_MAX_WALL_SECS",
     str(max(600.0, MAX_WORKER_TOKENS / WORKER_MIN_DECODE_TPS + 120.0))))
+
+REPO_WORKER_WALL_SECS = float(os.getenv(
+    "REPO_WORKER_WALL_SECS",
+    str(WORKER_TIMEOUT_SECS * WORKER_RETRIES)))
 
 # Phase 5: Automatic Unittests Config
 TEST_WORKER_ENDPOINTS = [
@@ -248,7 +248,7 @@ LLM_PRESENCE_PENALTY = 0.2
 RETRY_BASE_DELAY = 2.0
 RETRY_JITTER = 0.5
 MAX_EXEC_WORKERS = 4
-EXECUTION_RESULT_FIELDS = ["filename", "language", "status", "message"]
+EXECUTION_RESULT_FIELDS = ["filename", "language", "status", "message", "chunk"]
 
 TEST_MIN_DECODE_TPS = float(os.getenv("TEST_MIN_DECODE_TPS", "10.0"))
 TEST_TIMEOUT_SECS = float(os.getenv(
@@ -327,11 +327,6 @@ _PROMPT_PHASE3_SYNTHESIS = (
     "Do not add new <file> tags in your synthesis output."
 )
 
-_PROMPT_PHASE3_STITCH = (
-    "You are the Final Assembly Layer. Seamlessly weave the new sequential section into the existing master document. "
-    "Expand the document logically. Do not drop existing data or code. Output strictly in standard ASCII."
-)
-
 _PROMPT_PHASE4_DEDUP = (
     "You are a strict, highly logical Technical Editor processing a section of a larger technical document. "
     "Your job is to take this messy, repetitive draft and rewrite it into cohesive, succinct markdown. "
@@ -339,7 +334,8 @@ _PROMPT_PHASE4_DEDUP = (
     "\n1. Remove all repetitive statements, redundant introductions, and duplicated concepts."
     "\n2. Organize the content into logical, non-repeating markdown headers."
     "\n3. Use bullet points for readability where applicable."
-    "\n4. Do not add conversational filler. Be direct and professional."
+    "\n4. Preserve every fenced code block and configuration verbatim."
+    "\n5. Do not add conversational filler. Be direct and professional."
 )
 
 _PROMPT_PHASE4_SMOOTH = (
@@ -400,24 +396,6 @@ _PROMPT_PHASE6_ITERATE = (
 _active_clone_dirs: Set[Path] = set()
 _clone_dirs_lock = threading.Lock()
 _shutdown_event = threading.Event()
-
-class StitchContext:
-    def __init__(self, ep_queue: queue.Queue, merge_counter: list,
-                 merge_results: list, round_p_acc: list, round_c_acc: list,
-                 merges_done: list, progress_lock: threading.Lock,
-                 original_query: str, stitch_start: float, total_merges: int,
-                 total_rounds: int):
-        self.ep_queue = ep_queue
-        self.merge_counter = merge_counter
-        self.merge_results = merge_results
-        self.round_p_acc = round_p_acc
-        self.round_c_acc = round_c_acc
-        self.merges_done = merges_done
-        self.progress_lock = progress_lock
-        self.original_query = original_query
-        self.stitch_start = stitch_start
-        self.total_merges = total_merges
-        self.total_rounds = total_rounds
 
 def cleanup_clones():
     with _clone_dirs_lock:
@@ -533,7 +511,7 @@ def _stitch_completion(client: OpenAI, system_prompt: str, user_prompt: str,
             response.close()
         except Exception:
             pass
-            
+
     text = enforce_ascii(text.strip())
     if not p_tok and not c_tok:
         p_tok, c_tok = estimate_tokens(system_prompt + user_prompt), estimate_tokens(text)
@@ -541,26 +519,38 @@ def _stitch_completion(client: OpenAI, system_prompt: str, user_prompt: str,
 
 def verify_server_props(endpoints: List[str], label: str, expect_ctx: int, expect_np: int) -> None:
     for ep in endpoints:
-        try:
-            base = ep.rsplit("/v1", 1)[0]
-            props_url = f"{base}/props"
-            resp = requests.get(props_url, timeout=5.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                default_props = data.get("default_generation_settings", {})
-                n_ctx = default_props.get("n_ctx", 0)
-                slots = data.get("total_slots") or default_props.get("n_parallel") or 0
-                note = "ok"
-                per_slot = int(expect_ctx) // max(1, int(expect_np))
-                if expect_ctx and n_ctx and int(n_ctx) not in (int(expect_ctx), per_slot):
-                    note = "MISMATCH: constant says -c {} (per-slot {})".format(expect_ctx, per_slot)
-                elif expect_np and slots and int(slots) != int(expect_np):
-                    note = "MISMATCH: constant says -np {}".format(expect_np)
-                print("    [+] {} {} n_ctx={} slots={} :: {}".format(label, ep, n_ctx, slots, note), flush=True)
-            else:
-                print(f"    [!] {label} {ep} /props check returned HTTP {resp.status_code}", flush=True)
-        except Exception as exc:
-            print(f"    [!] {label} {ep} /props check failed: {str(exc)[:120]}", flush=True)
+        for attempt in range(3):
+            try:
+                base = ep.rsplit("/v1", 1)[0]
+                props_url = f"{base}/props"
+                resp = requests.get(props_url, timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    default_props = data.get("default_generation_settings", {})
+                    n_ctx = default_props.get("n_ctx", 0)
+                    slots = data.get("total_slots") or default_props.get("n_parallel") or 0
+                    
+                    # Handle false MISMATCH during unified KV startup where n_ctx defaults briefly
+                    per_slot = int(expect_ctx) // max(1, int(expect_np))
+                    if expect_ctx and n_ctx and int(n_ctx) not in (int(expect_ctx), per_slot) and int(n_ctx) in (512, 2048) and attempt < 2:
+                        time.sleep(2)
+                        continue
+                    
+                    note = "ok"
+                    if expect_ctx and n_ctx and int(n_ctx) not in (int(expect_ctx), per_slot):
+                        note = "MISMATCH: constant says -c {} (per-slot {})".format(expect_ctx, per_slot)
+                    elif expect_np and slots and int(slots) != int(expect_np):
+                        note = "MISMATCH: constant says -np {}".format(expect_np)
+                    print("    [+] {} {} n_ctx={} slots={} :: {}".format(label, ep, n_ctx, slots, note), flush=True)
+                    break
+                else:
+                    if attempt == 2:
+                        print(f"    [!] {label} {ep} /props check returned HTTP {resp.status_code}", flush=True)
+                    time.sleep(2)
+            except Exception as exc:
+                if attempt == 2:
+                    print(f"    [!] {label} {ep} /props check failed: {str(exc)[:120]}", flush=True)
+                time.sleep(2)
 
 def ping_tier(endpoints: List[str], model: str, api_key: str, label: str, timeout: float = 90.0) -> bool:
     ok = True
@@ -617,8 +607,8 @@ def describe_budget_alignment() -> str:
         f"  -> {STITCH_CONTEXT_TOKENS//1024}k tok/req"
         f" (native cap {STITCH_MODEL_NATIVE_CTX//1024}k)"
         f" | input<={MAX_STITCH_CONTEXT_CHARS:,} chars"
-        f" | out<={MAX_STITCH_TOKENS//1024}k tok"
-        f" | merge<={STITCH_MERGE_CHARS_EACH:,} chars/side"
+        f" | synth<={MAX_STITCH_MERGE_TOKENS//1024}k tok"
+        f" | edit<={MAX_STITCH_TOKENS//1024}k tok"
         f" | echo<={STITCH_ECHO_MAX_CHARS:,} chars"
         f" | gap_to={int(STITCH_TIMEOUT_SECS)}s"
     )
@@ -630,8 +620,24 @@ def describe_budget_alignment() -> str:
         f" | gap={int(WORKER_TIMEOUT_SECS)}s wall={int(WORKER_MAX_WALL_SECS)}s"
     )
     lines.append(
+        f"    repo    :batch  wall={int(REPO_WORKER_WALL_SECS)}s/attempt "
+        f"| outer={int(WORKER_RETRIES * REPO_WORKER_WALL_SECS + 30)}s"
+    )
+    
+    calc_worker_tok = WORKER_CONTEXT_TOKENS - WORKER_RESERVE_TOKENS - int(MAX_CONTEXT_CHARS / CHARS_PER_TOKEN)
+    if calc_worker_tok < 1024:
+        lines.append(
+            f"    [!] WARNING: Calculated worker output budget collapsed to {calc_worker_tok} "
+            f"and hit the 1024 floor. Most worker responses will truncate!"
+        )
+
+    lines.append(
         f"    tests   :8033/4 out<={MAX_OUTPUT_TOKENS//1024}k tok"
         f" | min_tps={TEST_MIN_DECODE_TPS} | timeout={int(TEST_TIMEOUT_SECS)}s"
+    )
+    lines.append(
+        "    [i] Tree-reduction stitch DISABLED: chunks are preserved individually. "
+        "No cross-chunk content loss."
     )
 
     peak_stitch = (
@@ -656,8 +662,8 @@ def describe_stitch_budget() -> str:
     return (
         f"window={STITCH_CONTEXT_TOKENS//1024}k tok | "
         f"input<={MAX_STITCH_CONTEXT_CHARS:,} chars (~{int(MAX_STITCH_CONTEXT_CHARS/STITCH_CHARS_PER_TOKEN)//1024}k tok) | "
-        f"output<={MAX_STITCH_TOKENS//1024}k tok | "
-        f"merge<={STITCH_MERGE_CHARS_EACH:,} chars/side | "
+        f"synth<={MAX_STITCH_MERGE_TOKENS//1024}k tok | "
+        f"edit<={MAX_STITCH_TOKENS//1024}k tok | "
         f"{len(STITCHER_ENDPOINTS)} node(s) x {STITCH_PARALLEL_SLOTS} slot(s)"
     )
 
@@ -671,19 +677,6 @@ def _format_eta(start_time: float, completed: int, total: int) -> str:
     if hours > 0:
         return f"{hours}h {mins:02d}m"
     return f"{mins:02d}:{secs:02d}"
-
-def _render_stitch_progress(done: int, total: int, current_round: int, total_rounds: int, start_time: float) -> None:
-    bar_len = 30
-    filled = int((done / total) * bar_len) if total else bar_len
-    bar = "#" * filled + "-" * (bar_len - filled)
-    percent = int((done / total) * 100) if total else 100
-    eta_str = _format_eta(start_time, done, total)
-    sys.stdout.write(
-        f"\r    [+] Stitch Progress: [{bar}] {percent}% "
-        f"(Merges: {done}/{total} | Round: {current_round}/{total_rounds}) "
-        f"| ETC: {eta_str}"
-    )
-    sys.stdout.flush()
 
 def _render_map_progress(workers_finished: int, total_tasks: int, chunks_completed: int, total_chunks: int, start_time: float) -> None:
     bar_len = 30
@@ -765,7 +758,8 @@ def _is_private_host(host: str) -> bool:
     """
     Advisory check to prevent basic SSRF against local metadata/loopback.
     NOTE: This is subject to TOCTOU (Time-of-Check to Time-of-Use) DNS rebinding
-    attacks, as the git subprocess performs its own resolution later at clone time.
+    attacks. Real mitigation requires running the clone behind a network namespace
+    or using GIT_PROXY_COMMAND with an enforced allowlist.
     """
     try:
         orig_timeout = socket.getdefaulttimeout()
@@ -1002,20 +996,29 @@ def render_inline_source(entries: list) -> str:
 
 def _repo_worker_call(system_prompt: str, user_prompt: str, endpoint: str) -> str:
     client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
-    stream = client.chat.completions.create(
-        model=WORKER_MODEL,
-        messages=[{"role": "system", "content": system_prompt},
-                  {"role": "user", "content": user_prompt}],
-        temperature=0.2, max_tokens=MAX_WORKER_TOKENS, stream=True)
-    try:
-        out = "".join(c.choices[0].delta.content for c in stream
-                      if c.choices and c.choices[0].delta.content is not None)
-        return enforce_ascii(out.strip())
-    finally:
+    
+    def _consume():
+        stream = client.chat.completions.create(
+            model=WORKER_MODEL,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_prompt}],
+            temperature=0.2, max_tokens=MAX_WORKER_TOKENS, stream=True)
         try:
-            stream.close()
-        except Exception:
-            pass
+            out = "".join(c.choices[0].delta.content for c in stream 
+                          if c.choices and c.choices[0].delta.content is not None)
+            return enforce_ascii(out.strip())
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+                
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_consume)
+        try:
+            return future.result(timeout=REPO_WORKER_WALL_SECS)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"Stream stall: exceeded {REPO_WORKER_WALL_SECS}s wall clock limit.")
 
 def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
     total = len(jobs)
@@ -1030,14 +1033,11 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
 
     def wrapper(idx: int, payload):
         endpoint = None
-        deadline = time.time() + (WORKER_RETRIES * WORKER_TIMEOUT_SECS)
-        while time.time() < deadline:
+        while not _shutdown_event.is_set():
             try:
                 endpoint = slot_queue.get(timeout=5.0)
                 break
             except queue.Empty:
-                if _shutdown_event.is_set():
-                    break
                 continue
         if endpoint is None:
             return fallback_fn(payload)
@@ -1064,8 +1064,12 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
             completed_count += 1
             eta_str = _format_eta(start_time_progress, completed_count, total)
             try:
-                results[idx] = future.result()
+                # Add strict wall clock boundary here to prevent fully blocked futures
+                results[idx] = future.result(timeout=WORKER_RETRIES * REPO_WORKER_WALL_SECS + 30)
                 print(f"        [+] {label} {completed_count}/{total} complete. | ETC: {eta_str}", flush=True)
+            except concurrent.futures.TimeoutError:
+                print(f"        [!] {label} {completed_count}/{total} future timed out entirely. Using fallback. | ETC: {eta_str}", flush=True)
+                results[idx] = fallback_fn(jobs[idx])
             except Exception as e:
                 print(f"        [!] {label} {completed_count}/{total} future raised exception: {e}. Using fallback. | ETC: {eta_str}", flush=True)
                 results[idx] = fallback_fn(jobs[idx])
@@ -1203,7 +1207,7 @@ def distill_document(raw_text: str) -> str:
                 response.close()
             except Exception:
                 pass
-                
+
         return enforce_ascii(out.strip())
 
     except Exception as e:
@@ -1223,7 +1227,15 @@ def save_distilled_output(output_text: str, original_path: Path) -> Path:
         sys.exit(1)
 
 # ==============================================================================
-# Phase 3: Unified Distributed Stitcher Cluster (Map-Reduce)
+# Phase 3: Distributed Map-Reduce (chunk-preserving, no tree reduction)
+# ------------------------------------------------------------------------------
+# The tree-reduction stitch was removed deliberately. Collapsing N synthesis
+# chunks into one document forces every merge through a single
+# MAX_STITCH_MERGE_TOKENS emission, so each round silently truncated the
+# accumulated left-hand side. With 8 chunks over 3 rounds that discarded
+# roughly 7/8 of the corpus and produced a final document containing only the
+# last section. Chunks are now persisted individually; Phase 4 polishes each
+# in place and Phase 5 harvests artifacts from all of them.
 # ==============================================================================
 
 def estimate_tokens(text: str) -> int:
@@ -1398,14 +1410,12 @@ def process_subtask(task_id: int, task_prompt: str, endpoint: str, slot_name: st
             prompt_tokens = estimate_tokens(_PROMPT_PHASE3_WORKER + user_instruction)
             comp_tokens = estimate_tokens(result_text)
 
-        if open_tags > close_tags + 2:
-            print(f"        [!] Warning: Thread{task_id:02d} has {open_tags - close_tags} unclosed "
-                  f"<file> tags. Skipping artifact extraction to prevent runaway content capture.", flush=True)
+        if open_tags != close_tags:
+            print(f"        [!] Warning: Thread{task_id:02d} tag count mismatch "
+                  f"({open_tags} open, {close_tags} close). Skipping artifact extraction to prevent corrupted slurring.", flush=True)
+            result_text += "\n\n...[ARTIFACT EXTRACTION FAILED: UNBALANCED FILE TAGS]..."
+            status = "failed_validation"
         else:
-            if open_tags != close_tags:
-                print(f"        [!] Warning: Thread{task_id:02d} tag count mismatch "
-                      f"({open_tags} open, {close_tags} close). Extracting matched pairs only.", flush=True)
-            
             file_matches = re.finditer(
                 r'<file\s+path="([^"]+)">([\s\S]*?)</file>', result_text, re.IGNORECASE
             )
@@ -1445,239 +1455,125 @@ def parallel_chunk_synthesis(batch_id: int, tasks: list, endpoint: str, original
 
     start_time = time.time()
     res_content, p_tok, c_tok = _stitch_completion(
-        client, _PROMPT_PHASE3_SYNTHESIS, user_prompt, MAX_STITCH_TOKENS, 0.3
+        client, _PROMPT_PHASE3_SYNTHESIS, user_prompt, MAX_STITCH_MERGE_TOKENS, 0.3
     )
     elapsed = round(time.time() - start_time, 2)
     return batch_id, res_content, p_tok, c_tok, elapsed
 
-def rolling_master_stitch(chunk_id: int, left_doc: str, right_doc: str, endpoint: str, original_query: str) -> tuple:
-    client = stitcher_client(endpoint)
-    budget_each = STITCH_MERGE_CHARS_EACH
+# ------------------------------------------------------------------
+# Chunk persistence (replaces tree_reduce_stitch)
+# ------------------------------------------------------------------
 
-    if len(right_doc) > budget_each:
-        right_doc = right_doc[:budget_each] + "\n\n...[NEW CHUNK TRUNCATED]..."
+CHUNKS_DIRNAME = "chunks"
 
-    if len(left_doc) > budget_each:
-        stitch_context = "...[EARLIER CONTENT TRUNCATED FOR CONTEXT LIMITS]...\n\n" + left_doc[-budget_each:]
-    else:
-        stitch_context = left_doc
+def chunks_dir_for(run_dir: Path) -> Path:
+    return run_dir / CHUNKS_DIRNAME
 
-    user_prompt = (
-        f"ORIGINAL QUERY: {original_query}\n\n"
-        f"--- CURRENT MASTER DOCUMENT ---\n{stitch_context}\n\n"
-        f"--- NEW SECTION {chunk_id} TO INTEGRATE ---\n{right_doc}"
-    )
+def list_chunk_files(run_dir: Path, polished: bool = False) -> List[Path]:
+    """Return sorted chunk files. If polished=True, prefer *_polished.md and
+    fall back to the raw chunk when a polished twin is missing."""
+    cdir = chunks_dir_for(run_dir)
+    if not cdir.exists():
+        return []
+    raw = sorted(cdir.glob("chunk_[0-9][0-9][0-9].md"))
+    if not polished:
+        return raw
+    out = []
+    for r in raw:
+        p = r.parent / f"{r.stem}_polished.md"
+        out.append(p if p.exists() else r)
+    return out
 
-    start_time = time.time()
-    res_content, p_tok, c_tok = _stitch_completion(
-        client, _PROMPT_PHASE3_STITCH, user_prompt, MAX_STITCH_TOKENS, 0.3
-    )
-    elapsed = round(time.time() - start_time, 2)
-    return res_content, p_tok, c_tok, elapsed
+def save_chunk_files(ordered_chunks: List[str], run_dir: Path) -> List[Path]:
+    """Persist each synthesis chunk to its own file. Nothing is merged, so
+    nothing is lost."""
+    cdir = chunks_dir_for(run_dir)
+    cdir.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    for idx, text in enumerate(ordered_chunks, start=1):
+        p = cdir / f"chunk_{idx:03d}.md"
+        body = enforce_ascii(text.strip())
+        header = f"<!-- chunk {idx:03d} of {len(ordered_chunks)} -->\n\n"
+        with open(p, "w", encoding="ascii") as f:
+            f.write(header + body + "\n")
+        paths.append(p)
+    return paths
 
-def _merge_pair(pair_idx: int, left: str, right: str, current_round: int,
-                total_pairs: int, ctx: StitchContext) -> None:
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            endpoint = ctx.ep_queue.get(timeout=5.0)
-        except queue.Empty:
-            continue
-        try:
-            with ctx.progress_lock:
-                ctx.merge_counter[0] += 1
-                cid = ctx.merge_counter[0]
+def build_synthesis_manifest(chunk_paths: List[Path], worker_stats: list,
+                             original_query: str, elapsed: float,
+                             w_p: int, w_c: int, syn_p: int, syn_c: int,
+                             truncated_count: int) -> str:
+    """FINAL_SYNTHESIS.md is now an index + telemetry document. The corpus
+    itself lives in chunks/ and is never collapsed."""
+    total_chars = sum(p.stat().st_size for p in chunk_paths if p.exists())
 
-            merged_text, p, c, elapsed = rolling_master_stitch(
-                cid, left, right, endpoint, ctx.original_query
-            )
+    lines = ["# Final Synthesis Manifest", ""]
+    lines.append(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- **Chunks preserved:** {len(chunk_paths)}")
+    lines.append(f"- **Total corpus:** {total_chars:,} bytes across all chunks")
+    lines.append(f"- **Assembly mode:** chunk-preserving (tree-reduction stitch disabled)")
+    lines.append("")
+    lines.append("## Query")
+    lines.append("")
+    q = original_query.strip()
+    lines.append("```")
+    lines.append(q[:4000] + ("\n...[QUERY TRUNCATED IN MANIFEST]..." if len(q) > 4000 else ""))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Chunk Index")
+    lines.append("")
+    lines.append("| # | File | Bytes |")
+    lines.append("|---|------|-------|")
+    for idx, p in enumerate(chunk_paths, start=1):
+        size = p.stat().st_size if p.exists() else 0
+        lines.append(f"| {idx} | `{CHUNKS_DIRNAME}/{p.name}` | {size:,} |")
+    lines.append("")
 
-            with ctx.progress_lock:
-                ctx.merge_results[pair_idx] = merged_text
-                ctx.round_p_acc[0] += p
-                ctx.round_c_acc[0] += c
-                ctx.merges_done[0] += 1
-                
-                _render_stitch_progress(
-                    ctx.merges_done[0], ctx.total_merges, current_round,
-                    ctx.total_rounds, ctx.stitch_start
-                )
-            return
-
-        except Exception as exc:
-            with ctx.progress_lock:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                print(
-                    f"        [!] Merge round {current_round} pair "
-                    f"{pair_idx + 1}/{total_pairs} attempt {attempt}/{MAX_RETRIES} "
-                    f"failed on {endpoint}: {exc}",
-                    flush=True,
-                )
-            if attempt == MAX_RETRIES:
-                with ctx.progress_lock:
-                    ctx.merge_results[pair_idx] = left + "\n\n" + right
-                    print(
-                        f"        [!] Merge round {current_round} pair "
-                        f"{pair_idx + 1} exhausted retries - "
-                        f"falling back to raw concatenation.",
-                        flush=True,
-                    )
-                    ctx.merges_done[0] += 1
-                    
-                    _render_stitch_progress(
-                        ctx.merges_done[0], ctx.total_merges, current_round,
-                        ctx.total_rounds, ctx.stitch_start
-                    )
-                return
-        finally:
-            ctx.ep_queue.put(endpoint)
-
-        if attempt < MAX_RETRIES:
-            time.sleep(2)
-
-    with ctx.progress_lock:
-        if ctx.merge_results[pair_idx] is None:
-            ctx.merge_results[pair_idx] = left + "\n\n" + right
-            print(
-                f"        [!] Merge round {current_round} pair {pair_idx + 1} "
-                f"never acquired a stitcher slot - falling back to raw concatenation.",
-                flush=True,
-            )
-            ctx.merges_done[0] += 1
-            
-            _render_stitch_progress(
-                ctx.merges_done[0], ctx.total_merges, current_round,
-                ctx.total_rounds, ctx.stitch_start
-            )
-
-
-def tree_reduce_stitch(ordered_chunks: List[str], original_query: str) -> Tuple[str, int, int]:
-    if not ordered_chunks:
-        return "", 0, 0
-
-    if len(ordered_chunks) == 1:
-        print("    [*] Single chunk - no stitching required.", flush=True)
-        return ordered_chunks[0], 0, 0
-
-    endpoint_pool: List[str] = [
-        ep for ep in STITCHER_ENDPOINTS for _ in range(STITCH_PARALLEL_SLOTS)
-    ]
-
-    if not endpoint_pool:
-        print("    [!] WARNING: No stitcher endpoints defined. Falling back to raw concatenation.", flush=True)
-        return "\n\n".join(ordered_chunks), 0, 0
-
-    ep_queue: queue.Queue = queue.Queue()
-    for ep in endpoint_pool:
-        ep_queue.put(ep)
-
-    total_merges = len(ordered_chunks) - 1
-    total_rounds = 0
-    _nodes = len(ordered_chunks)
-    while _nodes > 1:
-        total_rounds += 1
-        _nodes = (_nodes // 2) + (_nodes % 2)
-
-    print(
-        f"    [*] Stitch plan: {total_merges} merge(s) over {total_rounds} round(s) "
-        f"using {len(endpoint_pool)} concurrent stitcher slot(s).",
-        flush=True,
-    )
-
-    total_stitch_p_tok = 0
-    total_stitch_c_tok = 0
-    merges_done = [0]            
-    merge_counter = [0]          
-    progress_lock = threading.Lock()
-    stitch_start = time.time()
-    current_nodes = list(ordered_chunks)
-    round_num = 0
-
-    while len(current_nodes) > 1:
-        round_num += 1
-        n = len(current_nodes)
-
-        pairs = [(current_nodes[i], current_nodes[i + 1]) for i in range(0, n - 1, 2)]
-        passthrough = [current_nodes[-1]] if n % 2 == 1 else []
-
-        print(
-            f"    [STITCH] Round {round_num}/{total_rounds}: {len(pairs)} parallel merge(s)"
-            + (" + 1 passthrough node" if passthrough else "")
-            + f" ({n} -> {len(pairs) + len(passthrough)} nodes)",
-            flush=True,
+    lines.append("## Execution Telemetry")
+    lines.append("")
+    lines.append("### Worker Execution Statistics")
+    lines.append("")
+    lines.append("| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens | Estimated | Truncated |")
+    lines.append("|-----------|------|--------|-------------|----------|---------------|-------------|--------------|-----------|-----------|")
+    for stat in sorted(worker_stats, key=lambda x: x['id']):
+        est = "Yes" if stat.get('is_estimated') else "No"
+        trc = "Yes" if stat.get('truncated') else "No"
+        lines.append(
+            f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | "
+            f"{stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | "
+            f"{stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} | {est} | {trc} |"
         )
+    lines.append("")
+    lines.append("### Cluster Aggregate Statistics")
+    lines.append("")
+    lines.append(f"- **Total Wall-Clock Time:** {elapsed:.2f} seconds")
+    lines.append(f"- **Worker Prompt Tokens:** {w_p}")
+    lines.append(f"- **Worker Completion Tokens:** {w_c}")
+    lines.append(f"- **Stitcher Synthesis + Decomposition Prompt Tokens:** {syn_p}")
+    lines.append(f"- **Stitcher Synthesis + Decomposition Completion Tokens:** {syn_c}")
+    lines.append(f"- **Stitcher Tree-Reduction Tokens:** 0 (stage removed)")
+    lines.append(f"- **Worker Model:** {WORKER_MODEL}")
+    lines.append(f"- **Stitcher Model:** {STITCHER_MODEL}")
+    lines.append(f"- **Stitcher Endpoints:** {', '.join(STITCHER_ENDPOINTS)} (x{STITCH_PARALLEL_SLOTS} slot(s))")
+    lines.append(f"- **Stitcher Budget:** {describe_stitch_budget()}")
+    lines.append(f"- **Workers Truncated (wall clock):** {truncated_count} of {len(worker_stats)}")
+    lines.append("")
 
-        merge_results: List[Optional[str]] = [None] * len(pairs)
-        round_p_acc = [0]
-        round_c_acc = [0]
-        round_start = time.time()
+    return enforce_ascii("\n".join(lines))
 
-        ctx = StitchContext(
-            ep_queue=ep_queue,
-            merge_counter=merge_counter,
-            merge_results=merge_results,
-            round_p_acc=round_p_acc,
-            round_c_acc=round_c_acc,
-            merges_done=merges_done,
-            progress_lock=progress_lock,
-            original_query=original_query,
-            stitch_start=stitch_start,
-            total_merges=total_merges,
-            total_rounds=total_rounds
-        )
-
-        with progress_lock:
-            _render_stitch_progress(
-                merges_done[0], total_merges, round_num, total_rounds, stitch_start
-            )
-
-        max_workers = max(1, min(len(pairs), len(endpoint_pool)))
-        total_pairs_round = len(pairs)
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [
-                pool.submit(
-                    _merge_pair, i, left, right, round_num, total_pairs_round, ctx
-                )
-                for i, (left, right) in enumerate(pairs)
-            ]
-            concurrent.futures.wait(futures)
-
-        round_elapsed = round(time.time() - round_start, 2)
-        total_stitch_p_tok += round_p_acc[0]
-        total_stitch_c_tok += round_c_acc[0]
-
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-        print(
-            f"    [STITCH] Round {round_num}/{total_rounds} complete in {round_elapsed}s "
-            f"({round_c_acc[0]} completion tokens).",
-            flush=True,
-        )
-
-        current_nodes = [r if r is not None else "" for r in merge_results] + passthrough
-
-    total_elapsed = round(time.time() - stitch_start, 2)
-    print(
-        f"    [+] Stitch complete: {total_merges} merge(s) in {total_elapsed}s. "
-        f"Final document: {len(current_nodes[0]):,} chars.",
-        flush=True,
-    )
-
-    return current_nodes[0], total_stitch_p_tok, total_stitch_c_tok
-
-def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir: Path, decomp_p_tok: int = 0, decomp_c_tok: int = 0) -> tuple:
+def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir: Path,
+                                  decomp_p_tok: int = 0, decomp_c_tok: int = 0) -> tuple:
     if not WORKER_ENDPOINTS or not STITCHER_ENDPOINTS:
         print("\n[!] FATAL: Endpoints not defined for map-reduce cluster (need worker and stitcher pools).", flush=True)
         sys.exit(1)
 
     if not sub_tasks:
-        return "", 0, 0, decomp_p_tok, decomp_c_tok, 0, 0, []
+        return [], 0, 0, decomp_p_tok, decomp_c_tok, []
 
     total_tasks = len(sub_tasks)
     total_chunks = (total_tasks + SYNTHESIS_CHUNK_SIZE - 1) // SYNTHESIS_CHUNK_SIZE
 
-    print(f"\n[4] CONTINUOUS MAP-REDUCE: Launching parallel workers, chunk synthesis, and tree-reduction stitch...", flush=True)
+    print(f"\n[4] CONTINUOUS MAP-REDUCE: Launching parallel workers and chunk synthesis...", flush=True)
     print(f"    [*] Stitcher budget: {describe_stitch_budget()}", flush=True)
 
     worker_queue = queue.Queue()
@@ -1710,7 +1606,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                     break
                 except queue.Empty:
                     continue
-            
+
             if not endpoint:
                 last_result["result"] = "Aborted due to shutdown event."
                 event_queue.put(("worker", last_result))
@@ -1754,31 +1650,44 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         last_result["is_estimated"] = True
         event_queue.put(("worker", last_result))
 
-    def chunk_wrapper(batch_id: int, tasks: list):
-        tasks = [t for t in tasks if t is not None]
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                endpoint, slot_name = synth_queue.get(timeout=5.0)
-            except queue.Empty:
-                continue
-
-            try:
-                b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
-                event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
-                return
-            except Exception as e:
-                print(f"    [!] Chunk synthesis error on attempt {attempt} ({slot_name}): {e}", flush=True)
-            finally:
-                synth_queue.put((endpoint, slot_name))
-            time.sleep(2)
-
+    def _emit_chunk_fallback(batch_id: int, tasks: list):
         batch_context = "\n\n".join([f"--- TASK {t['id']}: {t['prompt']} ---\n{t['result']}" for t in tasks])
         fallback_text = f"\n--- [RAW CHUNK {batch_id}] ---\n" + batch_context
-
         user_prompt = f"ORIGINAL QUERY: {original_query}\n\nREPORTS TO MERGE:\n{batch_context}"
         est_p_tok = estimate_tokens(_PROMPT_PHASE3_SYNTHESIS + user_prompt)
         est_c_tok = estimate_tokens(fallback_text)
         event_queue.put(("chunk", batch_id, fallback_text, est_p_tok, est_c_tok, 0, "Stitch-Fallback"))
+
+    def chunk_wrapper(batch_id: int, tasks: list):
+        tasks = [t for t in tasks if t is not None]
+
+        endpoint, slot_name = None, None
+        deadline = time.time() + (MAX_RETRIES * STITCH_TIMEOUT_SECS)
+        while time.time() < deadline:
+            if _shutdown_event.is_set():
+                break
+            try:
+                endpoint, slot_name = synth_queue.get(timeout=5.0)
+                break
+            except queue.Empty:
+                continue
+
+        if endpoint is None:
+            _emit_chunk_fallback(batch_id, tasks)
+            return
+
+        try:
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    b_id, text, p_tok, c_tok, elap = parallel_chunk_synthesis(batch_id, tasks, endpoint, original_query)
+                    event_queue.put(("chunk", b_id, text, p_tok, c_tok, elap, slot_name))
+                    return
+                except Exception as e:
+                    print(f"    [!] Chunk synthesis error on attempt {attempt} ({slot_name}): {e}", flush=True)
+                    time.sleep(2)
+            _emit_chunk_fallback(batch_id, tasks)
+        finally:
+            synth_queue.put((endpoint, slot_name))
 
     worker_p_tok, worker_c_tok = 0, 0
     chunk_p_tok, chunk_c_tok = 0, 0
@@ -1796,7 +1705,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
     MAP_STALL_TIMEOUT = float(os.getenv(
         "MAP_STALL_TIMEOUT",
         str(WORKER_RETRIES * WORKER_TIMEOUT_SECS + 120.0)))
-        
+
     last_heartbeat = time.time()
     start_time_progress = time.time()
     last_event_time = time.time()
@@ -1818,7 +1727,7 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
             except queue.Empty:
                 if _shutdown_event.is_set():
                     break
-                    
+
                 idle = time.time() - last_event_time
                 if time.time() - last_heartbeat > MAP_HEARTBEAT_SECS:
                     last_heartbeat = time.time()
@@ -1829,24 +1738,29 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                               workers_finished, total_tasks, chunks_completed,
                               total_chunks, last_done, worker_queue.qsize(),
                               synth_queue.qsize()), flush=True)
-                    
+
                     _render_map_progress(workers_finished, total_tasks, chunks_completed, total_chunks, start_time_progress)
-                              
+
                 if idle > MAP_STALL_TIMEOUT:
                     print("\n    [!] Watchdog: no map/reduce events for {}s. Aborting phase.".format(
                         int(idle)), flush=True)
                     aborted = True
                     break
-                    
+
                 if workers_finished >= total_tasks and chunks_completed < total_chunks:
                     for chunk_idx in range(1, total_chunks + 1):
                         if chunk_idx not in submitted_chunks:
                             expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
                             expected_end = min(expected_start + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
-                            available = [results_dict.get(i) for i in range(expected_start, expected_end) if i in results_dict]
-                            if available:
+                            
+                            chunk_tasks = []
+                            for i in range(expected_start, expected_end):
+                                if i in results_dict:
+                                    chunk_tasks.append(results_dict[i])
+                                    
+                            if len(chunk_tasks) == (expected_end - expected_start):
                                 submitted_chunks.add(chunk_idx)
-                                synth_exec.submit(chunk_wrapper, chunk_idx, available)
+                                synth_exec.submit(chunk_wrapper, chunk_idx, chunk_tasks)
                 continue
 
             if event[0] == "progress":
@@ -1887,10 +1801,15 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
                         if chunk_idx not in submitted_chunks:
                             expected_start = (chunk_idx - 1) * SYNTHESIS_CHUNK_SIZE + 1
                             expected_end = min(expected_start + SYNTHESIS_CHUNK_SIZE, total_tasks + 1)
-                            available = [results_dict.get(i) for i in range(expected_start, expected_end) if i in results_dict]
-                            if available:
+                            
+                            chunk_tasks = []
+                            for i in range(expected_start, expected_end):
+                                if i in results_dict:
+                                    chunk_tasks.append(results_dict[i])
+                            
+                            if len(chunk_tasks) == (expected_end - expected_start):
                                 submitted_chunks.add(chunk_idx)
-                                synth_exec.submit(chunk_wrapper, chunk_idx, available)
+                                synth_exec.submit(chunk_wrapper, chunk_idx, chunk_tasks)
 
             elif event[0] == "chunk":
                 last_completion_time = time.time()
@@ -1927,25 +1846,26 @@ def execute_continuous_map_reduce(sub_tasks: list, original_query: str, run_dir:
         print("    [!] Map-reduce produced no output chunks. Aborting.", flush=True)
         sys.exit(2)
 
-    print(
-        f"\n[5] TREE-REDUCTION STITCH: Assembling {len(ordered_chunk_texts)} chunk(s) "
-        f"across {len(STITCHER_ENDPOINTS)} stitcher endpoint(s) x {STITCH_PARALLEL_SLOTS} slot(s) "
-        f"[{STITCHER_MODEL}]...",
-        flush=True,
-    )
+    print(f"\n[5] CHUNK PERSISTENCE: Writing {len(ordered_chunk_texts)} chunk(s) to disk "
+          f"(tree-reduction stitch disabled - no content is merged away)...", flush=True)
 
-    master_document, stitch_p_tok, stitch_c_tok = tree_reduce_stitch(
-        ordered_chunk_texts, original_query
-    )
+    chunk_paths = save_chunk_files(ordered_chunk_texts, run_dir)
+    total_bytes = sum(p.stat().st_size for p in chunk_paths)
+    print(f"    [+] Preserved {len(chunk_paths)} chunk(s), {total_bytes:,} bytes total, "
+          f"in {chunks_dir_for(run_dir)}", flush=True)
 
     total_synth_p = chunk_p_tok + decomp_p_tok
     total_synth_c = chunk_c_tok + decomp_c_tok
 
-    return (master_document, worker_p_tok, worker_c_tok, total_synth_p, total_synth_c,
-            stitch_p_tok, stitch_c_tok, worker_stats_log)
+    return (chunk_paths, worker_p_tok, worker_c_tok, total_synth_p, total_synth_c,
+            worker_stats_log)
 
 # ==============================================================================
-# Phase 4: Distributed Parallel Post-Processing
+# Phase 4: Per-Chunk Post-Processing
+# ------------------------------------------------------------------------------
+# Each chunk is polished independently and written back as chunk_NNN_polished.md.
+# Sub-chunks from every chunk are flattened into a single parallel dedup pass so
+# the stitcher slots stay saturated instead of idling between chunk files.
 # ==============================================================================
 
 def extract_and_protect_blocks(markdown_text: str) -> Tuple[str, Dict[str, str]]:
@@ -1962,19 +1882,11 @@ def extract_and_protect_blocks(markdown_text: str) -> Tuple[str, Dict[str, str]]
     code_pattern = re.compile(r'(`{3,})[^\r\n]*\r?\n[\s\S]*?\r?\n\1(?!`)')
     text_without_code = code_pattern.sub(replacer, markdown_text)
 
-    table_pattern = re.compile(r'## Execution Telemetry[\s\S]*?(?=\r?\n## |\Z)')
-    table_match = table_pattern.search(text_without_code)
-
-    if table_match:
-        placeholder = "[[PROTECTED_TELEMETRY_TABLE]]"
-        protected_blocks[placeholder] = table_match.group(0)
-        text_without_code = text_without_code[:table_match.start()] + f"\n\n{placeholder}\n"
-
     return text_without_code, protected_blocks
 
 def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, endpoint: str, slot_name: str) -> Tuple[str, bool]:
     original = chunk_text
-    placeholder_pattern = r'\[\[PROTECTED_[A-Z_]+?\d{3,}\]\]|\[\[PROTECTED_TELEMETRY_TABLE\]\]'
+    placeholder_pattern = r'\[\[PROTECTED_[A-Z_]+?\d{3,}\]\]'
     chunk_inventory = re.findall(placeholder_pattern, chunk_text)
 
     fitted_chunk_text = fit_stitch_context(chunk_text)
@@ -2005,26 +1917,30 @@ def semantic_deduplication(chunk_text: str, chunk_id: int, total_chunks: int, en
 
             return distilled_text, True
         except Exception as exc:
-            print(f"\n    [!] Dedup chunk {chunk_id}/{total_chunks} failed on {slot_name} (attempt {attempt}/3): {str(exc)[:120]}", flush=True)
+            print(f"\n    [!] Dedup segment {chunk_id}/{total_chunks} failed on {slot_name} (attempt {attempt}/3): {str(exc)[:120]}", flush=True)
             time.sleep(2)
-            
-    print(f"    [!] Dedup chunk {chunk_id}/{total_chunks} exhausted retries. Passing through unedited.", flush=True)
+
+    print(f"    [!] Dedup segment {chunk_id}/{total_chunks} exhausted retries. Passing through unedited.", flush=True)
     return original, False
 
-def parallel_edit_chunks(chunks: List[str]) -> Tuple[str, int]:
+def parallel_edit_chunks(chunks: List[str]) -> Tuple[List[str], int]:
+    """Dedup a flat list of text segments in parallel. Returns (results, failures)."""
     if not STITCHER_ENDPOINTS:
         print("    [!] WARNING: No stitcher endpoints defined. Skipping deduplication.", flush=True)
-        return "\n\n".join(chunks), len(chunks)
+        return list(chunks), len(chunks)
 
     total_chunks = len(chunks)
     endpoint_queue, total_slots = build_stitcher_slot_queue(prefix="Edit-Slot")
 
-    results = [""] * total_chunks
+    results: List[str] = [""] * total_chunks
     failures = 0
-    
+
     def _edit_chunk_worker(chunk_idx: int, chunk_content: str) -> Tuple[str, bool]:
         endpoint, slot_name = None, None
-        while not _shutdown_event.is_set():
+        deadline = time.time() + (MAX_RETRIES * STITCH_TIMEOUT_SECS)
+        while time.time() < deadline:
+            if _shutdown_event.is_set():
+                break
             try:
                 endpoint, slot_name = endpoint_queue.get(timeout=2.0)
                 break
@@ -2035,14 +1951,14 @@ def parallel_edit_chunks(chunks: List[str]) -> Tuple[str, int]:
         try:
             return semantic_deduplication(chunk_content, chunk_idx + 1, total_chunks, endpoint, slot_name)
         except Exception as exc:
-            print(f"\n    [!] Edit chunk worker failed unexpectedly: {str(exc)[:120]}", flush=True)
+            print(f"\n    [!] Edit segment worker failed unexpectedly: {str(exc)[:120]}", flush=True)
             return chunk_content, False
         finally:
             endpoint_queue.put((endpoint, slot_name))
 
     pool_size = max(1, total_slots)
 
-    print(f"    [*] Semantic Deduplication: Refining {total_chunks} chunk(s) across {pool_size} stitcher slot(s) [{STITCHER_MODEL}]...", flush=True)
+    print(f"    [*] Semantic Deduplication: Refining {total_chunks} segment(s) across {pool_size} stitcher slot(s) [{STITCHER_MODEL}]...", flush=True)
 
     start_time_progress = time.time()
 
@@ -2067,11 +1983,11 @@ def parallel_edit_chunks(chunks: List[str]) -> Tuple[str, int]:
             sys.stdout.flush()
 
     print()
-    
-    if failures > 0:
-        print(f"    [!] {failures} of {total_chunks} chunks passed through unedited.", flush=True)
 
-    return "\n\n".join(results), failures
+    if failures > 0:
+        print(f"    [!] {failures} of {total_chunks} segments passed through unedited.", flush=True)
+
+    return results, failures
 
 def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], endpoint: str) -> Tuple[str, bool]:
     client = stitcher_client(endpoint, max_retries=0)
@@ -2091,7 +2007,7 @@ def section_boundary_smoothing(full_skeleton: str, global_inventory: List[str], 
         except Exception as exc:
             print(f"\n    [!] Section boundary smoothing failed on {endpoint} (attempt {attempt}/2): {str(exc)[:120]}", flush=True)
             time.sleep(2)
-            
+
     print("    [!] Section boundary smoothing exhausted retries. Passing through unedited.", flush=True)
     return full_skeleton, False
 
@@ -2113,7 +2029,7 @@ def header_unification_pass(smoothed_skeleton: str, global_inventory: List[str],
         except Exception as exc:
             print(f"\n    [!] Header unification failed on {endpoint} (attempt {attempt}/2): {str(exc)[:120]}", flush=True)
             time.sleep(2)
-            
+
     print("    [!] Header unification exhausted retries. Passing through unedited.", flush=True)
     return smoothed_skeleton, False
 
@@ -2121,17 +2037,10 @@ def global_consolidation_pass(full_skeleton: str, global_inventory: List[str],
                               endpoint: Optional[str] = None) -> Tuple[str, bool, bool]:
     endpoint = endpoint or next_stitcher_endpoint()
 
-    if len(full_skeleton) > STITCH_ECHO_MAX_CHARS:
-        print("    [!] Skipping executive editor passes: skeleton is {:,} chars but the "
-              "stitcher can only emit ~{:,}. Per-chunk dedup output is kept as-is rather "
-              "than truncating the document.".format(
-                  len(full_skeleton), STITCH_ECHO_MAX_CHARS), flush=True)
-        return full_skeleton, False, False
+    # The STITCH_ECHO_MAX_CHARS check is deliberately lifted to the caller 
+    # to better record telemetry.
 
-    print("    [*] Executive Editor Pass 1: Section Boundary Smoothing...", flush=True)
     smoothed_text, smooth_ok = section_boundary_smoothing(full_skeleton, global_inventory, endpoint)
-
-    print("    [*] Executive Editor Pass 2: Header Unification...", flush=True)
     final_text, unify_ok = header_unification_pass(smoothed_text, global_inventory, endpoint)
 
     missing_placeholders = [p for p in global_inventory if p not in final_text]
@@ -2149,15 +2058,124 @@ def reassemble_document(distilled_text: str, protected_blocks: Dict[str, str]) -
             final_text += f"\n\n### Orphaned Artifact\n{original_content}"
     return final_text
 
+def run_phase4_polish_chunks(chunk_paths: List[Path], run_dir: Path,
+                             skip_executive: bool = False) -> Tuple[List[Path], dict]:
+    """Polish each chunk independently. Returns (polished_paths, stats)."""
+    print("\n[PHASE 4] STARTING PER-CHUNK SYNTHESIS POLISH", flush=True)
+
+    stats = {"chunks": len(chunk_paths), "segments": 0, "dedup_failures": 0,
+             "exec_ok": 0, "exec_skipped": 0, "exec_skipped_size": 0, "passthrough": 0}
+
+    # 1. Read + protect + split every chunk, remembering ownership.
+    per_chunk_protected: List[Dict[str, str]] = []
+    per_chunk_segments: List[List[str]] = []
+    owner_index: List[int] = []
+    flat_segments: List[str] = []
+
+    for c_idx, p in enumerate(chunk_paths):
+        raw = read_file_content_safe(p)
+        if raw is None:
+            print(f"    [!] Could not read {p.name}; skipping.", flush=True)
+            per_chunk_protected.append({})
+            per_chunk_segments.append([])
+            continue
+        skeleton, protected = extract_and_protect_blocks(raw)
+        segments = split_into_logical_chunks(skeleton, MAX_CHUNK_CHARS)
+        if not segments:
+            segments = [skeleton]
+        per_chunk_protected.append(protected)
+        per_chunk_segments.append(segments)
+        for s in segments:
+            flat_segments.append(s)
+            owner_index.append(c_idx)
+
+    stats["segments"] = len(flat_segments)
+    print(f"    [*] {len(chunk_paths)} chunk(s) -> {len(flat_segments)} editable segment(s).", flush=True)
+
+    if not flat_segments:
+        print("    [!] Nothing to polish.", flush=True)
+        return list(chunk_paths), stats
+
+    # 2. One flat parallel dedup pass across all segments.
+    edited_flat, dedup_failures = parallel_edit_chunks(flat_segments)
+    stats["dedup_failures"] = dedup_failures
+
+    # 3. Regroup by owning chunk, optionally run the executive editor, reassemble.
+    regrouped: Dict[int, List[str]] = {}
+    for seg_text, owner in zip(edited_flat, owner_index):
+        regrouped.setdefault(owner, []).append(seg_text)
+
+    polished_paths: List[Path] = []
+    for c_idx, p in enumerate(chunk_paths):
+        segs = regrouped.get(c_idx, [])
+        protected = per_chunk_protected[c_idx]
+        if not segs:
+            polished_paths.append(p)
+            stats["passthrough"] += 1
+            continue
+
+        skeleton = "\n\n".join(segs)
+        inventory = list(protected.keys())
+
+        if skip_executive or len(segs) <= 1:
+            final_skeleton = skeleton
+            stats["exec_skipped"] += 1
+        elif len(skeleton) > STITCH_ECHO_MAX_CHARS:
+            print(f"    [!] Skipping executive editor passes for {p.name}: skeleton is {len(skeleton):,} chars "
+                  f"but the stitcher can only ingest ~{STITCH_ECHO_MAX_CHARS:,}.", flush=True)
+            final_skeleton = skeleton
+            stats["exec_skipped_size"] += 1
+            stats["exec_skipped"] += 1
+        else:
+            final_skeleton, smooth_ok, unify_ok = global_consolidation_pass(skeleton, inventory)
+            if smooth_ok and unify_ok:
+                stats["exec_ok"] += 1
+            else:
+                stats["exec_skipped"] += 1
+
+        final_md = reassemble_document(final_skeleton, protected)
+        out_path = p.parent / f"{p.stem}_polished.md"
+        with open(out_path, "w", encoding="ascii") as f:
+            f.write(enforce_ascii(final_md).strip() + "\n")
+        polished_paths.append(out_path)
+        print(f"    [+] Polished {p.name} -> {out_path.name} ({out_path.stat().st_size:,} bytes)", flush=True)
+
+    return polished_paths, stats
+
+def build_polish_manifest(polished_paths: List[Path], stats: dict) -> str:
+    total = sum(p.stat().st_size for p in polished_paths if p.exists())
+    lines = ["# Polished Synthesis Manifest", ""]
+    lines.append(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- **Chunks polished:** {len(polished_paths)}")
+    lines.append(f"- **Editable segments processed:** {stats.get('segments', 0)}")
+    lines.append(f"- **Segments passed through unedited:** {stats.get('dedup_failures', 0)}")
+    lines.append(f"- **Executive editor applied:** {stats.get('exec_ok', 0)} chunk(s)")
+    lines.append(f"- **Executive editor skipped:** {stats.get('exec_skipped', 0)} chunk(s)")
+    lines.append(f"- **Executive editor skipped (size limit):** {stats.get('exec_skipped_size', 0)} chunk(s)")
+    lines.append(f"- **Total polished corpus:** {total:,} bytes")
+    lines.append("")
+    lines.append("## Polished Chunk Index")
+    lines.append("")
+    lines.append("| # | File | Bytes |")
+    lines.append("|---|------|-------|")
+    for idx, p in enumerate(polished_paths, start=1):
+        size = p.stat().st_size if p.exists() else 0
+        lines.append(f"| {idx} | `{CHUNKS_DIRNAME}/{p.name}` | {size:,} |")
+    lines.append("")
+    return enforce_ascii("\n".join(lines))
+
 # ==============================================================================
-# Phase 5: Automatic Unittests
+# Phase 5: Automatic Unittests (harvests artifacts from every chunk)
 # ==============================================================================
 
 def _format_execution_report_as_markdown(report_data: list) -> str:
     if not report_data: return ""
-    lines = ["## Test Execution Status\n", "| Artifact | Language | Status | Detail |", "|---|---|---|---|"]
+    lines = ["## Test Execution Status\n", "| Chunk | Artifact | Language | Status | Detail |", "|---|---|---|---|---|"]
     for res in report_data:
-        lines.append(f"| {res.get('filename', '')} | {res.get('language', '')} | **{res.get('status', '')}** | {res.get('message', '')} |")
+        lines.append(
+            f"| {res.get('chunk', '')} | {res.get('filename', '')} | {res.get('language', '')} | "
+            f"**{res.get('status', '')}** | {res.get('message', '')} |"
+        )
     return "\n".join(lines) + "\n\n"
 
 def _safe_output_path(detected_filename: str, output_dir: Path, seen_paths: Set[str]) -> Path:
@@ -2246,13 +2264,13 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
     while i < len(lines):
         line = lines[i]
 
-        if "</file>" in line:
+        if "</file>" in line and not in_block:
             detected_filename = None
             i += 1
             continue
 
         xml_match = re.search(r'<file path="([^"]+)">', line)
-        if xml_match:
+        if xml_match and not in_block:
             if detected_filename is not None:
                 print(f"    [!] Warning: Missing </file>. Overwriting filename '{detected_filename}' with '{xml_match.group(1)}'.", flush=True)
             detected_filename = xml_match.group(1)
@@ -2329,14 +2347,22 @@ def extract_code_blocks(md_content: str, output_dir: Union[str, Path]) -> list:
             f.write(content + "\n")
     return extracted_artifacts
 
-def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, test_output_dir: Path, progress_lock: threading.Lock, progress_state: dict) -> Optional[dict]:
+def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, test_output_dir: Path,
+                                  progress_lock: threading.Lock, progress_state: dict) -> Optional[dict]:
     if artifact["language"].lower() not in {"python", "py", "cpp", "c", "bash", "sh"}:
-        print(f"    [!] Skipping unsupported unit-test language generation: {artifact['language']}", flush=True)
         return None
 
-    try:
-        endpoint_url = endpoint_queue.get(timeout=5.0)
-    except queue.Empty:
+    endpoint_url = None
+    deadline = time.time() + (MAX_RETRIES * TEST_TIMEOUT_SECS)
+    while time.time() < deadline:
+        if _shutdown_event.is_set():
+            break
+        try:
+            endpoint_url = endpoint_queue.get(timeout=5.0)
+            break
+        except queue.Empty:
+            continue
+    if endpoint_url is None:
         return None
 
     try:
@@ -2369,7 +2395,6 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                 choices = result.get("choices")
 
                 if not choices:
-                    print(f"    [!] Endpoint {endpoint_url} returned no choices (attempt {attempt}). Raw: {result}", flush=True)
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
                         continue
@@ -2383,9 +2408,11 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                     return None
 
                 test_code = enforce_ascii(_strip_markdown_fences(test_code))
-                test_output_dir.mkdir(parents=True, exist_ok=True)
+                chunk_tag = artifact.get("chunk", "chunk")
+                chunk_test_dir = test_output_dir / chunk_tag
+                chunk_test_dir.mkdir(parents=True, exist_ok=True)
                 test_filename = f"test_{artifact['filename']}"
-                test_filepath = test_output_dir / test_filename
+                test_filepath = chunk_test_dir / test_filename
 
                 with open(test_filepath, "w", encoding="ascii") as f:
                     f.write(test_code + "\n")
@@ -2393,13 +2420,15 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
                 with progress_lock:
                     progress_state["done"] += 1
                     eta_str = _format_eta(progress_state["start_time"], progress_state["done"], progress_state["total"])
-                    print(f"    [+] [{endpoint_url}] Generated tests ({progress_state['done']}/{progress_state['total']}) | ETC: {eta_str} -> {test_filename}")
+                    print(f"    [+] Generated tests ({progress_state['done']}/{progress_state['total']}) "
+                          f"| ETC: {eta_str} -> {chunk_tag}/{test_filename}", flush=True)
 
                 generation_metadata = {
                     "filename": test_filename,
                     "test_filepath": str(test_filepath),
                     "language": artifact["language"],
                     "artifact_filepath": artifact["filepath"],
+                    "chunk": chunk_tag,
                 }
                 break
 
@@ -2415,7 +2444,8 @@ def execute_test_artifact(test_meta: dict) -> dict:
     lang = test_meta["language"].lower()
     test_path = Path(test_meta["test_filepath"]).resolve()
     artifact_path = Path(test_meta["artifact_filepath"]).resolve()
-    result = {"filename": test_meta["filename"], "language": lang, "status": "UNKNOWN", "message": ""}
+    result = {"filename": test_meta["filename"], "language": lang,
+              "status": "UNKNOWN", "message": "", "chunk": test_meta.get("chunk", "")}
     try:
         if lang in ("python", "py"):
             env = os.environ.copy()
@@ -2470,15 +2500,17 @@ def execute_test_artifact(test_meta: dict) -> dict:
         result["status"], result["message"] = "ERROR", str(exc)
     return result
 
-def run_phase5_automatic_unittests(source_path: Path):
+def run_phase5_automatic_unittests(source_paths: List[Path], workspace: Path):
     print(f"\n[PHASE 5] STARTING AUTOMATED UNITTEST PIPELINE", flush=True)
-    if not source_path.exists():
-        print(f"Error: Could not find {source_path}.", flush=True)
+
+    source_paths = [p for p in source_paths if p.exists()]
+    if not source_paths:
+        print("Error: No source chunks available for artifact extraction.", flush=True)
         return
-    OUTPUT_WORKSPACE = source_path.parent
-    EXTRACTED_ARTIFACTS_DIR = OUTPUT_WORKSPACE / "artifacts" / "extracted"
-    TEST_OUTPUT_DIR = OUTPUT_WORKSPACE / "tests"
-    REPORT_OUTPUT_DIR = OUTPUT_WORKSPACE / "reports"
+
+    EXTRACTED_ARTIFACTS_DIR = workspace / "artifacts" / "extracted"
+    TEST_OUTPUT_DIR = workspace / "tests"
+    REPORT_OUTPUT_DIR = workspace / "reports"
 
     endpoint_concurrency = CONCURRENT_REQS_PER_ENDPOINT
     total_gen_workers = len(TEST_WORKER_ENDPOINTS) * endpoint_concurrency
@@ -2487,17 +2519,33 @@ def run_phase5_automatic_unittests(source_path: Path):
         for _ in range(endpoint_concurrency):
             endpoint_queue.put(ep)
 
-    md_content = read_file_content_safe(source_path)
-    if md_content is None:
-        print(f"Error: Could not read {source_path}.", flush=True)
-        return
+    # Harvest artifacts from EVERY chunk, keeping them namespaced per chunk.
+    all_artifacts: list = []
+    for p in source_paths:
+        md_content = read_file_content_safe(p)
+        if md_content is None:
+            print(f"    [!] Could not read {p.name}; skipping.", flush=True)
+            continue
 
-    if re.search(r'\[\[PROTECTED_[A-Z_]+\d+\]\]', md_content):
-        print("    [!] WARNING: POLISHED_SYNTHESIS.md contains unresolved placeholder tokens. Phase 4 reassembly may have failed.", flush=True)
+        if re.search(r'\[\[PROTECTED_[A-Z_]+\d+\]\]', md_content):
+            print(f"    [!] WARNING: {p.name} contains unresolved placeholder tokens. "
+                  "Phase 4 reassembly may have failed for this chunk.", flush=True)
 
-    artifacts = extract_code_blocks(md_content, EXTRACTED_ARTIFACTS_DIR)
+        chunk_tag = re.sub(r'_polished$', '', p.stem)
+        chunk_out = EXTRACTED_ARTIFACTS_DIR / chunk_tag
+        found = extract_code_blocks(md_content, chunk_out)
+        for a in found:
+            a["chunk"] = chunk_tag
+        all_artifacts.extend(found)
+        print(f"    [+] {p.name}: extracted {len(found)} code artifact(s).", flush=True)
+
     valid_langs = {"python", "py", "cpp", "c", "bash", "sh"}
-    testable_artifacts = [a for a in artifacts if a["language"].lower() in valid_langs]
+    testable_artifacts = [a for a in all_artifacts if a["language"].lower() in valid_langs]
+    print(f"    [*] {len(all_artifacts)} artifact(s) total, {len(testable_artifacts)} testable.", flush=True)
+
+    if not testable_artifacts:
+        print("    [!] No testable artifacts found across any chunk.", flush=True)
+        return
 
     progress_lock = threading.Lock()
     progress_state = {"done": 0, "total": len(testable_artifacts), "start_time": time.time()}
@@ -2505,7 +2553,9 @@ def run_phase5_automatic_unittests(source_path: Path):
     generated_tests: list = []
 
     try:
-        futures = [executor.submit(request_unittests_from_worker, artifact, endpoint_queue, TEST_OUTPUT_DIR, progress_lock, progress_state) for artifact in testable_artifacts]
+        futures = [executor.submit(request_unittests_from_worker, artifact, endpoint_queue,
+                                   TEST_OUTPUT_DIR, progress_lock, progress_state)
+                   for artifact in testable_artifacts]
         for future in concurrent.futures.as_completed(futures):
             try:
                 test_meta = future.result()
@@ -2516,26 +2566,27 @@ def run_phase5_automatic_unittests(source_path: Path):
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    req_files = [a for a in artifacts if "requirements" in a["filename"].lower() and a["filename"].endswith(".txt")]
+    req_files = [a for a in all_artifacts if "requirements" in a["filename"].lower() and a["filename"].endswith(".txt")]
     for req in req_files:
         req_path = Path(req["filepath"]).resolve()
         _sanitize_requirements_file(req_path)
         try:
-            res = subprocess.run(["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)], capture_output=True, encoding="ascii", errors="ignore", timeout=120)
+            res = subprocess.run(["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
+                                 capture_output=True, encoding="ascii", errors="ignore", timeout=120)
             if res.returncode != 0:
-                print(f"    [!] Warning: pip install failed for {req['filename']}. Stderr:\n{res.stderr}", flush=True)
+                print(f"    [!] Warning: pip install failed for {req['filename']}.", flush=True)
         except Exception as e:
             print(f"    [!] Warning: pip install exception for {req['filename']}: {e}", flush=True)
 
     execution_results: list = []
     if generated_tests:
+        print(f"    [*] Executing {len(generated_tests)} generated test file(s)...", flush=True)
         exec_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_EXEC_WORKERS)
         try:
             exec_futures = [exec_executor.submit(execute_test_artifact, tm) for tm in generated_tests]
             for future in concurrent.futures.as_completed(exec_futures):
                 try:
-                    res = future.result()
-                    execution_results.append(res)
+                    execution_results.append(future.result())
                 except Exception:
                     pass
         finally:
@@ -2544,13 +2595,17 @@ def run_phase5_automatic_unittests(source_path: Path):
     if execution_results:
         REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         json_report_path = REPORT_OUTPUT_DIR / "execution_report.json"
-        csv_report_path  = REPORT_OUTPUT_DIR / "execution_report.csv"
+        csv_report_path = REPORT_OUTPUT_DIR / "execution_report.csv"
         with open(json_report_path, "w", encoding="ascii") as f:
             json.dump(execution_results, f, indent=4)
         with open(csv_report_path, "w", newline="", encoding="ascii") as f:
             writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(execution_results)
+
+        passed = sum(1 for r in execution_results if r["status"] == "PASSED")
+        print(f"    [+] Test execution complete: {passed}/{len(execution_results)} passed. "
+              f"Reports in {REPORT_OUTPUT_DIR}", flush=True)
 
 # ==============================================================================
 # Phase 6: Todo Project Distillation
@@ -2560,9 +2615,10 @@ def run_phase6_project_distillation(project_dir: Path, iterate: bool = False):
     print(f"\n[PHASE 6] STARTING PROJECT DISTILLATION", flush=True)
     project_name = project_dir.name
 
-    # Note: We intentionally exclude synthesized outputs so Phase 6 bases its 
-    # tasks purely on the raw ingested code (Phase 1) and test execution reports.
-    exclude_dirs = {"tests", "tasks", "artifacts", "reports"}
+    # Phase 6 bases its tasks on the raw ingested source (Phase 0/1) plus test
+    # telemetry. The synthesized chunks are excluded: they are derived output and
+    # would swamp the stitcher input window.
+    exclude_dirs = {"tests", "tasks", "artifacts", "reports", CHUNKS_DIRNAME}
     p6_exclude_names = {"DISTILLED_TASKS", "project_state", "FINAL_SYNTHESIS", "POLISHED_SYNTHESIS"}
 
     existing_tasks = ""
@@ -2589,7 +2645,7 @@ def run_phase6_project_distillation(project_dir: Path, iterate: bool = False):
 
             if file_path.stem in p6_exclude_names:
                 continue
-                
+
             if file_path.name.endswith("_distilled.md"):
                 continue
 
@@ -2696,6 +2752,8 @@ def main():
     parser.add_argument("-c", "--category", type=str, default="projects", help="Category folder.")
     parser.add_argument("-r", "--resume", action="store_true", help="Resume pipeline from the furthest completed artifact in the target directory.")
     parser.add_argument("--iterate", action="store_true", help="Enable iterative distillation for Phase 6.")
+    parser.add_argument("--no-polish", action="store_true", help="Skip Phase 4 entirely; test the raw synthesis chunks.")
+    parser.add_argument("--no-executive", action="store_true", help="Run per-segment dedup but skip the two executive editor passes.")
 
     args = parser.parse_args()
 
@@ -2770,7 +2828,7 @@ def main():
     if args.resume:
         md_files = list(target_directory.glob("*.md"))
         valid_raw = [
-            f for f in md_files 
+            f for f in md_files
             if re.match(r'^\d{8}_\d{6}_.*\.md$', f.name) and not f.name.endswith('_distilled.md')
         ]
 
@@ -2787,6 +2845,7 @@ def main():
             print("[!] Resume flag passed but no valid base raw file found in target directory. Aborting.")
             sys.exit(1)
 
+    # ---------------- Phase 1 / Phase 0 ----------------
     if args.resume and raw_filepath and raw_filepath.exists():
         print(f"[PHASE 1] Bypassed. Resuming from existing raw file: {raw_filepath.name}")
     elif args.git:
@@ -2797,6 +2856,7 @@ def main():
             sys.exit(1)
         raw_filepath = generate_content(target_prompt, target_directory)
 
+    # ---------------- Phase 2 ----------------
     if args.resume and distilled_filepath and distilled_filepath.exists():
         print(f"[PHASE 2] Bypassed. Resuming from existing distilled file: {distilled_filepath.name}")
     else:
@@ -2804,7 +2864,7 @@ def main():
             print("\n[!] Apex tier offline; Phase 2 distillation cannot run. "
                   "Re-run with -r once 8081 is healthy.", flush=True)
             sys.exit(1)
-            
+
         raw_content = read_file_content_safe(raw_filepath)
         if raw_content is None:
             print(f"[!] Fatal: Could not read {raw_filepath}.", flush=True)
@@ -2812,8 +2872,11 @@ def main():
         actionable_tasks = distill_document(raw_content)
         distilled_filepath = save_distilled_output(actionable_tasks, raw_filepath)
 
-    if args.resume and final_file_path.exists():
-        print(f"[PHASE 3] Bypassed. Resuming from existing FINAL_SYNTHESIS.md")
+    # ---------------- Phase 3 ----------------
+    existing_chunks = list_chunk_files(target_directory, polished=False)
+    if args.resume and existing_chunks and final_file_path.exists():
+        print(f"[PHASE 3] Bypassed. Resuming from {len(existing_chunks)} existing chunk(s).")
+        chunk_paths = existing_chunks
     else:
         target_query = read_file_content_safe(distilled_filepath)
         if target_query is None:
@@ -2824,7 +2887,7 @@ def main():
         fragments, p_tok, c_tok = decompose_to_atomic_pieces(target_query)
 
         export_to_split_files(fragments, target_directory)
-        (final_output, w_p, w_c, syn_p, syn_c, s_p, s_c, worker_stats) = execute_continuous_map_reduce(
+        (chunk_paths, w_p, w_c, syn_p, syn_c, worker_stats) = execute_continuous_map_reduce(
             fragments, target_query, target_directory, decomp_p_tok=p_tok, decomp_c_tok=c_tok)
 
         master_elapsed_time = time.time() - master_start_time
@@ -2833,85 +2896,47 @@ def main():
         if truncated_count > 0:
             print(f"    [!] WARNING: {truncated_count} workers were truncated due to exceeding MAX_WALL_SECS.", flush=True)
 
-        stats_md = "\n\n---\n## Execution Telemetry\n### Worker Execution Statistics\n"
-        stats_md += "| Worker ID | Slot | Status | Elapsed (s) | Task TPS | Prompt Tokens | Comp Tokens | Total Tokens | Estimated | Truncated |\n"
-        stats_md += "|-----------|------|--------|-------------|----------|---------------|-------------|--------------|-----------|-----------|\n"
-        for stat in sorted(worker_stats, key=lambda x: x['id']):
-            estimated_flag = "Yes" if stat.get('is_estimated') else "No"
-            truncated_flag = "Yes" if stat.get('truncated') else "No"
-            stats_md += f"| Thread{stat['id']:02d} | {stat.get('slot', 'N/A')} | {stat['status']} | {stat.get('elapsed', 0)} | {stat.get('tps', 0)} | {stat.get('prompt_tokens', 0)} | {stat.get('completion_tokens', 0)} | {stat.get('total_tokens', 0)} | {estimated_flag} | {truncated_flag} |\n"
-
-        agg_md = "\n### Cluster Aggregate Statistics\n"
-        agg_md += f"- **Total Wall-Clock Time:** {master_elapsed_time:.2f} seconds\n"
-        agg_md += f"- **Worker Prompt Tokens:** {w_p}\n"
-        agg_md += f"- **Worker Completion Tokens:** {w_c}\n"
-        agg_md += f"- **Stitcher Synthesis + Decomposition Prompt Tokens:** {syn_p}\n"
-        agg_md += f"- **Stitcher Synthesis + Decomposition Completion Tokens:** {syn_c}\n"
-        agg_md += f"- **Stitcher Tree-Reduction Prompt Tokens:** {s_p}\n"
-        agg_md += f"- **Stitcher Tree-Reduction Completion Tokens:** {s_c}\n"
-        agg_md += f"- **Stitcher Total Prompt Tokens:** {syn_p + s_p}\n"
-        agg_md += f"- **Stitcher Total Completion Tokens:** {syn_c + s_c}\n"
-        agg_md += f"- **Worker Model:** {WORKER_MODEL}\n"
-        agg_md += f"- **Stitcher Model:** {STITCHER_MODEL}\n"
-        agg_md += f"- **Stitcher Endpoints:** {', '.join(STITCHER_ENDPOINTS)} "
-        agg_md += f"(x{STITCH_PARALLEL_SLOTS} slot(s))\n"
-        agg_md += f"- **Stitcher Budget:** {describe_stitch_budget()}\n"
-        agg_md += f"- **Workers Truncated (wall clock):** {truncated_count} of {len(worker_stats)}\n"
-
-        final_output += stats_md + agg_md
-
+        manifest = build_synthesis_manifest(
+            chunk_paths, worker_stats, target_query, master_elapsed_time,
+            w_p, w_c, syn_p, syn_c, truncated_count
+        )
         with open(final_file_path, "w", encoding="ascii") as f:
-            f.write(final_output)
+            f.write(manifest)
+        print(f"[+] Synthesis manifest written to {final_file_path.name} "
+              f"({len(chunk_paths)} chunk(s) indexed).", flush=True)
 
-    if args.resume and output_path.exists():
-        print(f"[PHASE 4] Bypassed. Resuming from existing POLISHED_SYNTHESIS.md")
+    # ---------------- Phase 4 ----------------
+    existing_polished = [p for p in chunks_dir_for(target_directory).glob("chunk_*_polished.md")]
+    if args.no_polish:
+        print("\n[PHASE 4] Skipped by --no-polish. Using raw synthesis chunks downstream.")
+        source_paths = chunk_paths
+    elif args.resume and existing_polished and output_path.exists():
+        print(f"[PHASE 4] Bypassed. Resuming from {len(existing_polished)} polished chunk(s).")
+        source_paths = list_chunk_files(target_directory, polished=True)
     else:
-        print("\n[PHASE 4] STARTING DISTRIBUTED SYNTHESIS POLISH", flush=True)
-        raw_markdown = read_file_content_safe(final_file_path)
-        if raw_markdown is None:
-            print(f"[!] Fatal: Could not read {final_file_path}.", flush=True)
-            sys.exit(1)
+        source_paths, polish_stats = run_phase4_polish_chunks(
+            chunk_paths, target_directory, skip_executive=args.no_executive
+        )
+        with open(output_path, "w", encoding="ascii") as f:
+            f.write(build_polish_manifest(source_paths, polish_stats))
+        print(f"[+] Polish manifest written to {output_path.name}", flush=True)
 
-        skeleton_text, protected_assets = extract_and_protect_blocks(raw_markdown)
-        chunks = split_into_logical_chunks(skeleton_text, MAX_CHUNK_CHARS)
-
-        if len(chunks) <= 1:
-            with open(output_path, "w", encoding="ascii") as f:
-                f.write(raw_markdown)
-            print(f"[+] Document fits in single chunk. Bypassed LLM refinement. Saved to {output_path}")
-        else:
-            distilled_skeleton, dedup_failures = parallel_edit_chunks(chunks)
-            global_inventory = [k for k in protected_assets.keys() if k != "[[PROTECTED_TELEMETRY_TABLE]]"]
-            final_skeleton, smooth_ok, unify_ok = global_consolidation_pass(distilled_skeleton, global_inventory)
-            final_polished_markdown = reassemble_document(final_skeleton, protected_assets)
-
-            if dedup_failures == len(chunks) and not smooth_ok and not unify_ok:
-                print("    [!] WARNING: Every Phase 4 pass failed. POLISHED_SYNTHESIS.md is "
-                      "effectively a copy of FINAL_SYNTHESIS.md.", flush=True)
-            elif dedup_failures or not smooth_ok or not unify_ok:
-                print("    [!] Phase 4 partially degraded: {}/{} chunks unedited, "
-                      "smoothing={}, unification={}.".format(
-                          dedup_failures, len(chunks),
-                          "ok" if smooth_ok else "FAILED",
-                          "ok" if unify_ok else "FAILED"), flush=True)
-
-            with open(output_path, "w", encoding="ascii") as f:
-                f.write(final_polished_markdown)
-            print(f"[+] Cleaned File Saved To: {output_path.absolute()}")
-
+    # ---------------- Phase 5 ----------------
     if args.resume and report_path.exists():
         print(f"[PHASE 5] Bypassed. Resuming from existing execution_report.json")
     else:
-        source_for_tests = output_path if output_path.exists() else final_file_path
-        run_phase5_automatic_unittests(source_for_tests)
+        run_phase5_automatic_unittests(source_paths, target_directory)
 
+    # ---------------- Phase 6 ----------------
     if args.resume and distilled_tasks_path.exists() and not args.iterate:
         print(f"\n[PHASE 6] Bypassed. DISTILLED_TASKS.md already exists. Use --iterate to force re-run.")
     else:
-        run_phase6_project_distillation(output_path.parent, iterate=args.iterate)
+        run_phase6_project_distillation(target_directory, iterate=args.iterate)
 
     print("\n==============================================================================")
     print("PIPELINE COMPLETE")
+    print(f"  Chunks:    {chunks_dir_for(target_directory)}")
+    print(f"  Manifests: {final_file_path.name}, {output_path.name}")
     print("==============================================================================\n")
 
 if __name__ == "__main__":
