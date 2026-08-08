@@ -31,6 +31,7 @@ You must provide exactly one of the following input methods, or use the resume f
 ### Output Configurations
 - `-d DIR`, `--dir DIR`: Base directory for storing all outputs. (Default: `run_data`)
 - `-c CATEGORY`, `--category CATEGORY`: Category folder name within the base directory to organize runs logically. (Default: `projects`)
+- `--iterate`: Enable iterative distillation for Phase 6.
 
 ### Example Commands
 **Analyze a Git Repository:**
@@ -71,7 +72,7 @@ Acts as an executive editor. The massive document generated in Phase 3 is split 
 Extracts all embedded code blocks from the Phase 4 document. The worker swarm rapidly generates succinct unit tests for Python, C/C++, and Bash artifacts. It then executes these tests in isolated subprocesses and compiles a telemetry report (JSON/CSV) of successes and failures.
 
 ### Phase 6: Todo Project Distillation
-Reads the finalized documentation alongside the test execution telemetry from Phase 5. It performs a final distillation pass to produce an actionable `DISTILLED_TASKS.md` list, automatically elevating failed unit tests into high-priority actionable tasks embedded with the failing source code.
+Reads the finalized documentation alongside the test execution telemetry from Phase 5. It performs a final distillation pass to produce an actionable `DISTILLED_TASKS.md` list, automatically elevating failed unit tests into high-priority actionable tasks embedded with the failing source code. If the `--iterate` flag is provided, it enables iterative distillation to append to an existing `DISTILLED_TASKS.md` file based on new telemetry.
 
 ## Output Structure
 
