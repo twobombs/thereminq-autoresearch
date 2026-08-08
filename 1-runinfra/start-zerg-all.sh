@@ -1,19 +1,30 @@
 # this script starts all requirements for autoresearch to start on a six gpu machine
 
+# Context budget contract (keep in sync with autoresearch-core-onefile.py)
+#   With --kv-unified, -c is a SHARED KV pool: safe per-request window = -c / -np.
+#   apex     :8081  -c 65536  -np 1 -> 64k/req   (APEX_SERVER_CTX/NP)
+#   stitchers:8070/1 -c 196608 -np 2 -> 96k/req  (STITCH_SERVER_CTX/NP)
+#   workers  :8033/4 -c 196608 -np 2 -> 96k/req  (WORKER_SERVER_CTX/NP)
+#   gemma-4-E4B native window is 128k; 192k is only reachable by a lone sequence.
+
+
 # 27B 'Apex' substitute - replace with GLM or fronteer Qwen variant
 GGML_VK_VISIBLE_DEVICES=0,4 /root/llama-vulkan/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.6-27B-UD-IQ3_XXS.gguf   --tools all   -c 65536   -np 1   -ngl 999   --load-mode mmap   -fa on   -t 48   -tb 48   --reasoning on   --reasoning-preserve   --host 0.0.0.0   --port 8081   --cors-origins "*"   -ctk q8_0   -ctv q4_0   --spec-type draft-mtp   --spec-draft-n-max 3 &
 
+# NOTE: port 8082 is NOT referenced by autoresearch-core-onefile.py.
+# To actually use it: export OPENAI_API_BASE=http://localhost:8082/v1 \
+#   DISTILLER_URL=http://localhost:8082/v1 APEX_SERVER_CTX=131072
 # as an alternative we leverage the CPU for the large model to give room for the workers 
 # the 'apex' model does not need to do a whole lot so this helps a lot of GPU idle time
 GGML_VK_VISIBLE_DEVICES=2,5 /root/llama-vulkan-cpu/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-122B-A10B-UD/Qwen3.5-122B-A10B-UD-IQ1_M.gguf   --tools all   -c 131072   -np 1   -ngl 0   --load-mode mmap   -fa on   -t 48   -tb 48   --reasoning on   --reasoning-preserve   --host 0.0.0.0   --port 8082   --cors-origins "*"   -ctk q8_0   -ctv q4_0   --spec-type draft-mtp   --spec-draft-n-max 5 &
 
 # stitcher workers 
-GGML_VK_VISIBLE_DEVICES=2 /root/llama-vulkan-stitcher1/build/bin/llama-server   -m /media/aryan/nvme/models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   --model-draft /media/aryan/nvme/models/mtp-gemma-4-E4B-it-Q4_0.gguf   -c 131072   --no-cache-idle-slots   -np 2   -ngl 999   --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0   --load-mode none   --spec-type draft-mtp   --spec-draft-n-max 5   --host 0.0.0.0   --port 8070   --tools all   --fit off   --jinja &
-GGML_VK_VISIBLE_DEVICES=5 /root/llama-vulkan-stitcher2/build/bin/llama-server   -m /media/aryan/nvme/models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   --model-draft /media/aryan/nvme/models/mtp-gemma-4-E4B-it-Q4_0.gguf   -c 131072   --no-cache-idle-slots   -np 2   -ngl 999   --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0   --load-mode none   --spec-type draft-mtp   --spec-draft-n-max 5   --host 0.0.0.0   --port 8071   --tools all   --fit off   --jinja &
+GGML_VK_VISIBLE_DEVICES=2 /root/llama-vulkan-stitcher1/build/bin/llama-server   -m /media/aryan/nvme/models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   --model-draft /media/aryan/nvme/models/mtp-gemma-4-E4B-it-Q4_0.gguf   -c 196608   --no-cache-idle-slots   -np 2   -ngl 999   --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0   --load-mode none   --spec-type draft-mtp   --spec-draft-n-max 5   --host 0.0.0.0   --port 8070   --tools all   --fit off   --jinja &
+GGML_VK_VISIBLE_DEVICES=5 /root/llama-vulkan-stitcher2/build/bin/llama-server   -m /media/aryan/nvme/models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   --model-draft /media/aryan/nvme/models/mtp-gemma-4-E4B-it-Q4_0.gguf   -c 196608   --no-cache-idle-slots   -np 2   -ngl 999   --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0   --load-mode none   --spec-type draft-mtp   --spec-draft-n-max 5   --host 0.0.0.0   --port 8071   --tools all   --fit off   --jinja &
 
 # workers
-GGML_VK_VISIBLE_DEVICES=3 /root/llama-vulkan-worker1/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-9B-IQ4_XS.gguf   -c 196608  --no-cache-idle-slots  -np 1   -ngl 999  --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0    --no-mmap   --spec-type draft-mtp   --spec-draft-n-max 3   --host 0.0.0.0   --port 8033   --tools all   --fit off --jinja &
-GGML_VK_VISIBLE_DEVICES=1 /root/llama-vulkan-worker2/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-9B-IQ4_XS.gguf   -c 196608  --no-cache-idle-slots  -np 1   -ngl 999  --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0    --no-mmap   --spec-type draft-mtp   --spec-draft-n-max 3   --host 0.0.0.0   --port 8034   --tools all   --fit off --jinja &
+GGML_VK_VISIBLE_DEVICES=3 /root/llama-vulkan-worker1/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-9B-IQ4_XS.gguf   -c 196608  --no-cache-idle-slots  -np 2   -ngl 999  --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0    --no-mmap   --spec-type draft-mtp   --spec-draft-n-max 3   --host 0.0.0.0   --port 8033   --tools all   --fit off --jinja &
+GGML_VK_VISIBLE_DEVICES=1 /root/llama-vulkan-worker2/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-9B-IQ4_XS.gguf   -c 196608  --no-cache-idle-slots  -np 2   -ngl 999  --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0    --no-mmap   --spec-type draft-mtp   --spec-draft-n-max 3   --host 0.0.0.0   --port 8034   --tools all   --fit off --jinja &
 
 # orchestrators are deprecated
 # GGML_VK_VISIBLE_DEVICES=2 /root/llama-vulkan-orchestrator/build/bin/llama-server   -m /media/aryan/nvme/models/nvidia_Orchestrator-8B-Q5_K_S.gguf   -ngl 99  --no-cache-idle-slots --cache-ram 0 -c 40960   -b 512   -ub 512   --parallel 1   --no-mmap   --tools all   --jinja   --kv-unified   -fa on   -ctk q8_0   -ctv q4_0   -fit off   --host 0.0.0.0   --port 8080 &
