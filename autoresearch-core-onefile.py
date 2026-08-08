@@ -87,7 +87,7 @@ _REPO_EXT_LANG_MAP = {
 # Phase 1: Raw Generation Config
 GEN_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8081/v1")
 GEN_API_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.5-122B-A10B-UD-IQ1_M.gguf")
+LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-27B-UD-IQ3_XXS.gguf")
 
 # Unified Context Limits
 MAX_CONTEXT_CHARS = 60000
@@ -95,7 +95,7 @@ MAX_CHUNK_CHARS = 40000
 
 # Phase 2: Distillation Config
 DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:8081/v1")
-DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.5-122B-A10B-UD-IQ1_M.gguf")
+DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.6-27B-UD-IQ3_XXS.gguf")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
 # Phase 3 & 4: Unified Stitcher Cluster
