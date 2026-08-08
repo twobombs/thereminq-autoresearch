@@ -5,7 +5,7 @@ GGML_VK_VISIBLE_DEVICES=0,4 /root/llama-vulkan/build/bin/llama-server   -m /medi
 
 # as an alternative we leverage the CPU for the large model to give room for the workers 
 # the 'apex' model does not need to do a whole lot so this helps a lot of GPU idle time
-GGML_VK_VISIBLE_DEVICES=2,5 /root/llama-vulkan/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-122B-A10B-UD/Qwen3.5-122B-A10B-UD-IQ1_M.gguf   --tools all   -c 131072   -np 1   -ngl 0   --load-mode mmap   -fa on   -t 48   -tb 48   --reasoning on   --reasoning-preserve   --host 0.0.0.0   --port 8081   --cors-origins "*"   -ctk q8_0   -ctv q4_0   --spec-type draft-mtp   --spec-draft-n-max 5 &
+GGML_VK_VISIBLE_DEVICES=2,5 /root/llama-vulkan-cpu/build/bin/llama-server   -m /media/aryan/nvme/models/Qwen3.5-122B-A10B-UD/Qwen3.5-122B-A10B-UD-IQ1_M.gguf   --tools all   -c 131072   -np 1   -ngl 0   --load-mode mmap   -fa on   -t 48   -tb 48   --reasoning on   --reasoning-preserve   --host 0.0.0.0   --port 8082   --cors-origins "*"   -ctk q8_0   -ctv q4_0   --spec-type draft-mtp   --spec-draft-n-max 5 &
 
 # stitcher workers 
 GGML_VK_VISIBLE_DEVICES=2 /root/llama-vulkan-stitcher1/build/bin/llama-server   -m /media/aryan/nvme/models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   --model-draft /media/aryan/nvme/models/mtp-gemma-4-E4B-it-Q4_0.gguf   -c 196608   --no-cache-idle-slots   -np 2   -ngl 999   --kv-unified   -fa on   --split-mode none   --cache-type-k q8_0   --cache-type-v q4_0   --load-mode none   --spec-type draft-mtp   --spec-draft-n-max 5   --host 0.0.0.0   --port 8070   --tools all   --fit off   --jinja &
