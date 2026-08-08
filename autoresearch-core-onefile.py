@@ -106,10 +106,10 @@ _REPO_EXT_LANG_MAP = {
 APEX_SERVER_CTX = int(os.getenv("APEX_SERVER_CTX", "65536"))
 APEX_SERVER_NP = int(os.getenv("APEX_SERVER_NP", "1"))
 
-# Stitcher cluster (ports 8070, 8071): -c 196608 -np 2 --kv-unified
-STITCH_SERVER_CTX = int(os.getenv("STITCH_SERVER_CTX", "196608"))
+# Stitcher cluster (ports 8070, 8071): -c 131072 -np 2 --kv-unified
+STITCH_SERVER_CTX = int(os.getenv("STITCH_SERVER_CTX", "131072"))
 STITCH_SERVER_NP = int(os.getenv("STITCH_SERVER_NP", "2"))
-# gemma-4-E4B native training window. Caps the usable slot even if KV allows more.
+# gemma-4-E4B native training window == actual context window here, no extrapolation
 STITCH_MODEL_NATIVE_CTX = int(os.getenv("STITCH_MODEL_NATIVE_CTX", "131072"))
 
 # Worker cluster (ports 8033, 8034): -c 196608 -np 2 --kv-unified
@@ -130,9 +130,6 @@ GEN_API_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-27B-UD-IQ3_XXS.gguf")
 
 # Unified Context Limits
-# Ceiling is the apex window minus the largest apex completion (8192, Phase 2)
-# minus prompt/template overhead. The default stays at the tuned 60000 chars;
-# the clamp only prevents a raised override from overflowing port 8081.
 CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "3.5"))
 APEX_MAX_OUTPUT_TOKENS = int(os.getenv("APEX_MAX_OUTPUT_TOKENS", "8192"))
 APEX_GEN_TOKENS = int(os.getenv("APEX_GEN_TOKENS", "4096"))
@@ -166,18 +163,18 @@ STITCHER_ENDPOINTS = [
 ]
 STITCHER_MODEL = os.getenv("STITCHER_MODEL", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
 STITCHER_API_KEY = os.getenv("STITCHER_API_KEY", "local-sk")
-# Must not exceed the server's -np, or the surplus lanes just queue behind the
-# real slots and inflate tail latency while telemetry reports phantom parallelism.
 STITCH_PARALLEL_SLOTS = min(
     int(os.getenv("STITCH_PARALLEL_SLOTS", str(STITCH_SERVER_NP))),
     STITCH_SERVER_NP
 )
 MAX_RETRIES = 3
 
-# STITCH_CONTEXT_TOKENS is derived in the Server Context Alignment block above.
 MAX_STITCH_TOKENS = int(os.getenv("MAX_STITCH_TOKENS", "32768"))
 STITCH_CHARS_PER_TOKEN = float(os.getenv("STITCH_CHARS_PER_TOKEN", str(CHARS_PER_TOKEN)))
 STITCH_RESERVE_TOKENS = int(os.getenv("STITCH_RESERVE_TOKENS", "4096"))
+
+# Restrict decomposer to not bloat out pipeline operations on simple prompts
+MAX_DECOMPOSE_TASKS = int(os.getenv("MAX_DECOMPOSE_TASKS", "20"))
 
 _stitch_input_tokens = max(
     4096, STITCH_CONTEXT_TOKENS - MAX_STITCH_TOKENS - STITCH_RESERVE_TOKENS
@@ -196,11 +193,10 @@ STITCH_MERGE_CHARS_EACH = int(os.getenv(
     )))
 ))
 
-# The editor passes must reproduce their whole input, so they are output-bound.
-# Anything larger than the model can emit would be silently truncated.
+# Echo passes must fit within the input window, not the output window.
 STITCH_ECHO_MAX_CHARS = int(os.getenv(
     "STITCH_ECHO_MAX_CHARS",
-    str(int(MAX_STITCH_TOKENS * STITCH_CHARS_PER_TOKEN * 0.9))
+    str(MAX_STITCH_CONTEXT_CHARS)
 ))
 
 # Phase 3 & 4: Worker Config
@@ -211,15 +207,12 @@ WORKER_ENDPOINTS = [
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.5-9B-IQ4_XS.gguf")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 
-# Mirrors the worker server's -np. Over-subscribing here does not create
-# parallelism; llama-server simply queues the surplus requests.
 WORKER_PARALLEL_SLOTS = min(
     int(os.getenv("WORKER_PARALLEL_SLOTS", str(WORKER_SERVER_NP))),
     WORKER_SERVER_NP
 )
 WORKER_RETRIES = 3
 
-# Streaming timeout parameters (Max gap between tokens, not total block read length)
 WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "300.0"))
 STITCH_TIMEOUT_SECS = float(os.getenv("STITCH_TIMEOUT_SECS", "300.0"))
 
@@ -232,8 +225,6 @@ MAX_WORKER_TOKENS = min(
         - int(MAX_CONTEXT_CHARS / CHARS_PER_TOKEN))
 )
 
-# Absolute ceiling on one streaming worker call. The gap timeout above catches a
-# dead server; this catches one that dribbles tokens indefinitely.
 WORKER_MIN_DECODE_TPS = float(os.getenv("WORKER_MIN_DECODE_TPS", "4.0"))
 WORKER_MAX_WALL_SECS = float(os.getenv(
     "WORKER_MAX_WALL_SECS",
@@ -245,8 +236,6 @@ TEST_WORKER_ENDPOINTS = [
     "http://localhost:8034/v1/chat/completions"
 ]
 CONCURRENT_REQS_PER_ENDPOINT = WORKER_PARALLEL_SLOTS
-# Unit tests are deliberately compact; the prompt demands minimal code. A large
-# clamp only buys a runaway generation and a multi-minute wall-clock timeout.
 MAX_OUTPUT_TOKENS = min(
     int(os.getenv("MAX_OUTPUT_TOKENS", "4096")),
     max(1024, WORKER_CONTEXT_TOKENS - WORKER_RESERVE_TOKENS
@@ -261,7 +250,6 @@ RETRY_JITTER = 0.5
 MAX_EXEC_WORKERS = 4
 EXECUTION_RESULT_FIELDS = ["filename", "language", "status", "message"]
 
-# Test calls remain standard requests.post mapping wall-clock budgets
 TEST_MIN_DECODE_TPS = float(os.getenv("TEST_MIN_DECODE_TPS", "10.0"))
 TEST_TIMEOUT_SECS = float(os.getenv(
     "TEST_TIMEOUT_SECS",
@@ -310,7 +298,8 @@ _PROMPT_PHASE2_DISTILL = (
 _PROMPT_PHASE3_DECOMPOSE = (
     "You are an algorithmic micro-task decomposer.\n"
     "Your sole purpose is to take a large, complex query or task and shatter it into atomic, independent pieces for parallel processing.\n"
-    "Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conversational text."
+    "Output ONLY a valid, flat JSON array of strings. No markdown formatting, no conversational text.\n"
+    "Generate between 3 and 20 tasks. Do not generate fewer than 3 or more than 20 tasks regardless of input size."
 )
 
 _PROMPT_PHASE3_WORKER = (
@@ -1030,23 +1019,32 @@ def _parallel_repo_jobs(jobs: list, job_fn, fallback_fn, label: str) -> list:
     start_time_progress = time.time()
 
     def wrapper(idx: int, payload):
-        for attempt in range(1, WORKER_RETRIES + 1):
+        endpoint = None
+        deadline = time.time() + (WORKER_RETRIES * WORKER_TIMEOUT_SECS)
+        while time.time() < deadline:
             try:
                 endpoint = slot_queue.get(timeout=5.0)
+                break
             except queue.Empty:
+                if _shutdown_event.is_set():
+                    break
                 continue
+        if endpoint is None:
+            return fallback_fn(payload)
 
-            try:
-                output = job_fn(idx + 1, total, payload, endpoint)
-                if output and len(output.strip()) >= 20:
-                    return output.strip()
-            except Exception as e:
-                if attempt < WORKER_RETRIES:
-                    print(f"        [!] {label} {idx+1}/{total} attempt {attempt} failed ({str(e)}), retrying...", flush=True)
-            finally:
-                slot_queue.put(endpoint)
-            time.sleep(2)
-        return fallback_fn(payload)
+        try:
+            for attempt in range(1, WORKER_RETRIES + 1):
+                try:
+                    output = job_fn(idx + 1, total, payload, endpoint)
+                    if output and len(output.strip()) >= 20:
+                        return output.strip()
+                except Exception as e:
+                    if attempt < WORKER_RETRIES:
+                        print(f"        [!] {label} {idx+1}/{total} attempt {attempt} failed ({str(e)}), retrying...", flush=True)
+                    time.sleep(2)
+            return fallback_fn(payload)
+        finally:
+            slot_queue.put(endpoint)
 
     pool_size = max(1, len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
@@ -1235,16 +1233,8 @@ def extract_json_array(raw_text: str) -> str:
     while i < len(cleaned_text):
         char = cleaned_text[i]
 
-        if char == '\\':
-            if i + 1 >= len(cleaned_text):
-                break
-            if cleaned_text[i+1] == 'u':
-                if i + 12 <= len(cleaned_text) and cleaned_text[i+6:i+8] == '\\u':
-                    i += 12
-                else:
-                    i += min(6, len(cleaned_text) - i)
-            else:
-                i += 2
+        if in_string and char == '\\':
+            i += 2
             continue
 
         if char == '"':
@@ -1286,6 +1276,10 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
             atomic_pieces = json.loads(cleaned_output)
             if not isinstance(atomic_pieces, list) or not all(isinstance(x, str) for x in atomic_pieces):
                 raise ValueError(f"Decomposition produced non-string items: {type(atomic_pieces)}")
+
+            if len(atomic_pieces) > MAX_DECOMPOSE_TASKS:
+                print(f"    [!] Decomposer emitted {len(atomic_pieces)} tasks; clamping to {MAX_DECOMPOSE_TASKS}.", flush=True)
+                atomic_pieces = atomic_pieces[:MAX_DECOMPOSE_TASKS]
 
             elapsed = round(time.time() - start_time, 2)
             print(f"    [+] Success! Shattered into {len(atomic_pieces)} distinct micro-pieces in {elapsed}s.", flush=True)
