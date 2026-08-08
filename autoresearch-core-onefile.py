@@ -132,6 +132,7 @@ STITCH_MERGE_CHARS_EACH = int(os.getenv(
     )))
 ))
 
+# Phase 3 & 4: Worker Config
 WORKER_ENDPOINTS = [
     "http://localhost:8033/v1",
     "http://localhost:8034/v1"
@@ -142,9 +143,8 @@ WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 WORKER_PARALLEL_SLOTS = 2
 WORKER_RETRIES = 3
 WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "1800.0"))
-SYNTHESIS_CHUNK_SIZE = int(os.getenv("SYNTHESIS_CHUNK_SIZE", "3"))
-
-MAX_WORKER_TOKENS = 12288
+SYNTHESIS_CHUNK_SIZE = int(os.getenv("SYNTHESIS_CHUNK_SIZE", "2"))
+MAX_WORKER_TOKENS = int(os.getenv("MAX_WORKER_TOKENS", "8192"))
 
 # Phase 5: Automatic Unittests Config
 TEST_WORKER_ENDPOINTS = [
