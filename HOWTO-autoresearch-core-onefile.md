@@ -7,7 +7,6 @@
 Before running the pipeline, ensure the ThereminQ local LLM swarm is online. The script expects several local model endpoints to be available:
 - **Generation API (Phase 1):** Default `http://localhost:8081/v1`
 - **Distiller API (Phase 2):** Default `http://localhost:8081/v1`
-- **Orchestrator Nodes (Phase 3/4/6):** Default `http://localhost:8080/v1` and `http://localhost:8079/v1`
 - **Stitcher Nodes (Phase 3):** Default `http://localhost:8070/v1` and `http://localhost:8071/v1`
 - **Worker Nodes (Phase 3/5):** Default `http://localhost:8033/v1` and `http://localhost:8034/v1`
 
