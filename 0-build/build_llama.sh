@@ -12,6 +12,7 @@ cd ..
 
 cp -r ./llama.cpp ./llama.orch
 cp -r ./llama.cpp ./llama-vulkan
+cp -r ./llama.cpp ./llama-vulkan-cpu
 cp -r ./llama.cpp ./llama-vulkan-orchestrator
 cp -r ./llama.cpp ./llama-vulkan-orchestrator2
 cp -r ./llama.cpp ./llama-vulkan-worker1
