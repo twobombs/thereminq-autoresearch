@@ -1,5 +1,5 @@
 #!/bin/bash
-
+apt update
 apt install -y build-essential cmake glslang-tools spirv-headers 
 git clone https://github.com/ggml-org/llama.cpp.git
 
