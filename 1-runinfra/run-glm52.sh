@@ -1,5 +1,5 @@
 ./build/bin/llama-server \
-  -m /media/aryan/nvme/models/GLM-52/UD-IQ1S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf \
+  -m  ../0-build/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf \
   --tools all \
   -c 32768 \
   -np 1 \
