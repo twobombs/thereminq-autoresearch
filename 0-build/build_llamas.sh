@@ -1,6 +1,10 @@
 #!/bin/bash
+
 apt update
 apt install -y build-essential cmake glslang-tools spirv-headers 
+apt install -y libvulkan-dev glslc glslang-tools libcurl4-gnutls-dev
+apt clean all
+
 git clone https://github.com/ggml-org/llama.cpp.git
 
 cd llama.cpp
