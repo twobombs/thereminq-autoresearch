@@ -5,8 +5,8 @@ git clone https://github.com/ggml-org/llama.cpp.git
 
 cd llama.cpp
 
-cmake -B build -DGGML_VULKAN=ON
-cmake --build build --config Release -j$(nproc)
+cmake -B build -DGGML_VULKAN=1
+cmake --build build --config Release -j $(grep -c ^processor /proc/cpuinfo)
 
 cd ..
 
