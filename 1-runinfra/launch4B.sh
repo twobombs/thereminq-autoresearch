@@ -1,0 +1,1 @@
+../0-build/llama.cpp/build/bin/llama-server   -m ../0-build/Qwen3.8-4B-Q4_K_M.gguf -c 9600 --no-cache-idle-slots -np 1 -ngl 999 --device Vulkan1 --kv-unified --split-mode none --cache-type-k q8_0 --cache-type-v q4_0 --load-mode none --spec-type draft-mtp --spec-draft-n-max 3 --host 0.0.0.0 --port 8033 --tools all --fit off --jinja -b 256 -ub 256
