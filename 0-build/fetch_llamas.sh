@@ -20,6 +20,11 @@ wget https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/resolve/main/Qwen3
 wget https://huggingface.co/bartowski/nvidia_Orchestrator-8B-GGUF/resolve/main/nvidia_Orchestrator-8B-Q6_K.gguf &
 wget https://huggingface.co/bartowski/nvidia_Orchestrator-8B-GGUF/resolve/main/nvidia_Orchestrator-8B-Q5_K_S.gguf
 
+# Qwen 3.8 nextgen Apex midrange model
+wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf &
+wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf &
+wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf
+
 # midApex CPUonly model - not leveraged in the current setup - placeholder for distilled Apex model 
 wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ1_M.gguf &
 wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf
