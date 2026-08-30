@@ -31,7 +31,7 @@ while true; do
 
     /llama-vulkan/build/bin/llama-server \
         -m "./${MODEL_FILE}" \
-        -c 196608 --no-cache-idle-slots -np 1 -ngl 999 \
+        -c 163840 --no-cache-idle-slots -np 1 -ngl 999 \
         --device Vulkan0 --kv-unified -fa on --split-mode none \
         --cache-type-k q8_0 --cache-type-v q4_0 --no-mmap \
         --spec-type draft-mtp --spec-draft-n-max 3 \
