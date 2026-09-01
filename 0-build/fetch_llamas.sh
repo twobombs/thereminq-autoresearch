@@ -24,6 +24,8 @@ wget https://huggingface.co/bartowski/nvidia_Orchestrator-8B-GGUF/resolve/main/n
 wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf &
 wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf &
 wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf
+# MTP
+wget https://huggingface.co/dzannotti/Qwen3.8-Flash-Next-MTP-GGUF/resolve/main/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf
 
 # midApex CPUonly model - not leveraged in the current setup - placeholder for distilled Apex model 
 wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ1_M.gguf &
