@@ -99,7 +99,7 @@ while true; do
 
     /llama-vulkan/build/bin/llama-server \
         -m "./${MODEL_FILE}" \
-        --device Vulkan1 --device-draft Vulkan0 \
+        --device Vulkan0 --device-draft Vulkan0 \
         -ngl 99 -ngld 99 \
         -ot "\.ffn_(gate|up|down)_exps\.=CPU" \
         -c 131072 -np 1 -fa on -ctk f16 -ctv f16 \
