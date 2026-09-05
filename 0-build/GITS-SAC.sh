@@ -91,7 +91,7 @@ echo "cpus available: ${CPUS} -> -t ${GEN_THREADS} -tb ${BATCH_THREADS}"
 trap 'echo "shutting down"; exit 0' INT TERM
 
 # main model on Vulkan1, MTP/draft on Vulkan0
-export GGML_VK_VISIBLE_DEVICES=0,2
+export GGML_VK_VISIBLE_DEVICES=0
 
 BACKOFF=2
 while true; do
