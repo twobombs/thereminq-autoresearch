@@ -21,6 +21,12 @@
 #   ./launch-tiers.sh all               staggered background start of all tiers
 #   ./launch-tiers.sh stop              tear down
 #   ./launch-tiers.sh health            probe every tier endpoint + check RSS
+#   ./launch-tiers.sh purge             drop all scratch state (do this after
+#                                       any card swap - shader caches are
+#                                       architecture-specific)
+#
+# All runtime state - shader caches, logs, SPIR-V temp - lives under
+# 8-workdir/.runtime, alongside testprompt.txt. Nothing is written to /var.
 # ==============================================================================
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -28,8 +34,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 BUILD=${BUILD:-../0-build}
 BIN=${BIN:-$BUILD/llama.cpp/build/bin/llama-server}
 GGUF_PY=${GGUF_PY:-$BUILD/llama.cpp/gguf-py}
-LOG_DIR=${LOG_DIR:-./agent_logs}
-CACHE_ROOT=${CACHE_ROOT:-/var/cache/thereminq}
+# All churning, disposable state lives under the workdir that already holds
+# testprompt.txt - not /var. That directory is where the NVMe RAID is, it is
+# removable as a unit, and nothing here is worth surviving a card swap. Shader
+# caches in particular are architecture-specific and must not outlive the card
+# that compiled them.
+WORKDIR=${WORKDIR:-../8-workdir}
+SCRATCH=${SCRATCH:-$WORKDIR/.runtime}
+LOG_DIR=${LOG_DIR:-$SCRATCH/logs}
+CACHE_ROOT=${CACHE_ROOT:-$SCRATCH/vkcache}
+CACHE_MAX=${CACHE_MAX:-2147483648}      # 2 GiB ceiling per driver stack
 
 # ------------------------------------------------------------------------------
 # Tier table. Add a row, get a tier. Fields:
@@ -56,6 +70,18 @@ RESERVE=${RESERVE:-192}       # MiB held back for driver + fragmentation
 
 die() { echo "[!] $*" >&2; exit 1; }
 note() { echo "[*] $*" >&2; }
+
+# The workdir is removable by design, so treat its absence as a hard error
+# rather than silently recreating it somewhere slow. If the RAID is not
+# mounted, a shader cache landing on the root filesystem is worse than a
+# refusal - it is slow, invisible, and it survives the next card swap.
+scratch_check() {
+  [ -d "$WORKDIR" ] || die "workdir $WORKDIR not present - is the NVMe array mounted?"
+  mkdir -p "$SCRATCH" 2>/dev/null || die "cannot create scratch under $WORKDIR"
+  [ -w "$SCRATCH" ] || die "$SCRATCH is not writable"
+  printf 'scratch state for launch-tiers.sh - safe to delete at any time\n' \
+    > "$SCRATCH/.disposable"
+}
 
 # ------------------------------------------------------------------------------
 # Device enumeration
@@ -205,8 +231,15 @@ guard_env() {
   # Shader cache keyed on the card, so a swap invalidates instead of loading
   # SPIR-V compiled for the previous architecture. Both stacks, either vendor.
   export MESA_SHADER_CACHE_DIR="$CACHE_ROOT/vk-$TIER_SLUG"
+  export MESA_SHADER_CACHE_MAX_SIZE="$((CACHE_MAX / 1073741824))G"
   export __GL_SHADER_DISK_CACHE_PATH="$CACHE_ROOT/vk-$TIER_SLUG"
-  mkdir -p "$MESA_SHADER_CACHE_DIR" "$LOG_DIR"
+  export __GL_SHADER_DISK_CACHE_SIZE="$CACHE_MAX"
+
+  # SPIR-V compilation scratch goes to the same NVMe, not to /tmp. On a 50/50
+  # box /tmp is usually tmpfs, and tmpfs is RAM - the one budget that must not
+  # move. This is the same reason --no-mmap is staggered in cmd_all.
+  export TMPDIR="$SCRATCH/tmp"
+  mkdir -p "$MESA_SHADER_CACHE_DIR" "$LOG_DIR" "$TMPDIR"
 
   export GGML_VK_VISIBLE_DEVICES=${TIER_DEV#Vulkan}
 }
@@ -231,6 +264,7 @@ cmd_list() {
 
 cmd_plan() {
   local t
+  scratch_check
   for t in $(printf '%s\n' "${TIERS[@]}" | cut -d'|' -f1); do
     resolve_tier "$t"
     printf '%s\n' "--- tier: $TIER_NAME (port $TIER_PORT)"
@@ -244,6 +278,7 @@ cmd_plan() {
 }
 
 cmd_run() {
+  scratch_check
   resolve_tier "$1"
   guard_env
   guard_coopmat
@@ -264,6 +299,7 @@ cmd_run() {
 }
 
 cmd_all() {
+  scratch_check
   # Staggered on purpose. --no-mmap allocates a full host-side copy during load;
   # two tiers loading at once on a 50/50 box with Jenkins resident is how you
   # meet the OOM killer. Each tier must be serving before the next one loads.
@@ -308,6 +344,14 @@ cmd_health() {
 
 cmd_stop() { pkill -f "$BIN" 2>/dev/null && note "stopped" || note "nothing running"; }
 
+# Everything under $SCRATCH is regenerable. Purge after a card swap so no tier
+# loads SPIR-V compiled for an architecture that is no longer in the box.
+cmd_purge() {
+  [ -f "$SCRATCH/.disposable" ] || die "$SCRATCH is not a scratch dir I created"
+  rm -rf "${SCRATCH:?}"
+  note "purged $SCRATCH"
+}
+
 case "${1:-plan}" in
   list)   cmd_list ;;
   plan)   cmd_plan ;;
@@ -315,6 +359,7 @@ case "${1:-plan}" in
   all)    cmd_all ;;
   health) cmd_health ;;
   stop)   cmd_stop ;;
+  purge)  cmd_purge ;;
   *)      sed -n '2,30p' "$0"; exit 1 ;;
 esac
 
