@@ -2,7 +2,11 @@
 # this script is used when we need an in-container LLM to assist vscode to execute ThereminQuantumOPS commands
 set -o pipefail
 
+LLAMA_BIN="/llama-vulkan/build/bin/llama-server"
 MODEL_DIR="/thereminq-autoresearch/0-build"
+
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-9931}"
 
 # Qwen 3.8 nextgen Apex midrange model (split GGUF, 3 shards)
 MODEL_BASE="Qwen3.8-Flash-Next-UD-IQ4_XS"
@@ -87,41 +91,110 @@ BATCH_THREADS=$CPUS
 
 echo "cpus available: ${CPUS} -> -t ${GEN_THREADS} -tb ${BATCH_THREADS}"
 
-# --- supervisor loop ---
-trap 'echo "shutting down"; exit 0' INT TERM
+# --- Vulkan device detection and layer split ---
+# ask llama.cpp itself rather than vulkaninfo: this honours GGML_VK_VISIBLE_DEVICES
+# (if set in the container env) and skips devices the Vulkan backend won't use.
+# TS_MODE=even (default) gives every GPU the same share of layers;
+# TS_MODE=vram weights the share by each card's total VRAM (for mixed cards).
+TS_MODE="${TS_MODE:-even}"
 
-# main model on Vulkan1, MTP/draft on Vulkan0
-export GGML_VK_VISIBLE_DEVICES=0
+DEV_LIST="$("$LLAMA_BIN" --list-devices 2>&1)"
+mapfile -t GPU_LINES < <(printf '%s\n' "$DEV_LIST" | grep -E '^[[:space:]]*Vulkan[0-9]+:')
+NGPU=${#GPU_LINES[@]}
+
+if [ "$NGPU" -eq 0 ]; then
+    echo "no Vulkan devices detected by llama.cpp, output was:"
+    printf '%s\n' "$DEV_LIST"
+    exit 1
+fi
+
+DEVICES=""
+SPLIT=""
+for line in "${GPU_LINES[@]}"; do
+    dev=$(printf '%s' "$line" | grep -oE 'Vulkan[0-9]+' | head -n1)
+    w=1
+    if [ "$TS_MODE" = "vram" ]; then
+        # line looks like: "Vulkan0: <name> (24560 MiB, 23900 MiB free)"
+        w=$(printf '%s' "$line" | grep -oE '\([0-9]+ MiB' | tail -n1 | tr -dc '0-9')
+        [ -z "$w" ] && w=1
+    fi
+    DEVICES="${DEVICES:+$DEVICES,}$dev"
+    SPLIT="${SPLIT:+$SPLIT,}$w"
+    echo "gpu:${line}"
+done
+
+GPU_ARGS=(--device "$DEVICES")
+if [ "$NGPU" -gt 1 ]; then
+    GPU_ARGS+=(--split-mode layer --tensor-split "$SPLIT")
+    echo "using ${NGPU} Vulkan devices: ${DEVICES} -> tensor-split ${SPLIT} (${TS_MODE})"
+else
+    echo "using 1 Vulkan device: ${DEVICES}"
+fi
+
+# --- server arguments ---
+SERVER_ARGS=(
+    -m "./${MODEL_FILE}"
+    "${GPU_ARGS[@]}"
+    -ngl 99
+    -ot "\.ffn_(gate|up|down)_exps\.=CPU"
+    -c 131072 -np 1 -fa on -ctk f16 -ctv f16
+    --no-context-shift -b 2048 -ub 512
+    -t "$GEN_THREADS" -tb "$BATCH_THREADS" --jinja --tools all
+    --host "$HOST" --port "$PORT"
+)
+# optional: export LLAMA_API_KEY=... to require a key on the endpoint
+[ -n "${LLAMA_API_KEY:-}" ] && SERVER_ARGS+=(--api-key "$LLAMA_API_KEY")
+
+# --- supervisor loop ---
+# server runs in the background and we `wait` on it, so SIGTERM from
+# `docker stop` interrupts the wait and gets forwarded instead of being deferred
+CHILD=0
+shutdown() {
+    echo "shutting down"
+    if [ "$CHILD" -ne 0 ]; then
+        kill -TERM "$CHILD" 2>/dev/null
+        wait "$CHILD"
+    fi
+    exit 0
+}
+trap shutdown INT TERM
 
 BACKOFF=2
+FAST_FAILS=0
+MAX_FAST_FAILS=5
+
 while true; do
     START=$(date +%s)
 
-    /llama-vulkan/build/bin/llama-server \
-        -m "./${MODEL_FILE}" \
-        --device Vulkan0 --device-draft Vulkan0 \
-        -ngl 99 -ngld 99 \
-        -ot "\.ffn_(gate|up|down)_exps\.=CPU" \
-        -c 131072 -np 1 -fa on -ctk f16 -ctv f16 \
-        --no-context-shift -b 2048 -ub 512 \
-        -t "$GEN_THREADS" -tb "$BATCH_THREADS" --jinja --tools all \
-        --host 0.0.0.0 --port 9931
-
+    "$LLAMA_BIN" "${SERVER_ARGS[@]}" &
+    CHILD=$!
+    wait "$CHILD"
     RC=$?
+    CHILD=0
+
     RUNTIME=$(( $(date +%s) - START ))
     echo "llama-server exited rc=$RC after ${RUNTIME}s"
 
     # clean shutdown -> stop supervising
     [ "$RC" -eq 0 ] && break
 
-    # reset backoff if it ran fine for a while, otherwise grow it
+    # a long run resets the backoff; repeated fast crashes mean a config error
     if [ "$RUNTIME" -ge 60 ]; then
         BACKOFF=2
+        FAST_FAILS=0
     else
-        BACKOFF=$(( BACKOFF * 2 ))
-        [ "$BACKOFF" -gt 60 ] && BACKOFF=60
+        FAST_FAILS=$(( FAST_FAILS + 1 ))
+        if [ "$FAST_FAILS" -ge "$MAX_FAST_FAILS" ]; then
+            echo "${MAX_FAST_FAILS} fast failures in a row, giving up"
+            exit 1
+        fi
     fi
 
     echo "restarting in ${BACKOFF}s ..."
-    sleep "$BACKOFF"
+    sleep "$BACKOFF" & wait $!          # interruptible by the trap
+
+    if [ "$FAST_FAILS" -gt 0 ]; then
+        BACKOFF=$(( BACKOFF * 2 ))
+        [ "$BACKOFF" -gt 60 ] && BACKOFF=60
+    fi
 done
