@@ -218,6 +218,10 @@ AGENT_CONTEXT_BUDGET = int(os.getenv("AGENT_CONTEXT_BUDGET", str(int(WORKER_INPU
 AGENT_ROSTER_BUDGET = int(os.getenv("AGENT_ROSTER_BUDGET", str(int(WORKER_INPUT_CHARS * 0.15))))
 AGENT_COMMS_BUDGET = int(os.getenv("AGENT_COMMS_BUDGET", str(int(WORKER_INPUT_CHARS * 0.35))))
 AGENT_OBJECTIVE_BUDGET = int(os.getenv("AGENT_OBJECTIVE_BUDGET", str(int(WORKER_INPUT_CHARS * 0.15))))
+# Continuations: the parent's deliverables are carved OUT of the context budget
+# (background shrinks), so the total input window is unchanged.
+AGENT_PARENT_BUDGET = min(AGENT_CONTEXT_BUDGET,
+                          int(os.getenv("AGENT_PARENT_BUDGET", str(int(AGENT_CONTEXT_BUDGET * 0.7)))))
 
 WORKER_MIN_DECODE_TPS = float(os.getenv("WORKER_MIN_DECODE_TPS", "4.0"))
 WORKER_MAX_WALL_SECS = float(os.getenv(
@@ -236,6 +240,7 @@ COMMS_DIRNAME = "comms"
 TREES_DIRNAME = "trees"
 POLICY_DIRNAME = "policy"
 DREAM_DIRNAME = "dream"
+ABORTED_DIRNAME = "aborted"
 
 # ------------------------------------------------------------------------------
 # Recursive self-improvement at the exploration layer (Dream-RSI).
@@ -261,6 +266,9 @@ DREAM_COVERAGE_FLOOR = float(os.getenv("DREAM_COVERAGE_FLOOR", "0.4"))
 POLICY_MAX_CHARS = int(os.getenv("POLICY_MAX_CHARS", "20000"))
 POLICY_MAX_STEPS = int(os.getenv("POLICY_MAX_STEPS", "400"))
 POLICY_MAX_FANOUT = int(os.getenv("POLICY_MAX_FANOUT", "16"))
+# Cap on ALL interface calls (reads included), so a loop that only polls
+# budget_left() and swallows errors still terminates promptly.
+POLICY_MAX_RPC = int(os.getenv("POLICY_MAX_RPC", str(POLICY_MAX_STEPS * 10)))
 
 # Evaluator weights. Deterministic and cheap by requirement: replay reads stored
 # node scores rather than recomputing, so nondeterminism here would make
@@ -273,6 +281,65 @@ EVAL_W_VIOLATION = float(os.getenv("EVAL_W_VIOLATION", "0.20"))
 EVAL_W_TRUNCATED = float(os.getenv("EVAL_W_TRUNCATED", "0.15"))
 # Mix of creation-time heuristic vs Phase 5 pass rate once tests have run.
 EVAL_HEURISTIC_MIX = float(os.getenv("EVAL_HEURISTIC_MIX", "0.6"))
+# Untested nodes are blended against this prior instead of being left on the raw
+# heuristic scale. Without it a tested node (<= heuristic unless every test
+# passes) is systematically outranked by its untested siblings.
+EVAL_UNTESTED_PRIOR = float(os.getenv("EVAL_UNTESTED_PRIOR", "0.5"))
+# Status credit for an attempt that hit its output limit but still yielded
+# complete, closed <file> blocks (salvaged).
+EVAL_PARTIAL_STATUS_FRAC = float(os.getenv("EVAL_PARTIAL_STATUS_FRAC", "0.5"))
+
+# Replay accounting. A request for a branch history never recorded would have
+# cost a real agent call online, so replay charges for it as well. Otherwise
+# probing the edge of the dream is free and replay cost stops meaning anything.
+REPLAY_CHARGE_UNRECORDED = os.getenv("REPLAY_CHARGE_UNRECORDED", "1") == "1"
+
+# Dream selection. Scores within DREAM_TIE_EPS of the incumbent are ties; ties
+# keep the incumbent unless DREAM_PREFER_CHEAPER=1. Cheaper-on-tie is what turns
+# a saturated evaluator into a ratchet toward shallower search.
+DREAM_TIE_EPS = float(os.getenv("DREAM_TIE_EPS", "0.001"))
+DREAM_PREFER_CHEAPER = os.getenv("DREAM_PREFER_CHEAPER", "0") == "1"
+
+# Replay cost term (the paper's beta_1). Without it the objective is blind to
+# spend: under a shared budget cap a policy that exhausts the cap weakly
+# dominates one that stops early, so "conserve while progress is good" can never
+# win a dream. Cost is normalised by the policy budget: 0.05 means spending the
+# whole budget costs 0.05 score. 0 restores the old spend-blind objective.
+DREAM_COST_WEIGHT = float(os.getenv("DREAM_COST_WEIGHT", "0.05"))
+
+# Replay evaluates untested nodes against the pool's empirical test pass rate
+# instead of the fixed EVAL_UNTESTED_PRIOR. With a fixed 0.5 and a real pass
+# rate below it, replay rewards policies that route AROUND tested nodes.
+# "fixed" restores the old behaviour. Below the minimum sample size the fixed
+# prior is used.
+EVAL_UNTESTED_PRIOR_MODE = os.getenv("EVAL_UNTESTED_PRIOR_MODE", "empirical").lower()
+EVAL_EMPIRICAL_MIN_TESTED = int(os.getenv("EVAL_EMPIRICAL_MIN_TESTED", "4"))
+
+# Off-policy support probes. A fraction of each live round is held back from the
+# deployed policy and spent mechanically on expansions the policy family tends
+# not to make (refine each task's best node; open a further independent root
+# attempt). Without them the recorded pool only contains branches the logging
+# policy chose, and replay can only ever confirm that policy. Applied in BOTH
+# arms (dream and --no-dream) so the comparison stays at equal budget.
+SUPPORT_PROBE_FRAC = float(os.getenv("SUPPORT_PROBE_FRAC", "0.15"))
+
+# Policy isolation. Policies run in a child process that talks to the explorer
+# over a line-JSON RPC; these are that child's resource limits.
+POLICY_CPU_SECS = int(os.getenv("POLICY_CPU_SECS", "20"))
+POLICY_MEM_MB = int(os.getenv("POLICY_MEM_MB", "512"))
+POLICY_REPLAY_WALL_SECS = float(os.getenv("POLICY_REPLAY_WALL_SECS", "60"))
+
+# Phase 5 hardening.
+TEST_NODES_PER_TASK = max(1, int(os.getenv("TEST_NODES_PER_TASK", "2")))
+TEST_PIP_INSTALL = os.getenv("TEST_PIP_INSTALL", "1") == "1"
+TEST_PIP_ALLOWLIST = {p.strip().lower().replace("_", "-")
+                      for p in os.getenv("TEST_PIP_ALLOWLIST", "").split(",") if p.strip()}
+TEST_CPU_SECS = int(os.getenv("TEST_CPU_SECS", "60"))
+TEST_MEM_MB = int(os.getenv("TEST_MEM_MB", "4096"))
+TEST_FSIZE_MB = int(os.getenv("TEST_FSIZE_MB", "128"))
+
+# Phase 0: permit LAN git hosts (e.g. a self-hosted Gitea). Off = fail closed.
+GIT_ALLOW_PRIVATE_HOSTS = os.getenv("GIT_ALLOW_PRIVATE_HOSTS", "0") == "1"
 
 # Phase 5: Automatic Unittests Config (runs on the agent worker pool)
 TEST_WORKER_ENDPOINTS = [ep.rstrip("/") + "/chat/completions" for ep in WORKER_ENDPOINTS]
@@ -545,6 +612,14 @@ def apex_client(base_url: Optional[str] = None, api_key: Optional[str] = None,
     )
 
 
+def _is_stream_options_rejection(err_lower: str) -> bool:
+    """Only a server that rejects stream_options/include_usage gets the retry
+    without it. A generic HTTP 400 (context overflow, bad params) is re-raised
+    instead of being retried into the same failure."""
+    return ("stream_options" in err_lower or "include_usage" in err_lower
+            or ("unrecognized" in err_lower and "stream" in err_lower))
+
+
 def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
                      max_tokens: int, temperature: float,
                      model: Optional[str] = None,
@@ -563,7 +638,7 @@ def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
         response = client.chat.completions.create(**kwargs)
     except Exception as e:
         low = str(e).lower()
-        if "stream_options" in low or "unrecognized" in low or "400" in low:
+        if _is_stream_options_rejection(low):
             kwargs.pop("stream_options")
             response = client.chat.completions.create(**kwargs)
         else:
@@ -729,6 +804,16 @@ def describe_budget_alignment() -> str:
         f"{WORK_DIRNAME}/ and their own logs into {COMMS_DIRNAME}/. No model merges output."
     )
     lines.append(
+        f"    [i] Policies run isolated (cpu {POLICY_CPU_SECS}s, mem {POLICY_MEM_MB}MB, no fs/fds); "
+        f"replay charges unrecorded branches: {'yes' if REPLAY_CHARGE_UNRECORDED else 'no'}; "
+        f"ties keep incumbent{' unless cheaper' if DREAM_PREFER_CHEAPER else ''}"
+    )
+    lines.append(
+        f"    [i] Tests: top-{TEST_NODES_PER_TASK} node(s)/task, run-scoped venv, wheels only"
+        f"{', allowlist ' + str(len(TEST_PIP_ALLOWLIST)) + ' pkg(s)' if TEST_PIP_ALLOWLIST else ''}"
+        f"{'' if TEST_PIP_INSTALL else ', installs OFF'}; untested prior {EVAL_UNTESTED_PRIOR}"
+    )
+    lines.append(
         f"    [i] RSI: budget {ROUND_BUDGET_PER_TASK} agent call(s)/task per round"
         f" (clamped {ROUND_BUDGET_MIN}-{ROUND_BUDGET_MAX})"
         f" | {DREAM_CANDIDATES} policy revision(s) per dream on apex"
@@ -829,25 +914,44 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
 # Phase 0: Git Repository Intake
 # ==============================================================================
 
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _is_private_host(host: str) -> bool:
     """
-    Advisory check to prevent basic SSRF against local metadata/loopback.
-    NOTE: This is subject to TOCTOU (Time-of-Check to Time-of-Use) DNS rebinding
-    attacks. Real mitigation requires running the clone behind a network namespace
-    or using GIT_PROXY_COMMAND with an enforced allowlist.
+    Advisory SSRF check against local/metadata addresses. Resolves EVERY address
+    (IPv4 and IPv6) and fails CLOSED: a host that cannot be resolved is treated
+    as blocked. Still subject to DNS-rebinding TOCTOU; the clone itself is further
+    constrained with redirects disabled and a protocol allowlist. Set
+    GIT_ALLOW_PRIVATE_HOSTS=1 to clone from a LAN git server.
     """
+    blocked_names = {"metadata.google.internal", "metadata.azure.internal", "localhost"}
+    if host.lower() in blocked_names:
+        return True
     try:
         orig_timeout = socket.getdefaulttimeout()
         socket.setdefaulttimeout(3.0)
         try:
-            ip = socket.gethostbyname(host)
+            infos = socket.getaddrinfo(host, None)
         finally:
             socket.setdefaulttimeout(orig_timeout)
-        addr = ipaddress.ip_address(ip)
-        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
     except Exception:
-        blocked = {"metadata.google.internal", "metadata.azure.internal", "localhost"}
-        return host.lower() in blocked
+        return True
+    addrs = {info[4][0] for info in infos}
+    if not addrs:
+        return True
+    for raw in addrs:
+        try:
+            addr = ipaddress.ip_address(raw.split("%", 1)[0])
+        except ValueError:
+            return True
+        if getattr(addr, "ipv4_mapped", None):
+            addr = addr.ipv4_mapped
+        if (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+                or addr.is_multicast or addr.is_unspecified
+                or (addr.version == 4 and addr in _CGNAT_NET)):
+            return True
+    return False
 
 
 def validate_git_url(git_url: str) -> bool:
@@ -864,7 +968,7 @@ def validate_git_url(git_url: str) -> bool:
         else:
             return False
 
-    if _is_private_host(host):
+    if not GIT_ALLOW_PRIVATE_HOSTS and _is_private_host(host):
         return False
 
     return True
@@ -883,7 +987,12 @@ def clone_git_repository(git_url: str) -> tuple:
 
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    cmd = ["git", "clone", "--depth", str(GIT_CLONE_DEPTH), "--single-branch",
+    env["GIT_ALLOW_PROTOCOL"] = "https:http:ssh:git"
+    # No redirects (a public URL cannot bounce the clone onto a private host), no
+    # file:// or ext:: transports, no submodules.
+    cmd = ["git", "-c", "http.followRedirects=false",
+           "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
+           "clone", "--depth", str(GIT_CLONE_DEPTH), "--single-branch", "--no-recurse-submodules",
            "--", git_url, str(clone_dir)]
     try:
         start_time = time.time()
@@ -1529,8 +1638,31 @@ def load_tree(run_dir: Path, rnd: int) -> List[dict]:
     # A node id may be rewritten by score writeback; last write wins.
     merged: Dict[str, dict] = {}
     for n in nodes:
-        merged[n["id"]] = n
-    return list(merged.values())
+        if "id" in n:
+            merged[n["id"]] = n
+    return [_normalise_node(n) for n in merged.values()]
+
+
+def _normalise_node(n: dict) -> dict:
+    """Bring nodes recorded by earlier revisions onto the current score scale.
+
+    score_online is what a policy SAW when it made its decisions (heuristic +
+    untested prior); score is the final, test-informed value that replay
+    EVALUATES against. Legacy nodes carried a single raw-heuristic score."""
+    if not n.get("task"):
+        n.setdefault("score_online", n.get("score", 0.0))
+        return n
+    if "score_online" not in n:
+        h = n.get("heuristic_score", n.get("score", 0.0))
+        n["heuristic_score"] = h
+        has_files = bool(n.get("files"))
+        n["score_online"] = blend_test_score(h, None, has_files)
+        n["score"] = blend_test_score(h, n.get("test_pass_rate"), has_files)
+    n.setdefault("cost", 1)
+    n.setdefault("files", [])
+    n.setdefault("file_hashes", [])
+    n.setdefault("gain", None)
+    return n
 
 
 def load_pool(run_dir: Path) -> List[Tuple[int, List[dict]]]:
@@ -1581,15 +1713,35 @@ def ancestors_of(nodes: List[dict], node_id: str) -> List[dict]:
 # deterministic: replay reads these scores rather than recomputing anything, so
 # any nondeterminism here would make dreaming lie about the past.
 #
-# Test telemetry arrives later (Phase 5, end of round) and is written back onto
-# the node, so the NEXT round's dreaming scores policies against test-informed
-# outcomes rather than the creation-time heuristic alone.
+# Every node carries two scores:
+#   score_online - heuristic blended with EVAL_UNTESTED_PRIOR. This is what the
+#                  policy saw when it made its decisions, and what replay SHOWS
+#                  a policy, so replaying the incumbent over its own tree stays
+#                  exact even after test telemetry lands.
+#   score        - heuristic blended with the real pass rate once Phase 5 has
+#                  run. This is what replay EVALUATES a policy against.
+# Tested and untested nodes share one scale, so testing a node can no longer
+# only ever push it below its untested siblings.
 # ------------------------------------------------------------------
+
+def _normalise_for_hash(body: str) -> str:
+    return re.sub(r'\s+', ' ', body or "").strip()
+
+
+def content_hash(body: str) -> str:
+    """Whitespace-insensitive digest: reflowing a file is not new work."""
+    return hashlib.sha256(_normalise_for_hash(body).encode("ascii", "ignore")).hexdigest()
+
 
 def score_node_heuristic(status: str, files: List[str], violations: List[str],
                          truncated: bool, log_len: int, novel_frac: float) -> Tuple[float, dict]:
     parts = {}
-    parts["status"] = EVAL_W_STATUS if status == "success" else 0.0
+    if status == "success":
+        parts["status"] = EVAL_W_STATUS
+    elif status == "partial":
+        parts["status"] = EVAL_W_STATUS * EVAL_PARTIAL_STATUS_FRAC
+    else:
+        parts["status"] = 0.0
     parts["deliverables"] = EVAL_W_FILES * (1.0 if files else 0.0)
     parts["violations"] = -EVAL_W_VIOLATION * min(len(violations), 3)
     parts["truncated"] = -EVAL_W_TRUNCATED if truncated else 0.0
@@ -1604,15 +1756,46 @@ def score_node_heuristic(status: str, files: List[str], violations: List[str],
     return round(score, 6), {k: round(v, 6) for k, v in parts.items()}
 
 
-def blend_test_score(heuristic: float, pass_rate: Optional[float]) -> float:
-    if pass_rate is None:
-        return heuristic
-    return round(EVAL_HEURISTIC_MIX * heuristic + (1.0 - EVAL_HEURISTIC_MIX) * pass_rate, 6)
+def blend_test_score(heuristic: float, pass_rate: Optional[float],
+                     has_files: bool = True) -> float:
+    """A node with nothing on disk has nothing to test: its rate is 0, not the
+    optimistic prior, so failed attempts do not earn score for free."""
+    if pass_rate is not None:
+        rate = float(pass_rate)
+    else:
+        rate = EVAL_UNTESTED_PRIOR if has_files else 0.0
+    return round(EVAL_HEURISTIC_MIX * heuristic + (1.0 - EVAL_HEURISTIC_MIX) * rate, 6)
 
 
 # ------------------------------------------------------------------
 # Explorer interface - identical surface for live and replay
 # ------------------------------------------------------------------
+# The policy never touches an explorer object directly: it runs in a child
+# process and reaches these methods through a line-JSON RPC (see run_policy).
+# Only the names in _POLICY_API are dispatchable, and every return value is a
+# plain JSON projection, so there is no Path, queue or roster to reach through.
+# ------------------------------------------------------------------
+
+_POLICY_API = {"tasks", "root", "budget_left", "spent", "nodes", "frontier", "best",
+               "best_per_task", "note", "expand", "expand_parallel"}
+
+
+class PolicyAborted(Exception):
+    """Raised inside the PARENT when a policy exceeds its interface-call cap.
+    The child re-raises it as a BaseException subclass, so a policy's
+    `except Exception` cannot swallow it."""
+    pass
+
+
+def _node_view(n: dict) -> dict:
+    """What a policy is allowed to see of a node: decision-time score only."""
+    return {
+        "id": n.get("id"), "parent": n.get("parent"), "task": n.get("task"),
+        "depth": n.get("depth", 0), "score": n.get("score_online", n.get("score", 0.0)),
+        "gain": n.get("gain"), "status": n.get("status"), "cost": n.get("cost", 1),
+        "files": list(n.get("files", [])),
+    }
+
 
 class ExplorerBase:
     """What an exploration policy is allowed to do. Live and replay implement the
@@ -1625,8 +1808,9 @@ class ExplorerBase:
         self._nodes: List[dict] = []
         self._steps = 0
         self._log: List[str] = []
+        self._root_id = "root"
 
-    # --- read-only views ---
+    # --- read-only views (decision-time scores) ---
     def tasks(self) -> List[str]:
         return list(self._tasks)
 
@@ -1639,31 +1823,44 @@ class ExplorerBase:
     def spent(self) -> int:
         return self._spent
 
+    def _real(self) -> List[dict]:
+        return [n for n in self._nodes if n.get("task")]
+
     def nodes(self) -> List[dict]:
-        return [dict(n) for n in self._nodes if n.get("task")]
+        return [_node_view(n) for n in self._real()]
 
     def frontier(self) -> List[dict]:
         """Expanded nodes with no expanded children yet."""
         parents = {n.get("parent") for n in self._nodes}
-        return [dict(n) for n in self._nodes if n.get("task") and n["id"] not in parents]
+        return [_node_view(n) for n in self._real() if n["id"] not in parents]
 
     def best(self) -> Optional[dict]:
-        real = [n for n in self._nodes if n.get("task")]
-        return dict(max(real, key=lambda n: n["score"])) if real else None
+        real = self._real()
+        if not real:
+            return None
+        return _node_view(max(real, key=lambda n: _node_view(n)["score"]))
 
     def best_per_task(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}
-        for n in self._nodes:
-            if not n.get("task"):
-                continue
+        for n in self._real():
+            v = _node_view(n)
             cur = out.get(n["task"])
-            if cur is None or n["score"] > cur["score"]:
-                out[n["task"]] = dict(n)
+            if cur is None or v["score"] > cur["score"]:
+                out[n["task"]] = v
         return out
 
     def note(self, msg) -> None:
         if len(self._log) < 200:
             self._log.append(str(msg)[:200])
+
+    # --- evaluation views (final scores; never exposed to the policy) ---
+    def final_best_per_task(self) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        for n in self._real():
+            cur = out.get(n["task"])
+            if cur is None or n.get("score", 0.0) > cur.get("score", 0.0):
+                out[n["task"]] = n
+        return out
 
     # --- actions ---
     def _tick(self):
@@ -1671,27 +1868,56 @@ class ExplorerBase:
         if self._steps > POLICY_MAX_STEPS:
             raise PolicyAborted(f"policy exceeded {POLICY_MAX_STEPS} interface calls")
 
+    @staticmethod
+    def _normalise_request(req) -> Optional[Tuple[str, str]]:
+        try:
+            return (str(req[0]), str(req[1]))
+        except Exception:
+            return None
+
+    def _valid(self, req: Optional[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        if req is None:
+            return None
+        parent_id, task = req
+        if task not in self._tasks:
+            return None
+        if not any(n["id"] == parent_id for n in self._nodes):
+            return None
+        return req
+
     def expand(self, parent_id: str, task: str) -> Optional[dict]:
         res = self.expand_parallel([(parent_id, task)])
         return res[0] if res else None
 
     def expand_parallel(self, requests) -> List[Optional[dict]]:
+        """Always returns a list aligned 1:1 with `requests`. Requests beyond
+        POLICY_MAX_FANOUT are run in further batches (each batch is one interface
+        call) instead of being silently dropped."""
+        reqs = [self._valid(self._normalise_request(r)) for r in list(requests)]
+        results: List[Optional[dict]] = [None] * len(reqs)
+        for start in range(0, len(reqs), POLICY_MAX_FANOUT):
+            self._tick()
+            chunk = reqs[start:start + POLICY_MAX_FANOUT]
+            for off, res in enumerate(self._expand_batch(chunk)):
+                results[start + off] = res
+            if self.budget_left() <= 0:
+                break
+        return results
+
+    def _expand_batch(self, reqs: List[Optional[Tuple[str, str]]]) -> List[Optional[dict]]:
         raise NotImplementedError
-
-
-class PolicyAborted(Exception):
-    pass
 
 
 class ReplayExplorer(ExplorerBase):
     """Dreaming. Resolves each requested expansion against a recorded node and
-    charges one unit of budget for it; nothing is executed and no agent is
-    called. A branch history never recorded is simply unavailable - that is the
-    boundary of the dream, and returning None is how the policy learns it."""
+    charges its recorded cost; nothing is executed and no agent is called.
+
+    A valid request for a branch history never recorded returns None - that is
+    the edge of the dream - and, with REPLAY_CHARGE_UNRECORDED, costs one unit,
+    because online it would have cost at least one real agent call."""
 
     def __init__(self, recorded: List[dict], tasks: List[str], budget: int):
         super().__init__(tasks, budget)
-        self._recorded = recorded
         self._by_parent: Dict[str, List[dict]] = {}
         for n in recorded:
             self._by_parent.setdefault(n.get("parent") or "", []).append(n)
@@ -1700,33 +1926,35 @@ class ReplayExplorer(ExplorerBase):
         roots = [n for n in recorded if not n.get("parent")]
         self._root_id = roots[0]["id"] if roots else "root"
         self._consumed: Set[str] = set()
+        self._unrecorded = 0
         if roots:
             self._nodes.append(dict(roots[0]))
+        else:
+            self._nodes.append({"id": "root", "parent": None, "task": None, "depth": 0,
+                                "score": 0.0, "score_online": 0.0})
 
-    def expand_parallel(self, requests) -> List[Optional[dict]]:
-        self._tick()
+    def _expand_batch(self, reqs):
         out: List[Optional[dict]] = []
-        for req in list(requests)[:POLICY_MAX_FANOUT]:
-            try:
-                parent_id, task = req[0], req[1]
-            except Exception:
+        for req in reqs:
+            if req is None or self.budget_left() <= 0:
                 out.append(None)
                 continue
-            if self.budget_left() <= 0:
-                out.append(None)
-                continue
+            parent_id, task = req
             match = None
             for cand in self._by_parent.get(parent_id, []):
                 if cand.get("task") == task and cand["id"] not in self._consumed:
                     match = cand
                     break
             if match is None:
+                self._unrecorded += 1
+                if REPLAY_CHARGE_UNRECORDED:
+                    self._spent += 1
                 out.append(None)
                 continue
             self._consumed.add(match["id"])
             self._spent += int(match.get("cost", 1))
             self._nodes.append(dict(match))
-            out.append(dict(match))
+            out.append(_node_view(match))
         return out
 
 
@@ -1737,6 +1965,7 @@ class LiveExplorer(ExplorerBase):
 
     def __init__(self, tasks: List[str], budget: int, roster: List[dict], rnd: int,
                  background: str, run_dir: Path, slot_queue: queue.Queue,
+                 prior_hashes: Optional[Dict[str, Set[str]]] = None,
                  semantic_guidance: bool = False):
         super().__init__(tasks, budget)
         self.roster = roster
@@ -1745,13 +1974,14 @@ class LiveExplorer(ExplorerBase):
         self.run_dir = run_dir
         self.slot_queue = slot_queue
         self.semantic_guidance = semantic_guidance
+        self.prior_hashes = prior_hashes or {}
         self._seq = 0
-        self._seen_hashes: Set[str] = set()
         self._lock = threading.Lock()
+        self._support_mode = False
         self._root_id = new_node_id(rnd, 0)
         root = {"id": self._root_id, "seq": 0, "round": rnd, "parent": None,
                 "depth": 0, "task": None, "status": "root", "score": 0.0,
-                "cost": 0, "files": [], "violations": []}
+                "score_online": 0.0, "cost": 0, "files": [], "violations": []}
         self._nodes.append(root)
         append_node(run_dir, rnd, root)
 
@@ -1760,65 +1990,107 @@ class LiveExplorer(ExplorerBase):
             self._seq += 1
             return self._seq
 
-    def expand_parallel(self, requests) -> List[Optional[dict]]:
-        self._tick()
-        reqs = []
-        for req in list(requests)[:POLICY_MAX_FANOUT]:
-            try:
-                reqs.append((str(req[0]), str(req[1])))
-            except Exception:
-                continue
-        if not reqs:
-            return []
-
-        index = {n["id"]: n for n in self._nodes}
-        valid = []
-        for parent_id, task in reqs:
-            if parent_id not in index:
-                valid.append(None)
-                continue
-            if task not in self._tasks:
-                valid.append(None)
-                continue
-            valid.append((parent_id, task))
-
-        runnable = [(i, v) for i, v in enumerate(valid) if v is not None]
+    def _expand_batch(self, reqs):
+        results: List[Optional[dict]] = [None] * len(reqs)
+        runnable = [(i, v) for i, v in enumerate(reqs) if v is not None]
         with self._lock:
             allowance = self.budget_left()
         runnable = runnable[:allowance]
-
-        results: List[Optional[dict]] = [None] * len(valid)
         if not runnable:
             return results
-
         pool = max(1, min(len(runnable), POLICY_MAX_FANOUT))
         with concurrent.futures.ThreadPoolExecutor(max_workers=pool) as ex:
             futs = {ex.submit(self._run_one, v[0], v[1]): i for i, v in runnable}
             for fut in concurrent.futures.as_completed(futs):
                 i = futs[fut]
                 try:
-                    results[i] = fut.result()
+                    node = fut.result()
+                    results[i] = _node_view(node) if node else None
                 except Exception as exc:
                     print(f"\n    [!] expansion failed: {str(exc)[:120]}", flush=True)
                     results[i] = None
         return results
 
-    def _run_one(self, parent_id: str, task: str) -> Optional[dict]:
+    def run_support_probes(self, n: int) -> int:
+        """Spend up to n calls on off-policy expansions, chosen deterministically
+        from the tree the policy grew:
+          deep - refine each task's best node that has no same-task child yet
+                 (pi_0-style policies refine the WEAKEST half and never do this)
+          wide - a further independent root attempt, fewest-roots tasks first
+                 (replay can only serve one root child per recorded attempt)
+        The two lists are interleaved so both kinds of support accumulate."""
+        if n <= 0:
+            return 0
+        with self._lock:
+            real = [dict(x) for x in self._nodes if x.get("task")]
+        has_child = {(x.get("parent"), x["task"]) for x in real}
+        roots: Dict[str, int] = {}
+        best: Dict[str, dict] = {}
+        for x in real:
+            if x.get("parent") == self._root_id:
+                roots[x["task"]] = roots.get(x["task"], 0) + 1
+            if not x.get("files"):
+                continue
+            cur = best.get(x["task"])
+            if cur is None or x.get("score_online", 0.0) > cur.get("score_online", 0.0):
+                best[x["task"]] = x
+        deep = [(b["id"], t) for t, b in sorted(best.items(),
+                                                key=lambda kv: (-kv[1].get("score_online", 0.0), kv[0]))
+                if (b["id"], t) not in has_child]
+        wide = [(self._root_id, t) for t in sorted(self._tasks, key=lambda t: (roots.get(t, 0), t))]
+        reqs: List[Tuple[str, str]] = []
+        di = wi = 0
+        while len(reqs) < n and (di < len(deep) or wi < len(wide)):
+            if di < len(deep):
+                reqs.append(deep[di]); di += 1
+            if len(reqs) < n and wi < len(wide):
+                reqs.append(wide[wi]); wi += 1
+        if not reqs:
+            return 0
+        self._support_mode = True
+        self._steps = 0
+        before = self.spent()
+        try:
+            self.expand_parallel(reqs)
+        finally:
+            self._support_mode = False
+        return self.spent() - before
+
+    def _reserve(self) -> bool:
         with self._lock:
             if self.budget_left() <= 0:
-                return None
+                return False
             self._spent += 1
+            return True
+
+    def _run_one(self, parent_id: str, task: str) -> Optional[dict]:
+        # One unit per REAL agent call: the first attempt is reserved here, every
+        # retry reserves again and is refused once the budget is gone.
+        if not self._reserve():
+            return None
         seq = self._next_seq()
         node_id = new_node_id(self.rnd, seq)
-        index = {n["id"]: n for n in self._nodes}
-        depth = index.get(parent_id, {}).get("depth", 0) + 1
+        with self._lock:
+            index = {n["id"]: n for n in self._nodes}
+        parent = index.get(parent_id)
+        depth = (parent or {}).get("depth", 0) + 1
         agent = next((r for r in self.roster if r["id"] == task), None)
         if agent is None:
             return None
+        parent_task_node = parent if (parent and parent.get("task") == task) else None
+        if parent_task_node is not None:
+            reference = set(parent_task_node.get("file_hashes", []))
+        else:
+            reference = set(self.prior_hashes.get(task, set()))
 
-        endpoint, slot_name = None, None
         node = None
+        attempts = 0
+        slot_name = None
         for attempt in range(1, WORKER_RETRIES + 1):
+            if attempt > 1 and not self._reserve():
+                break
+            attempts += 1
+            endpoint, slot_name = None, None
             while not _shutdown_event.is_set():
                 try:
                     endpoint, slot_name = self.slot_queue.get(timeout=5.0)
@@ -1826,78 +2098,160 @@ class LiveExplorer(ExplorerBase):
                 except queue.Empty:
                     continue
             if endpoint is None:
-                return None
+                break
             try:
                 node = run_agent(agent, self.roster, self.rnd, node_id, seq, parent_id,
                                  depth, endpoint, slot_name, self.background,
-                                 self.run_dir, self._nodes, self._seen_hashes,
-                                 self._lock, semantic_guidance=self.semantic_guidance)
-                if node["status"] == "success":
+                                 self.run_dir, self._nodes, self._lock,
+                                 parent_task_node=parent_task_node, reference_hashes=reference,
+                                 attempt=attempt, semantic_guidance=self.semantic_guidance)
+                if node["status"] in ("success", "partial"):
                     break
             except Exception as exc:
                 print(f"\n    [!] {task} attempt {attempt} raised {str(exc)[:80]}", flush=True)
             finally:
                 self.slot_queue.put((endpoint, slot_name))
+            if _shutdown_event.is_set():
+                break
             time.sleep(2)
 
         if node is None:
+            h, parts = score_node_heuristic("error", [], [], False, 0, 0.0)
             node = {"id": node_id, "seq": seq, "round": self.rnd, "parent": parent_id,
-                    "depth": depth, "task": task, "status": "error", "score": 0.0,
-                    "score_parts": {}, "cost": 1, "files": [], "violations": [],
-                    "notes": [], "elapsed": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "truncated": False, "slot": slot_name or ""}
+                    "depth": depth, "task": task, "dir": agent["dir"], "status": "error",
+                    "heuristic_score": h, "score_parts": parts,
+                    "score_online": blend_test_score(h, None, False),
+                    "score": blend_test_score(h, None, False),
+                    "test_pass_rate": None, "files": [], "file_hashes": [], "violations": [],
+                    "notes": [], "elapsed": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                    "truncated": False, "slot": slot_name or "", "log_path": None}
+        node["cost"] = max(1, attempts)
+        node["attempts"] = attempts
+        node["support"] = bool(self._support_mode)
+        if parent_task_node is not None:
+            node["gain"] = round(node["score_online"] - parent_task_node.get("score_online", 0.0), 6)
+        else:
+            node["gain"] = None
 
         with self._lock:
             self._nodes.append(node)
         append_node(self.run_dir, self.rnd, node)
         append_event(self.run_dir, {
             "round": self.rnd, "event": "node", "node": node_id, "parent": parent_id,
-            "task": task, "depth": depth, "status": node["status"],
-            "score": node["score"], "files": len(node["files"]),
+            "task": task, "depth": depth, "status": node["status"], "cost": node["cost"],
+            "score": node["score_online"], "gain": node["gain"], "files": len(node["files"]),
         })
+        with self._lock:
+            real = [n for n in self._nodes if n.get("task")]
+            spent = self._spent
         sys.stdout.write("\r    [+] round {:02d}: {} node(s), budget {}/{}, best {:.3f}   ".format(
-            self.rnd, len([n for n in self._nodes if n.get("task")]),
-            self._spent, self._budget,
-            max([n["score"] for n in self._nodes if n.get("task")] or [0.0])))
+            self.rnd, len(real), spent, self._budget,
+            max([n["score_online"] for n in real] or [0.0])))
         sys.stdout.flush()
-        return dict(node)
+        return node
 
 
 # ------------------------------------------------------------------
 # Agent output parsing and ownership enforcement
 # ------------------------------------------------------------------
 
-def _strip_fenced(text: str) -> str:
-    """<file>/<log>/<note> strings inside code fences are content, not tags."""
-    out = re.sub(r'```[\s\S]*?```', '', text)
-    return re.sub(r'`[^`\n]+`', '', out)
+_SCAN_RE = re.compile(
+    r'```|`'
+    r'|<(file)\s+path="([^"]*)"\s*>'
+    r'|<(note)\s+to="([^"]*)"\s*>'
+    r'|<(log)\s*>'
+    r'|</(file|note|log)\s*>',
+    re.IGNORECASE)
 
 
-def _tags_balanced(text: str) -> Tuple[bool, dict]:
-    stripped = _strip_fenced(text)
-    counts = {
-        "file_open": len(re.findall(r'<file\s+path="[^"]*"\s*>', stripped, re.IGNORECASE)),
-        "file_close": len(re.findall(r'</file\s*>', stripped, re.IGNORECASE)),
-        "log_open": len(re.findall(r'<log\s*>', stripped, re.IGNORECASE)),
-        "log_close": len(re.findall(r'</log\s*>', stripped, re.IGNORECASE)),
-        "note_open": len(re.findall(r'<note\s+to="[^"]*"\s*>', stripped, re.IGNORECASE)),
-        "note_close": len(re.findall(r'</note\s*>', stripped, re.IGNORECASE)),
-    }
-    ok = (counts["file_open"] == counts["file_close"]
-          and counts["log_open"] == counts["log_close"]
-          and counts["note_open"] == counts["note_close"])
-    return ok, counts
+def scan_agent_output(text: str) -> dict:
+    """Single-pass scanner shared by validation and parsing, so the two can never
+    disagree. Outside a block, fenced and inline code is skipped (a tag in a code
+    example is content). Inside a block, only that block's own closer ends it, so
+    file content may contain fences freely. An unclosed <file> at the end is
+    reported as `dangling` - the signature of an output cut off at its limit."""
+    files: List[dict] = []
+    notes: List[dict] = []
+    logs: List[str] = []
+    spans: List[Tuple[int, int]] = []
+    counts = {k: 0 for k in ("file_open", "file_close", "log_open", "log_close",
+                             "note_open", "note_close")}
+    dangling = None
+    pos, n = 0, len(text)
+    while pos < n:
+        m = _SCAN_RE.search(text, pos)
+        if not m:
+            break
+        tok = m.group(0)
+        if tok == "```":
+            close = text.find("```", m.end())
+            if close == -1:
+                break
+            pos = close + 3
+            continue
+        if tok == "`":
+            close = text.find("`", m.end())
+            nl = text.find("\n", m.end())
+            pos = close + 1 if (close != -1 and (nl == -1 or close < nl)) else m.end()
+            continue
+        if m.group(6):
+            counts[m.group(6).lower() + "_close"] += 1
+            pos = m.end()
+            continue
+        kind = (m.group(1) or m.group(3) or m.group(5)).lower()
+        counts[kind + "_open"] += 1
+        closer = re.compile(r'</%s\s*>' % kind, re.IGNORECASE).search(text, m.end())
+        if not closer:
+            if kind == "file":
+                dangling = {"path": m.group(2).strip(), "content": text[m.end():]}
+            spans.append((m.start(), n))
+            break
+        counts[kind + "_close"] += 1
+        body = text[m.end():closer.start()].strip()
+        if kind == "file":
+            files.append({"path": m.group(2).strip(), "content": body})
+        elif kind == "note":
+            notes.append({"to": m.group(4).strip().lower(), "body": body})
+        else:
+            logs.append(body)
+        spans.append((m.start(), closer.end()))
+        pos = closer.end()
+
+    if logs:
+        log = logs[0]
+    else:
+        residue, last = [], 0
+        for a, b in spans:
+            residue.append(text[last:a])
+            last = b
+        residue.append(text[last:])
+        log = "".join(residue).strip()
+
+    balanced = (dangling is None
+                and counts["file_open"] == counts["file_close"]
+                and counts["log_open"] == counts["log_close"]
+                and counts["note_open"] == counts["note_close"])
+    return {"files": files, "notes": notes, "log": log, "balanced": balanced,
+            "counts": counts, "dangling": dangling}
+
+
+def parse_agent_output(text: str) -> dict:
+    """Split raw agent output into deliverables, log and notes."""
+    s = scan_agent_output(text)
+    return {"files": s["files"], "notes": s["notes"], "log": s["log"]}
 
 
 def _agent_output_path(declared: str, agent_dir: Path, other_dirs: Set[str],
-                       seen: Set[str]) -> Tuple[Path, Optional[str]]:
+                       seen: Set[str], inherited: Optional[Set[str]] = None
+                       ) -> Tuple[Path, Optional[str]]:
     """Resolve a declared path INSIDE the agent's own node directory.
 
     Escape is impossible by construction (the path is rebuilt relative to
     agent_dir). The violation we actually care about is an agent claiming a path
     that names a teammate's directory - that is the signal it drifted into a
     neighbour's assignment. Those land in claimed/ and are reported, not silently
-    accepted into the shared tree."""
+    accepted into the shared tree. A path inherited from the parent attempt may
+    be overwritten once: that is what a continuation is for."""
     violation = None
     normalised = declared.replace("\\", "/").strip()
     if normalised.startswith("/") or ".." in PurePosixPath(normalised).parts:
@@ -1915,6 +2269,11 @@ def _agent_output_path(declared: str, agent_dir: Path, other_dirs: Set[str],
 
     parts = parts[-3:]
     candidate = agent_dir.joinpath(*parts)
+    key = str(candidate)
+    if inherited is not None and key in inherited and key not in seen:
+        inherited.discard(key)
+        seen.add(key)
+        return candidate, violation
     stem, suffix = candidate.stem, candidate.suffix
     counter = 1
     while str(candidate) in seen or candidate.exists():
@@ -1924,25 +2283,38 @@ def _agent_output_path(declared: str, agent_dir: Path, other_dirs: Set[str],
     return candidate, violation
 
 
-def parse_agent_output(text: str) -> dict:
-    """Split raw agent output into deliverables, log and notes."""
-    files = []
-    for m in re.finditer(r'<file\s+path="([^"]+)"\s*>([\s\S]*?)</file\s*>', text, re.IGNORECASE):
-        files.append({"path": m.group(1).strip(), "content": m.group(2).strip()})
+def _node_files(run_dir: Path, node: dict) -> Dict[str, str]:
+    """Relative path (inside the node dir) -> content, for a recorded node."""
+    out: Dict[str, str] = {}
+    ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
+    if not ndir.exists():
+        return out
+    for p in sorted(ndir.rglob("*")):
+        if p.is_file() and not p.is_symlink():
+            content = read_file_content_safe(p)
+            if content is not None:
+                out[str(p.relative_to(ndir)).replace("\\", "/")] = content
+    return out
 
-    notes = []
-    for m in re.finditer(r'<note\s+to="([^"]+)"\s*>([\s\S]*?)</note\s*>', text, re.IGNORECASE):
-        notes.append({"to": m.group(1).strip().lower(), "body": m.group(2).strip()})
 
-    log_match = re.search(r'<log\s*>([\s\S]*?)</log\s*>', text, re.IGNORECASE)
-    if log_match:
-        log = log_match.group(1).strip()
-    else:
-        residue = re.sub(r'<file\s+path="[^"]+"\s*>[\s\S]*?</file\s*>', '', text, flags=re.IGNORECASE)
-        residue = re.sub(r'<note\s+to="[^"]+"\s*>[\s\S]*?</note\s*>', '', residue, flags=re.IGNORECASE)
-        log = residue.strip()
-
-    return {"files": files, "notes": notes, "log": log}
+def render_parent_deliverables(files: Dict[str, str], budget: int) -> str:
+    if not files:
+        return "(the parent attempt produced no files)"
+    blocks, used = [], 0
+    for rel, content in files.items():
+        max_ticks = max((len(m.group(0)) for m in re.finditer(r'`+', content)), default=2)
+        fence = "`" * max(3, max_ticks + 1)
+        block = f"--- {rel} ---\n{fence}\n{content.rstrip()}\n{fence}"
+        remaining = budget - used
+        if remaining <= 200:
+            blocks.append(f"...[{len(files) - len(blocks)} more inherited file(s) omitted; "
+                          "they are still on disk in your directory]...")
+            break
+        if len(block) > remaining:
+            block = block[:remaining] + f"\n...[FILE TRUNCATED IN PROMPT; full copy is on disk]...\n{fence}"
+        blocks.append(block)
+        used += len(block) + 2
+    return "\n\n".join(blocks)
 
 
 def build_comms_digest(run_dir: Path, task: str, rnd: int, live_nodes: List[dict],
@@ -1979,10 +2351,10 @@ def build_comms_digest(run_dir: Path, task: str, rnd: int, live_nodes: List[dict
             if lp:
                 body = (read_file_content_safe(run_dir / lp) or "").strip()
             if body:
-                blocks.append(f"--- attempt {n['id']} (score {n['score']:.3f}) ---\n"
+                blocks.append(f"--- attempt {n['id']} (score {n.get('score_online', n['score']):.3f}) ---\n"
                               f"{body[:COMMS_PEER_SUMMARY_CHARS * 2]}")
         if blocks:
-            sections.append("THE ATTEMPT YOU ARE CONTINUING\n\n" + "\n\n".join(blocks)
+            sections.append("THE ATTEMPT YOU ARE CONTINUING (LOGS)\n\n" + "\n\n".join(blocks)
                             + "\n\nImprove on it. Do not restart from nothing.")
 
     for r in range(rnd, 0, -1):
@@ -1999,7 +2371,7 @@ def build_comms_digest(run_dir: Path, task: str, rnd: int, live_nodes: List[dict
         if not n.get("task") or n["task"] == task:
             continue
         cur = best.get(n["task"])
-        if cur is None or n["score"] > cur["score"]:
+        if cur is None or n.get("score_online", 0) > cur.get("score_online", 0):
             best[n["task"]] = n
     for tid in sorted(best):
         n = best[tid]
@@ -2039,29 +2411,54 @@ def build_comms_digest(run_dir: Path, task: str, rnd: int, live_nodes: List[dict
 def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
               parent_id: str, depth: int, endpoint: str, slot_name: str,
               background: str, run_dir: Path, live_nodes: List[dict],
-              seen_hashes: Set[str], lock: threading.Lock,
+              lock: threading.Lock, parent_task_node: Optional[dict] = None,
+              reference_hashes: Optional[Set[str]] = None, attempt: int = 1,
               semantic_guidance: bool = False) -> dict:
     """One agent, one assignment, one tree node. Writes its own deliverables and
-    log, and returns the recorded outcome that becomes replayable history."""
+    log, and returns the recorded outcome that becomes replayable history.
+
+    A continuation starts from its parent's deliverables: they are copied into
+    this node's directory and shown in the prompt, and the agent only emits the
+    files it changes or adds."""
     task = agent["id"]
+    reference_hashes = set(reference_hashes or set())
     client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY,
                     timeout=WORKER_TIMEOUT_SECS, max_retries=0)
     start_time = time.time()
+
+    wroot = work_dir_for(run_dir)
+    node_out = wroot / agent["dir"] / node_id
+    # Retry safety: a previous attempt at this node id must not leak files into
+    # this one.
+    if node_out.exists():
+        shutil.rmtree(node_out, ignore_errors=True)
+
+    parent_files: Dict[str, str] = {}
+    if parent_task_node is not None:
+        parent_files = _node_files(run_dir, parent_task_node)
 
     roster_block = render_roster(roster, task, AGENT_ROSTER_BUDGET)
     with lock:
         snapshot = [dict(n) for n in live_nodes]
     comms_block = build_comms_digest(run_dir, task, rnd, snapshot, parent_id,
                                      AGENT_COMMS_BUDGET, semantic_guidance)
-    context_block = fit_context(background, AGENT_CONTEXT_BUDGET)
     objective_block = fit_context(agent["objective"], AGENT_OBJECTIVE_BUDGET)
 
-    stage_note = (
-        "This is a fresh attempt at your objective. Produce your deliverables from scratch."
-        if depth <= 1 else
-        f"This is a CONTINUATION (depth {depth}). The attempt you are extending is shown below "
-        f"and already exists on disk. Improve and complete YOUR OWN deliverables only."
-    )
+    if parent_task_node is not None:
+        parent_block = render_parent_deliverables(parent_files, AGENT_PARENT_BUDGET)
+        context_budget = max(2000, AGENT_CONTEXT_BUDGET - len(parent_block))
+        stage_note = (
+            f"This is a CONTINUATION (depth {depth}) of attempt {parent_task_node['id']}. "
+            "Its deliverables are shown below and are ALREADY IN YOUR DIRECTORY under the same "
+            "relative paths. Emit ONLY the files you change or add: a <file> with an existing path "
+            "replaces that file; files you do not emit are kept as they are. Improve and complete "
+            "YOUR OWN deliverables only.\n\n"
+            f"===== INHERITED DELIVERABLES =====\n{parent_block}"
+        )
+    else:
+        context_budget = AGENT_CONTEXT_BUDGET
+        stage_note = "This is a fresh attempt at your objective. Produce your deliverables from scratch."
+    context_block = fit_context(background, context_budget)
 
     user_instruction = (
         f"{roster_block}\n\n"
@@ -2077,11 +2474,15 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     prompt_tokens, comp_tokens = 0, 0
     is_estimated = True
     truncated = False
+    finish_reason = None
     violations: List[str] = []
     saved_files: List[str] = []
+    file_hashes: List[str] = []
     notes_out: List[dict] = []
     novel_frac = 0.0
+    emitted = 0
     log_body = ""
+    log_rel = None
 
     try:
         base_kwargs = dict(
@@ -2098,8 +2499,7 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
             response = client.chat.completions.create(
                 stream_options={"include_usage": True}, **base_kwargs)
         except Exception as e:
-            low = str(e).lower()
-            if "stream_options" in low or "unrecognized" in low or "400" in low:
+            if _is_stream_options_rejection(str(e).lower()):
                 response = client.chat.completions.create(**base_kwargs)
             else:
                 raise
@@ -2108,11 +2508,15 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
             for chunk in response:
                 now = time.time()
                 if now - start_time > WORKER_MAX_WALL_SECS:
-                    result_text += "\n\n...[OUTPUT TRUNCATED: MAX WALL CLOCK EXCEEDED]..."
                     truncated = True
+                    finish_reason = "wall_clock"
                     break
-                if chunk.choices and chunk.choices[0].delta.content is not None:
-                    result_text += chunk.choices[0].delta.content
+                if chunk.choices:
+                    ch = chunk.choices[0]
+                    if ch.delta is not None and ch.delta.content is not None:
+                        result_text += ch.delta.content
+                    if getattr(ch, "finish_reason", None):
+                        finish_reason = ch.finish_reason
                 if getattr(chunk, "usage", None) is not None:
                     prompt_tokens = chunk.usage.prompt_tokens
                     comp_tokens = chunk.usage.completion_tokens
@@ -2123,83 +2527,114 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
             except Exception:
                 pass
 
+        if finish_reason == "length":
+            truncated = True
+
         result_text = enforce_ascii(result_text.strip())
         if is_estimated:
             prompt_tokens = estimate_tokens(_PROMPT_PHASE3_AGENT + user_instruction)
             comp_tokens = estimate_tokens(result_text)
 
-        balanced, counts = _tags_balanced(result_text)
-        parsed = parse_agent_output(result_text)
-        log_body = parsed["log"]
+        scan = scan_agent_output(result_text)
+        counts = scan["counts"]
+        log_body = scan["log"]
+        emit_files = scan["files"]
 
-        if not balanced:
-            violations.append(
-                "unbalanced output tags (file {}/{}, log {}/{}, note {}/{}) - "
-                "deliverables not written".format(
-                    counts["file_open"], counts["file_close"],
-                    counts["log_open"], counts["log_close"],
-                    counts["note_open"], counts["note_close"]))
-            status = "failed_validation"
-            parsed["files"] = []
+        if not scan["balanced"]:
+            tag_detail = "file {}/{}, log {}/{}, note {}/{}".format(
+                counts["file_open"], counts["file_close"], counts["log_open"],
+                counts["log_close"], counts["note_open"], counts["note_close"])
+            if truncated and emit_files:
+                dangling = scan["dangling"]["path"] if scan["dangling"] else None
+                violations.append(
+                    f"output cut off ({finish_reason}); {len(emit_files)} complete file(s) salvaged"
+                    + (f", unfinished '{dangling}' discarded" if dangling else "")
+                    + f" ({tag_detail})")
+                status = "partial"
+            else:
+                violations.append(f"unbalanced output tags ({tag_detail}) - deliverables not written"
+                                  + (f" [cut off: {finish_reason}]" if truncated else ""))
+                status = "failed_validation"
+                emit_files = []
 
         if len(result_text) < 20:
             status = "failed_validation"
+            emit_files = []
 
-        # Deliverables land under the agent's own directory, namespaced by node so
-        # sibling attempts at the same objective never overwrite each other.
-        node_out = work_dir_for(run_dir) / agent["dir"] / node_id
         other_dirs = {r["dir"] for r in roster if r["id"] != task}
+        accepted = status in ("success", "partial")
+
+        # Inherit the parent's deliverables first (baseline), then apply the
+        # agent's emitted files on top.
+        inherited: Set[str] = set()
+        if accepted and parent_files:
+            for rel, content in parent_files.items():
+                dest = node_out.joinpath(*PurePosixPath(rel).parts)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "w", encoding="ascii", errors="ignore") as fh:
+                    fh.write(content)
+                inherited.add(str(dest))
+
         novel = 0
-        if parsed["files"]:
+        if accepted and emit_files:
             node_out.mkdir(parents=True, exist_ok=True)
             seen: Set[str] = set()
-            for f in parsed["files"]:
-                path, violation = _agent_output_path(f["path"], node_out, other_dirs, seen)
+            for f in emit_files:
+                path, violation = _agent_output_path(f["path"], node_out, other_dirs, seen, inherited)
                 if violation:
                     violations.append(violation)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 body = enforce_ascii(f["content"])
                 with open(path, "w", encoding="ascii") as fh:
                     fh.write(body + "\n")
-                digest = hashlib.sha256(body.encode("ascii", "ignore")).hexdigest()
-                with lock:
-                    if digest not in seen_hashes:
-                        seen_hashes.add(digest)
-                        novel += 1
-                rel = str(path.relative_to(work_dir_for(run_dir)))
-                saved_files.append(rel)
-            novel_frac = novel / max(1, len(parsed["files"]))
+                if content_hash(body) not in reference_hashes:
+                    novel += 1
+            emitted = len(emit_files)
+            novel_frac = novel / max(1, emitted)
+
+        if node_out.exists():
+            for p in sorted(node_out.rglob("*")):
+                if p.is_file() and not p.is_symlink():
+                    saved_files.append(str(p.relative_to(wroot)))
+                    file_hashes.append(content_hash(read_file_content_safe(p) or ""))
 
         rdir = round_dir_for(run_dir, rnd)
         rdir.mkdir(parents=True, exist_ok=True)
         log_rel = f"{COMMS_DIRNAME}/round{rnd:02d}/{node_id}_{task}.md"
         with open(run_dir / log_rel, "w", encoding="ascii") as fh:
-            fh.write(f"# {task} - node {node_id} (round {rnd:02d}, depth {depth})\n\n")
+            fh.write(f"# {task} - node {node_id} (round {rnd:02d}, depth {depth}, attempt {attempt})\n\n")
             fh.write(f"- parent: {parent_id}\n")
             fh.write(f"- slot: {slot_name}\n")
             fh.write(f"- status: {status}\n")
+            if parent_files:
+                fh.write(f"- inherited: {len(parent_files)} file(s) from {parent_task_node['id']}\n")
+            fh.write(f"- emitted: {emitted} file(s)\n")
             fh.write(f"- deliverables: {', '.join(saved_files) if saved_files else '(none)'}\n")
             if violations:
                 fh.write(f"- violations: {'; '.join(violations)}\n")
             fh.write("\n## Log\n\n")
             fh.write(enforce_ascii(log_body or "(agent produced no log)").strip() + "\n")
 
-        valid_ids = {r["id"] for r in roster}
-        ndir = rdir / "notes"
-        for note in parsed["notes"]:
-            target = note["to"]
-            if target not in valid_ids:
-                violations.append(f"note addressed to unknown agent '{target}'")
-                continue
-            ndir.mkdir(parents=True, exist_ok=True)
-            with open(ndir / f"{target}.md", "a", encoding="ascii") as fh:
-                fh.write(f"\n### from {task} (node {node_id})\n\n"
-                         + enforce_ascii(note["body"]).strip() + "\n")
-            notes_out.append({"to": target, "chars": len(note["body"])})
+        # Notes are only delivered from accepted output, so a rejected attempt
+        # (which will be retried) cannot put duplicate or stale messages in a
+        # teammate's inbox.
+        if accepted:
+            valid_ids = {r["id"] for r in roster}
+            ndir = rdir / "notes"
+            for note in scan["notes"]:
+                target = note["to"]
+                if target not in valid_ids:
+                    violations.append(f"note addressed to unknown agent '{target}'")
+                    continue
+                ndir.mkdir(parents=True, exist_ok=True)
+                with open(ndir / f"{target}.md", "a", encoding="ascii") as fh:
+                    fh.write(f"\n### from {task} (node {node_id})\n\n"
+                             + enforce_ascii(note["body"]).strip() + "\n")
+                notes_out.append({"to": target, "chars": len(note["body"])})
 
         for v in violations:
             append_event(run_dir, {"round": rnd, "node": node_id, "agent": task,
-                                   "event": "violation", "detail": v})
+                                   "attempt": attempt, "event": "violation", "detail": v})
 
     except Exception as e:
         status = "error"
@@ -2208,24 +2643,27 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
         is_estimated = True
 
     elapsed = round(time.time() - start_time, 2)
-    score, parts = score_node_heuristic(status, saved_files, violations, truncated,
-                                        len(log_body or ""), novel_frac)
+    h, parts = score_node_heuristic(status, saved_files, violations, truncated,
+                                    len(log_body or ""), novel_frac)
+    online = blend_test_score(h, None, bool(saved_files))
     return {
         "id": node_id, "seq": seq, "round": rnd, "parent": parent_id, "depth": depth,
         "task": task, "dir": agent["dir"], "status": status,
-        "score": score, "score_parts": parts, "heuristic_score": score,
+        "score": online, "score_online": online, "heuristic_score": h, "score_parts": parts,
         "test_pass_rate": None, "cost": 1,
-        "files": saved_files, "violations": violations, "notes": notes_out,
+        "files": saved_files, "file_hashes": sorted(set(file_hashes)),
+        "emitted": emitted, "inherited": len(parent_files),
+        "violations": violations, "notes": notes_out,
         "log_path": log_rel if status != "error" else None,
         "elapsed": elapsed, "prompt_tokens": prompt_tokens,
         "completion_tokens": comp_tokens, "tps": round(comp_tokens / elapsed, 2) if elapsed > 0 else 0,
         "slot": slot_name, "is_estimated": is_estimated, "truncated": truncated,
-        "raw_chars": len(result_text),
+        "finish_reason": finish_reason, "raw_chars": len(result_text),
     }
 
 
 # ------------------------------------------------------------------
-# Exploration policy: executable code, sandboxed
+# Exploration policy: executable code, isolated
 # ------------------------------------------------------------------
 
 DEFAULT_POLICY_SOURCE = '''\
@@ -2252,27 +2690,34 @@ def explore(ctx):
 _POLICY_BLOCKED_NAMES = {
     "open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
     "getattr", "setattr", "delattr", "input", "exit", "quit", "breakpoint",
-    "memoryview", "object", "super", "type",
+    "memoryview", "object", "super", "type", "BaseException", "print", "help",
+    "dir", "id", "hasattr", "classmethod", "staticmethod", "property",
 }
 
-_POLICY_SAFE_BUILTINS = {
-    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict, "divmod": divmod,
-    "enumerate": enumerate, "filter": filter, "float": float, "int": int, "len": len,
-    "list": list, "map": map, "max": max, "min": min, "pow": pow, "range": range,
-    "reversed": reversed, "round": round, "set": set, "sorted": sorted, "str": str,
-    "sum": sum, "tuple": tuple, "zip": zip, "True": True, "False": False, "None": None,
-    "Exception": Exception, "ValueError": ValueError, "KeyError": KeyError,
-    "IndexError": IndexError, "TypeError": TypeError,
+# Attribute names with no leading underscore that still reach interpreter
+# internals: frames (and through them module globals), code objects, tracebacks.
+_POLICY_BLOCKED_ATTRS = {
+    "gi_frame", "gi_code", "gi_yieldfrom", "gi_running", "gi_suspended",
+    "cr_frame", "cr_code", "cr_await", "cr_running", "cr_origin",
+    "ag_frame", "ag_code", "ag_await", "ag_running",
+    "f_back", "f_globals", "f_locals", "f_builtins", "f_code", "f_trace", "f_lineno",
+    "tb_frame", "tb_next", "tb_lasti", "tb_lineno", "with_traceback",
+    "co_code", "co_consts", "co_names", "func_globals", "func_code", "mro",
 }
+
+_POLICY_SAFE_BUILTIN_NAMES = [
+    "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter", "float", "int",
+    "len", "list", "map", "max", "min", "pow", "range", "reversed", "round", "set",
+    "sorted", "str", "sum", "tuple", "zip", "True", "False", "None", "Exception",
+    "ValueError", "KeyError", "IndexError", "TypeError", "ZeroDivisionError",
+    "ArithmeticError", "StopIteration", "isinstance", "frozenset",
+]
 
 
 def validate_policy_source(source: str) -> Tuple[bool, str]:
-    """Static check before any execution.
-
-    NOTE: this is a guardrail, not a sandbox. The policy is written by a model and
-    then executed in-process. It is acceptable here only because the whole cluster
-    is local and containerized; do not lift this into an environment where the
-    apex endpoint is untrusted."""
+    """Static check before any execution. Defence in depth only: the policy also
+    runs in a resource-limited child process that can reach the explorer solely
+    through the RPC surface in _POLICY_API."""
     if len(source) > POLICY_MAX_CHARS:
         return False, f"policy source exceeds {POLICY_MAX_CHARS} chars"
     try:
@@ -2280,49 +2725,258 @@ def validate_policy_source(source: str) -> Tuple[bool, str]:
     except SyntaxError as exc:
         return False, f"syntax error: {exc}"
 
-    has_explore = any(isinstance(n, ast.FunctionDef) and n.name == "explore"
-                      for n in tree.body)
+    has_explore = False
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef):
+            if stmt.name == "explore":
+                has_explore = True
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            continue  # docstring / bare constant
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            continue  # module-level constants
+        return False, f"top-level {type(stmt).__name__} is not permitted; only defs and constants"
     if not has_explore:
         return False, "no top-level explore(ctx) function"
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             return False, "imports are not permitted in an exploration policy"
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            return False, f"dunder/private attribute access '{node.attr}'"
+        if isinstance(node, (ast.AsyncFunctionDef, ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            return False, "async constructs are not permitted"
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                return False, f"dunder/private attribute access '{node.attr}'"
+            if node.attr in _POLICY_BLOCKED_ATTRS:
+                return False, f"interpreter-internal attribute '{node.attr}'"
         if isinstance(node, ast.Name) and node.id in _POLICY_BLOCKED_NAMES:
             return False, f"blocked name '{node.id}'"
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            return False, f"dunder name '{node.id}'"
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             return False, "global/nonlocal are not permitted"
-        if isinstance(node, (ast.While, ast.For)):
-            continue
+        if isinstance(node, ast.ExceptHandler) and node.type is None:
+            return False, "bare 'except:' is not permitted (it would swallow the step cap)"
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "__" in node.value:
+            return False, "string constants containing '__' are not permitted"
     return True, "ok"
 
 
-def load_policy_callable(source: str):
+# The child process. It sets its own resource limits before it ever sees policy
+# source, exposes a ctx proxy whose only reach into the parent is the RPC, and
+# re-raises the parent's step-cap abort as a BaseException subclass.
+_POLICY_CHILD_SRC = r'''
+import sys, json, resource, builtins
+
+def _lim(res, soft, hard=None):
+    try:
+        resource.setrlimit(res, (soft, soft if hard is None else hard))
+    except Exception:
+        pass
+
+_cpu, _mem = int(sys.argv[1]), int(sys.argv[2])
+_lim(resource.RLIMIT_CPU, _cpu, _cpu + 1)
+_lim(resource.RLIMIT_AS, _mem * 1024 * 1024)
+_lim(resource.RLIMIT_FSIZE, 0)
+_lim(resource.RLIMIT_CORE, 0)
+if hasattr(resource, "RLIMIT_NPROC"):
+    _lim(resource.RLIMIT_NPROC, 0)
+
+_rd, _wr, _fl = sys.stdin.readline, sys.stdout.write, sys.stdout.flush
+_loads, _dumps = json.loads, json.dumps
+_boot = _loads(_rd())
+_src, _names = _boot["source"], _boot["builtins"]
+_safe = {n: getattr(builtins, n) for n in _names if hasattr(builtins, n)}
+# No new file descriptors from here on: no files, sockets or pipes.
+_lim(resource.RLIMIT_NOFILE, 3)
+
+
+class PolicyAborted(BaseException):
+    pass
+
+
+def _call(m, *a):
+    _wr(_dumps({"m": m, "a": list(a)}) + "\n")
+    _fl()
+    line = _rd()
+    if not line:
+        raise PolicyAborted("parent closed the channel")
+    r = _loads(line)
+    if "abort" in r:
+        raise PolicyAborted(r["abort"])
+    if "fail" in r:
+        raise TypeError(r["fail"])
+    return r.get("r")
+
+
+def _norm(req):
+    try:
+        return [str(req[0]), str(req[1])]
+    except BaseException:
+        return None
+
+
+class Ctx:
+    __slots__ = ()
+    def tasks(self): return _call("tasks")
+    def root(self): return _call("root")
+    def budget_left(self): return _call("budget_left")
+    def spent(self): return _call("spent")
+    def nodes(self): return _call("nodes")
+    def frontier(self): return _call("frontier")
+    def best(self): return _call("best")
+    def best_per_task(self): return _call("best_per_task")
+    def note(self, msg): return _call("note", str(msg)[:200])
+    def expand(self, parent_id, task): return _call("expand", str(parent_id), str(task))
+    def expand_parallel(self, requests):
+        return _call("expand_parallel", [_norm(r) for r in list(requests)])
+
+
+_ns = {"__builtins__": _safe}
+try:
+    exec(compile(_src, "<policy>", "exec"), _ns)
+    _fn = _ns.get("explore")
+    if not callable(_fn):
+        raise ValueError("explore is not callable")
+    _fn(Ctx())
+    _out = {"done": True, "ok": True, "detail": "ok"}
+except PolicyAborted as _e:
+    _out = {"done": True, "ok": True, "detail": "aborted: %s" % _e}
+except BaseException as _e:
+    _out = {"done": True, "ok": False, "detail": "%s: %s" % (type(_e).__name__, str(_e)[:160])}
+_wr(_dumps(_out) + "\n")
+_fl()
+'''
+
+
+def run_policy(source: str, explorer: ExplorerBase,
+               wall_secs: Optional[float] = None) -> Tuple[bool, str]:
+    """Execute a policy in an isolated child process against `explorer`.
+
+    The child gets CPU/memory/file-size/fd/process limits and a clean env, and
+    can only call the methods in _POLICY_API. Pure-compute runaways die on
+    RLIMIT_CPU (waiting on the parent's agent calls costs the child no CPU, so
+    live rounds are unaffected); replay additionally gets a wall-clock cap."""
     ok, reason = validate_policy_source(source)
     if not ok:
-        raise ValueError(reason)
-    namespace = {"__builtins__": dict(_POLICY_SAFE_BUILTINS)}
-    exec(compile(source, "<policy>", "exec"), namespace)  # noqa: S102 - see validate_policy_source
-    fn = namespace.get("explore")
-    if not callable(fn):
-        raise ValueError("explore is not callable")
-    return fn
+        return False, reason
 
+    sandbox = Path(tempfile.mkdtemp(prefix="autoresearch_policy_"))
+    err_path = sandbox / "stderr.txt"
+    killed = {"why": None}
+    done = threading.Event()
+    result: Optional[Tuple[bool, str]] = None
+    try:
+        with open(err_path, "w") as err_fh:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", _POLICY_CHILD_SRC,
+                 str(POLICY_CPU_SECS), str(POLICY_MEM_MB)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err_fh,
+                text=True, encoding="ascii", errors="replace", bufsize=1,
+                cwd=str(sandbox), env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                start_new_session=True)
 
-def run_policy(source: str, explorer: ExplorerBase) -> Tuple[bool, str]:
-    try:
-        fn = load_policy_callable(source)
-    except Exception as exc:
-        return False, str(exc)[:200]
-    try:
-        fn(explorer)
-        return True, "ok"
-    except PolicyAborted as exc:
-        return True, f"aborted: {exc}"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:160]}"
+        def _kill(why: str):
+            if killed["why"] is None:
+                killed["why"] = why
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        def _watchdog():
+            t0 = time.time()
+            while not done.wait(0.5):
+                if _shutdown_event.is_set():
+                    _kill("shutdown requested")
+                    return
+                if wall_secs and time.time() - t0 > wall_secs:
+                    _kill(f"wall clock exceeded ({wall_secs:.0f}s)")
+                    return
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+        try:
+            proc.stdin.write(json.dumps({"source": source,
+                                         "builtins": _POLICY_SAFE_BUILTIN_NAMES}) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+        aborted_msg = None
+        post_abort = 0
+        rpc_calls = 0
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                _kill("malformed RPC from policy")
+                break
+            if msg.get("done"):
+                result = (bool(msg.get("ok")), str(msg.get("detail", ""))[:200])
+                break
+            m, args = msg.get("m"), msg.get("a") or []
+            rpc_calls += 1
+            if aborted_msg is None and rpc_calls > POLICY_MAX_RPC:
+                aborted_msg = f"policy exceeded {POLICY_MAX_RPC} interface calls (reads included)"
+            if aborted_msg is not None:
+                post_abort += 1
+                if post_abort > 50:
+                    _kill("kept calling after abort")
+                    break
+                resp = {"abort": aborted_msg}
+            elif m not in _POLICY_API:
+                resp = {"fail": f"unknown interface method '{m}'"}
+            else:
+                try:
+                    resp = {"r": getattr(explorer, m)(*args)}
+                except PolicyAborted as exc:
+                    aborted_msg = str(exc)
+                    resp = {"abort": aborted_msg}
+                except TypeError as exc:
+                    resp = {"fail": f"{m}: {exc}"}
+                except Exception as exc:
+                    resp = {"fail": f"{m}: {type(exc).__name__}: {str(exc)[:120]}"}
+            try:
+                proc.stdin.write(json.dumps(resp) + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                break
+
+        done.set()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill("did not exit")
+            proc.wait(timeout=5)
+
+        if result is not None:
+            return result
+        if killed["why"]:
+            return False, f"policy killed: {killed['why']}"
+        rc = proc.returncode
+        if rc is not None and rc < 0:
+            sig = -rc
+            if sig == getattr(signal, "SIGXCPU", 24) or sig == signal.SIGKILL:
+                return False, f"policy killed: CPU limit ({POLICY_CPU_SECS}s)"
+            if sig == getattr(signal, "SIGXFSZ", 25):
+                return False, "policy killed: attempted file write"
+            return False, f"policy killed by signal {sig}"
+        tail = ""
+        try:
+            tail = (err_path.read_text(errors="replace").strip().splitlines() or [""])[-1]
+        except Exception:
+            pass
+        return False, f"policy process exited ({rc}) {tail[:160]}".strip()
+    finally:
+        done.set()
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 def policy_path(run_dir: Path, rnd: int) -> Path:
@@ -2335,6 +2989,10 @@ def load_or_init_policy(run_dir: Path, rnd: int) -> str:
         src = read_file_content_safe(path)
         if src and src.strip():
             return src
+    if rnd > 1:
+        print(f"    [!] WARNING: {path.name} not found; deploying pi_0 for round {rnd:02d}. "
+              f"The dreamed policy lineage is broken here.", flush=True)
+        append_event(run_dir, {"round": rnd, "event": "policy_missing", "fallback": "pi_0"})
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="ascii") as f:
         f.write(DEFAULT_POLICY_SOURCE)
@@ -2345,27 +3003,55 @@ def load_or_init_policy(run_dir: Path, rnd: int) -> str:
 # Replay scoring and dreaming
 # ------------------------------------------------------------------
 
+def pool_untested_prior(pool: List[Tuple[int, List[dict]]]) -> Tuple[float, int]:
+    """Prior pass rate for untested nodes during replay evaluation. Tested nodes
+    are the top-k by online score, so this mean is if anything optimistic for
+    the untested remainder - but it tracks reality, unlike a constant."""
+    rates = [n["test_pass_rate"] for _, nodes in pool for n in nodes
+             if n.get("task") and n.get("test_pass_rate") is not None]
+    if EVAL_UNTESTED_PRIOR_MODE != "empirical" or len(rates) < EVAL_EMPIRICAL_MIN_TESTED:
+        return EVAL_UNTESTED_PRIOR, len(rates)
+    return sum(rates) / len(rates), len(rates)
+
+
+def _replay_eval_score(n: dict, prior: float) -> float:
+    """Final score of a node for replay EVALUATION. Tested nodes keep their
+    test-informed score; untested nodes with files are re-blended against the
+    pool prior; nodes with no files keep their (zero-rate) score."""
+    if n.get("test_pass_rate") is not None or not n.get("files"):
+        return float(n.get("score", 0.0))
+    h = n.get("heuristic_score")
+    if h is None:
+        return float(n.get("score", 0.0))
+    return EVAL_HEURISTIC_MIX * float(h) + (1.0 - EVAL_HEURISTIC_MIX) * prior
+
+
 def replay_score(source: str, pool: List[Tuple[int, List[dict]]], tasks: List[str],
-                 budget: int) -> dict:
+                 budget: int, prior: Optional[float] = None) -> dict:
     """Score a candidate policy by dreaming it over every recorded tree. Zero
     agent calls: each expansion resolves to a node whose outcome is already on
-    disk."""
+    disk. The policy decides on score_online (what it would have seen live); the
+    result is evaluated on the final, test-informed score."""
+    if prior is None:
+        prior, _ = pool_untested_prior(pool)
     per_tree = []
     for rnd, nodes in pool:
         ex = ReplayExplorer(nodes, tasks, budget)
-        ok, detail = run_policy(source, ex)
+        ok, detail = run_policy(source, ex, wall_secs=POLICY_REPLAY_WALL_SECS)
         if not ok:
             return {"valid": False, "detail": detail, "score": -1.0,
                     "cost": 0, "per_tree": []}
-        best = ex.best()
-        best_score = best["score"] if best else 0.0
-        covered = ex.best_per_task()
+        covered: Dict[str, float] = {}
+        for n in ex._real():
+            v = _replay_eval_score(n, prior)
+            if v > covered.get(n["task"], -1.0):
+                covered[n["task"]] = v
         coverage = len(covered) / max(1, len(tasks))
         per_tree.append({
-            "round": rnd, "best": round(best_score, 6), "cost": ex.spent(),
+            "round": rnd, "best": round(max(covered.values(), default=0.0), 6),
+            "cost": ex.spent(), "unrecorded": ex._unrecorded,
             "coverage": round(coverage, 4),
-            "mean_best": round(sum(n["score"] for n in covered.values()) / max(1, len(covered)), 6)
-                         if covered else 0.0,
+            "mean_best": round(sum(covered.values()) / len(covered), 6) if covered else 0.0,
         })
 
     if not per_tree:
@@ -2375,14 +3061,16 @@ def replay_score(source: str, pool: List[Tuple[int, List[dict]]], tasks: List[st
     mean_best = sum(t["mean_best"] for t in per_tree) / len(per_tree)
     mean_cov = sum(t["coverage"] for t in per_tree) / len(per_tree)
     mean_cost = sum(t["cost"] for t in per_tree) / len(per_tree)
-    # Primary objective: quality of the best deliverable per task, weighted by how
-    # much of the roster was covered at all. Cost enters only as a tie-break, so a
-    # policy is never rewarded for simply spending less and finding nothing.
-    score = mean_best * (DREAM_COVERAGE_FLOOR + (1 - DREAM_COVERAGE_FLOOR) * mean_cov)
+    quality = mean_best * (DREAM_COVERAGE_FLOOR + (1 - DREAM_COVERAGE_FLOOR) * mean_cov)
+    cost_pen = DREAM_COST_WEIGHT * mean_cost / max(1, budget)
+    score = quality - cost_pen
     return {
         "valid": True, "detail": "ok", "score": round(score, 6),
+        "quality": round(quality, 6), "cost_penalty": round(cost_pen, 6),
+        "prior": round(prior, 4),
         "mean_best": round(mean_best, 6), "coverage": round(mean_cov, 4),
         "cost": round(mean_cost, 2),
+        "unrecorded": sum(t["unrecorded"] for t in per_tree),
         "efficiency": round(score / mean_cost, 6) if mean_cost else 0.0,
         "per_tree": per_tree,
     }
@@ -2394,7 +3082,9 @@ def _policy_interface_doc() -> str:
         "  ctx.tasks() -> list of task ids, e.g. ['t01','t02']\n"
         "  ctx.root() -> id of the tree root\n"
         "  ctx.expand(parent_id, task) -> node dict or None\n"
-        "  ctx.expand_parallel([(parent_id, task), ...]) -> list of node-or-None, run concurrently\n"
+        "  ctx.expand_parallel([(parent_id, task), ...]) -> list of node-or-None, aligned 1:1\n"
+        f"      with the requests. Runs concurrently in batches of {POLICY_MAX_FANOUT}; each batch\n"
+        "      counts as one interface call.\n"
         "  ctx.frontier() -> expanded nodes with no expanded children\n"
         "  ctx.nodes() -> every node expanded so far this run\n"
         "  ctx.best() -> highest-scoring node so far, or None\n"
@@ -2402,18 +3092,21 @@ def _policy_interface_doc() -> str:
         "  ctx.budget_left() / ctx.spent() -> ints, budget is in agent calls\n"
         "  ctx.note(msg) -> record a short diagnostic string\n"
         "\n"
-        "A node dict has: id, parent, task, depth, score (0..1), status, cost, files.\n"
+        "A node dict has: id, parent, task, depth, score (0..1), gain, status, cost, files.\n"
+        "  gain = score minus the parent attempt's score for a continuation (None at depth 1).\n"
+        "  A continuation starts from its parent's files and only changes what it improves.\n"
+        "  cost can exceed 1: failed attempts are retried and every real call is charged.\n"
         "expand returns None when the budget is exhausted, the request is malformed, or\n"
-        "- during replay - history never recorded that branch. None is information: it\n"
-        "means the dream has reached its edge.\n"
+        "- during replay - history never recorded that branch. An unrecorded branch still\n"
+        "costs 1 budget unit, exactly as a real call would online. None is information.\n"
         "\n"
         "HARD RULES\n"
-        "  1. Define exactly one top-level function: explore(ctx). No other top-level code.\n"
-        "  2. No imports of any kind. No file, network or system access. Pure control flow.\n"
-        f"  3. At most {POLICY_MAX_FANOUT} requests per expand_parallel call, "
-        f"at most {POLICY_MAX_STEPS} interface calls total.\n"
-        "  4. Terminate. Every loop must make progress toward budget exhaustion or break.\n"
-        "  5. Output ONLY Python source, no markdown fences, no commentary."
+        "  1. Define exactly one top-level function: explore(ctx). Helper defs and constants are ok.\n"
+        "  2. No imports, no print, no file/network/system access. Pure control flow.\n"
+        "  3. No attribute or name starting with '_', no bare 'except:'.\n"
+        f"  4. At most {POLICY_MAX_STEPS} interface calls total; exceeding it ends the run.\n"
+        "  5. Terminate. Every loop must make progress toward budget exhaustion or break.\n"
+        "  6. Output ONLY Python source, no markdown fences, no commentary."
     )
 
 
@@ -2424,21 +3117,49 @@ def _pool_summary(pool: List[Tuple[int, List[dict]]], tasks: List[str]) -> str:
         if not real:
             continue
         depths: Dict[int, int] = {}
+        gains: Dict[int, List[float]] = {}
         for n in real:
-            depths[n["depth"]] = depths.get(n["depth"], 0) + 1
+            d = n.get("depth", 0)
+            depths[d] = depths.get(d, 0) + 1
+            if isinstance(n.get("gain"), (int, float)):
+                gains.setdefault(d, []).append(n["gain"])
         by_task: Dict[str, List[float]] = {}
         for n in real:
-            by_task.setdefault(n["task"], []).append(n["score"])
-        gains = []
+            by_task.setdefault(n["task"], []).append(n.get("score_online", n.get("score", 0.0)))
+        best = []
         for t in sorted(by_task):
             s = sorted(by_task[t])
-            gains.append(f"{t}:{s[-1]:.2f}(n={len(s)})")
+            best.append(f"{t}:{s[-1]:.2f}(n={len(s)})")
+        tested = [n for n in real if n.get("test_pass_rate") is not None]
+        gain_s = ", ".join(f"d{d}:{sum(g)/len(g):+.3f}(n={len(g)})" for d, g in sorted(gains.items()))
         lines.append(
             f"round {rnd:02d}: {len(real)} nodes, depth histogram "
             + ", ".join(f"d{d}={c}" for d, c in sorted(depths.items()))
-            + " | best per task " + " ".join(gains)
+            + (f" | mean gain by depth {gain_s}" if gain_s else "")
+            + (f" | tested {len(tested)} node(s), mean pass "
+               f"{sum(n['test_pass_rate'] for n in tested)/len(tested):.2f}" if tested else "")
+            + " | best per task " + " ".join(best)
         )
     return "\n".join(lines) or "(pool is empty)"
+
+
+def _select_winner(results: List[dict]) -> dict:
+    """Incumbent-stable selection. A challenger must beat the incumbent by more
+    than DREAM_TIE_EPS; ties keep the incumbent (or, with DREAM_PREFER_CHEAPER,
+    the cheapest tied policy)."""
+    valid = [r for r in results if r["valid"]]
+    incumbent = results[0] if results and results[0]["valid"] else None
+    if not valid:
+        return results[0]
+    best = max(valid, key=lambda r: r["score"])
+    if incumbent is None:
+        return best
+    if best["score"] > incumbent["score"] + DREAM_TIE_EPS:
+        return best
+    if DREAM_PREFER_CHEAPER:
+        tied = [r for r in valid if r["score"] >= incumbent["score"] - DREAM_TIE_EPS]
+        return min(tied, key=lambda r: (r.get("cost", 0), -r["score"], r["index"]))
+    return incumbent
 
 
 def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
@@ -2447,22 +3168,40 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     """Offline policy improvement. The policy-development agent runs on APEX -
     it is a planning task, not an agent assignment and not a merge.
 
-    The deployed policy is entered as candidate 0, so the winner is never worse
-    than what it replaces."""
+    The deployed policy is entered as candidate 0 and wins ties, so the winner
+    is never worse than what it replaces on the recorded pool."""
+    # Candidates are replayed under the cap the policy actually gets online.
+    budget = policy_budget(budget, len(tasks))
+    prior, n_tested = pool_untested_prior(pool)
     print(f"\n[DREAM] Round {rnd:02d}: replaying candidate policies over "
-          f"{len(pool)} recorded tree(s) at zero agent calls...", flush=True)
+          f"{len(pool)} recorded tree(s) at zero agent calls "
+          f"(policy budget {budget}, untested prior {prior:.3f} from {n_tested} tested node(s), "
+          f"cost weight {DREAM_COST_WEIGHT})...", flush=True)
+
+    def _board(name: str, r: dict) -> str:
+        if not r["valid"]:
+            return f"{name}: REJECTED - {r['detail'][:80]}"
+        trees = "; ".join(f"r{t['round']:02d} cost {t['cost']} off-map {t['unrecorded']} "
+                          f"cov {t['coverage']:.2f}" for t in r.get("per_tree", []))
+        return (f"{name}: score {r['score']:.4f} (quality {r.get('quality', 0):.4f} "
+                f"- cost {r.get('cost_penalty', 0):.4f}), mean cost {r.get('cost', 0)}, "
+                f"off-map requests {r.get('unrecorded', 0)} [{trees}]")
 
     ddir = dream_dir_for(run_dir) / f"round{rnd:02d}"
     ddir.mkdir(parents=True, exist_ok=True)
 
     candidates = [{"name": "pi_0 (deployed)", "source": current_source}]
-    base = replay_score(current_source, pool, tasks, budget)
+    base = replay_score(current_source, pool, tasks, budget, prior)
     results = [dict(base, name="pi_0 (deployed)", index=0)]
-    print(f"    [+] pi_0 (deployed): score {base['score']:.4f} "
-          f"| mean_best {base.get('mean_best', 0):.4f} "
-          f"| coverage {base.get('coverage', 0):.2f} | cost {base.get('cost', 0)}", flush=True)
-
-    leaderboard = f"pi_0 (deployed): score {base['score']:.4f}, cost {base.get('cost', 0)}"
+    if base["valid"]:
+        print(f"    [+] pi_0 (deployed): score {base['score']:.4f} "
+              f"| mean_best {base.get('mean_best', 0):.4f} "
+              f"| coverage {base.get('coverage', 0):.2f} | cost {base.get('cost', 0)}", flush=True)
+        leaderboard = _board("pi_0 (deployed)", base)
+    else:
+        print(f"    [!] Deployed policy does not replay ({base['detail'][:80]}); "
+              f"any valid revision will replace it.", flush=True)
+        leaderboard = f"pi_0 (deployed): INVALID IN REPLAY - {base['detail'][:80]}"
     client = apex_client(timeout=WORKER_TIMEOUT_SECS)
 
     for m in range(1, DREAM_CANDIDATES + 1):
@@ -2473,7 +3212,13 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
             f"===== CURRENT POLICY SOURCE =====\n{fit_context(current_source, 6000)}\n\n"
             f"===== RECORDED DISCOVERY HISTORY =====\n{fit_context(_pool_summary(pool, tasks), 6000)}\n\n"
             f"===== REPLAY LEADERBOARD SO FAR =====\n{leaderboard}\n\n"
-            f"===== BUDGET =====\nEach replay is capped at {budget} agent calls.\n\n"
+            f"===== BUDGET AND OBJECTIVE =====\nEach replay is capped at {budget} agent calls. "
+            f"score = quality - {DREAM_COST_WEIGHT} * (calls spent / {budget}), where quality is "
+            f"mean best-per-task score scaled by roster coverage. Unspent calls are saved, so "
+            f"stopping a line that has plateaued is rewarded. 'off-map' counts requests for "
+            f"branches history never recorded: each returned None and still cost a call - "
+            f"a high count means the policy is steering where the recorded trees cannot follow. "
+            f"A revision must beat the incumbent by more than {DREAM_TIE_EPS} to be adopted.\n\n"
             f"Write revision {m} of the exploration policy. Change the search SHAPE - "
             f"branching, parallel grouping, depth allocation, stopping - not the agents' "
             f"objectives. Output only Python."
@@ -2489,7 +3234,7 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
         with open(ddir / f"candidate_{m:02d}.py", "w", encoding="ascii") as f:
             f.write(enforce_ascii(source) + "\n")
 
-        res = replay_score(source, pool, tasks, budget)
+        res = replay_score(source, pool, tasks, budget, prior)
         res.update({"name": f"pi_{m}", "index": m})
         results.append(res)
         candidates.append({"name": f"pi_{m}", "source": source})
@@ -2498,14 +3243,15 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
             print(f"    [+] pi_{m}: score {res['score']:.4f} "
                   f"| mean_best {res.get('mean_best', 0):.4f} "
                   f"| coverage {res.get('coverage', 0):.2f} | cost {res.get('cost', 0)}", flush=True)
-            leaderboard += f"\npi_{m}: score {res['score']:.4f}, cost {res.get('cost', 0)}"
         else:
             print(f"    [!] pi_{m}: rejected ({res['detail'][:80]})", flush=True)
-            leaderboard += f"\npi_{m}: REJECTED - {res['detail'][:80]}"
+        leaderboard += "\n" + _board(f"pi_{m}", res)
 
-    valid = [r for r in results if r["valid"]]
-    # Tie-break on cost: equal quality, fewer agent calls wins.
-    winner = max(valid, key=lambda r: (r["score"], -r.get("cost", 0)))
+    winner = _select_winner(results)
+    if not winner["valid"]:
+        # Nothing replays - not even the incumbent. Keep deploying it rather than
+        # crash; the live round falls back to pi_0 if it fails there too.
+        winner = results[0]
     winner_source = next(c["source"] for c in candidates if c["name"] == winner["name"])
 
     with open(ddir / "scores.json", "w", encoding="ascii") as f:
@@ -2513,10 +3259,13 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
 
     next_path = policy_path(run_dir, rnd + 1)
     next_path.parent.mkdir(parents=True, exist_ok=True)
+    body = enforce_ascii(winner_source).rstrip()
+    # Strip a previous selection header so headers do not accumulate.
+    body = re.sub(r'\A(# Deployed for round .*\n# Replay score .*\n)+', '', body + "\n").rstrip()
     with open(next_path, "w", encoding="ascii") as f:
         f.write(f"# Deployed for round {rnd + 1}. Selected by replay over {len(pool)} tree(s).\n"
                 f"# Replay score {winner['score']:.4f} (pi_0 baseline {base['score']:.4f}).\n"
-                + enforce_ascii(winner_source).rstrip() + "\n")
+                + body + "\n")
 
     improved = winner["name"] != "pi_0 (deployed)"
     print(f"    [+] Winner: {winner['name']} (score {winner['score']:.4f} vs "
@@ -2525,7 +3274,7 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
 
     append_event(run_dir, {
         "round": rnd, "event": "dream", "candidates": len(results),
-        "valid": len(valid), "winner": winner["name"],
+        "valid": len([r for r in results if r["valid"]]), "winner": winner["name"],
         "winner_score": winner["score"], "baseline_score": base["score"],
         "improved": improved,
     })
@@ -2533,7 +3282,7 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     return winner_source, {
         "round": rnd, "winner": winner["name"], "winner_score": winner["score"],
         "baseline_score": base["score"], "candidates": len(results),
-        "valid": len(valid), "improved": improved,
+        "valid": len([r for r in results if r["valid"]]), "improved": improved,
     }
 
 
@@ -2645,6 +3394,13 @@ def best_nodes_for_round(nodes: List[dict]) -> Dict[str, dict]:
     return best
 
 
+# Boilerplate that legitimately appears in every package; identical copies are
+# not duplicate WORK and should not become high-priority TO-DOs downstream.
+_RECONCILE_TRIVIAL_NAMES = {"__init__.py", "py.typed", ".gitignore", ".gitkeep", "license",
+                            "license.txt", "license.md", "copying", "conftest.py"}
+RECONCILE_MIN_DUP_CHARS = int(os.getenv("RECONCILE_MIN_DUP_CHARS", "64"))
+
+
 def reconcile_round(run_dir: Path, rnd: int, roster: List[dict],
                     nodes: List[dict]) -> Tuple[str, dict]:
     """Filesystem walk plus content hashing over each task's BEST node. Finds the
@@ -2667,9 +3423,11 @@ def reconcile_round(run_dir: Path, rnd: int, roster: List[dict],
             rel = path.relative_to(wroot)
             owner = dir_to_agent.get(node.get("dir", ""), task)
             per_agent_counts[owner] = per_agent_counts.get(owner, 0) + 1
-            digest = _file_digest(path)
-            if digest:
-                by_hash.setdefault(digest, []).append(f"{owner}:{rel}")
+            if path.name.lower() in _RECONCILE_TRIVIAL_NAMES:
+                continue
+            body = read_file_content_safe(path) or ""
+            if len(_normalise_for_hash(body)) >= RECONCILE_MIN_DUP_CHARS:
+                by_hash.setdefault(content_hash(body), []).append(f"{owner}:{rel}")
             by_basename.setdefault(path.name.lower(), []).append(f"{owner}:{rel}")
 
     dup_content = {h: v for h, v in by_hash.items() if len({e.split(':', 1)[0] for e in v}) > 1}
@@ -2687,7 +3445,7 @@ def reconcile_round(run_dir: Path, rnd: int, roster: List[dict],
     lines.append(f"- **Tasks reached:** {len(best)} of {len(roster)}"
                  + (f" (never expanded: {uncovered})" if uncovered else ""))
     lines.append(f"- **Tasks with a failed best attempt:** {len(failed)} {failed if failed else ''}")
-    lines.append(f"- **Attempts truncated on wall clock:** {len(truncated)} {truncated if truncated else ''}")
+    lines.append(f"- **Attempts cut off (output limit or wall clock):** {len(truncated)} {truncated if truncated else ''}")
     lines.append(f"- **Scope violations recorded:** {len(violations)}")
     lines.append(f"- **Identical files across agents:** {len(dup_content)}")
     lines.append(f"- **Colliding filenames across agents:** {len(dup_names)}")
@@ -2761,16 +3519,32 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
     slot_queue, slot_count = build_worker_slot_queue(prefix="A-Slot")
 
     print(f"\n[3] ROUND {rnd:02d}: deploying {policy_path(run_dir, rnd).name} over "
-          f"{len(tasks)} assignment(s), budget {budget} agent call(s), "
+          f"{len(tasks)} assignment(s), budget {budget} agent call(s) "
+          f"({budget - support_reserve(budget, len(tasks))} policy + "
+          f"{support_reserve(budget, len(tasks))} support), "
           f"{slot_count} slot(s) [{WORKER_MODEL}]...", flush=True)
 
-    explorer = LiveExplorer(tasks, budget, roster, rnd, background, run_dir,
-                            slot_queue, semantic_guidance=semantic_guidance)
+    # Novelty reference for fresh (depth-1) attempts: everything this task has
+    # already produced in earlier rounds. Continuations compare to their parent.
+    prior_hashes: Dict[str, Set[str]] = {}
+    for prnd, pnodes in load_pool(run_dir):
+        if prnd >= rnd:
+            continue
+        for n in pnodes:
+            if n.get("task"):
+                prior_hashes.setdefault(n["task"], set()).update(n.get("file_hashes", []))
+
+    reserve = support_reserve(budget, len(tasks))
+    explorer = LiveExplorer(tasks, budget - reserve, roster, rnd, background, run_dir,
+                            slot_queue, prior_hashes=prior_hashes,
+                            semantic_guidance=semantic_guidance)
     start = time.time()
     ok, detail = run_policy(policy_source, explorer)
     print()
 
-    if not ok:
+    if not ok and _shutdown_event.is_set():
+        print(f"    [!] Policy stopped for shutdown ({detail}).", flush=True)
+    elif not ok:
         print(f"    [!] Deployed policy failed ({detail}). Falling back to pi_0 for the "
               f"remaining budget.", flush=True)
         append_event(run_dir, {"round": rnd, "event": "policy_failure", "detail": detail})
@@ -2779,6 +3553,19 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
     elif detail != "ok":
         print(f"    [~] Policy {detail}", flush=True)
 
+    support_spent = 0
+    if reserve > 0 and not _shutdown_event.is_set():
+        # The policy's cap was budget - reserve; lift it by exactly the reserve.
+        # Calls the policy chose not to spend are NOT handed to the probes, or
+        # stopping early would stop saving anything.
+        with explorer._lock:
+            explorer._budget = explorer._spent + reserve
+        support_spent = explorer.run_support_probes(reserve)
+        print()
+        print(f"    [+] Support probes: {support_spent}/{reserve} call(s) off-policy.", flush=True)
+        append_event(run_dir, {"round": rnd, "event": "support", "reserved": reserve,
+                               "spent": support_spent})
+
     nodes = [n for n in explorer._nodes if n.get("task")]
     elapsed = time.time() - start
     print(f"    [+] Round {rnd:02d} online phase complete: {len(nodes)} node(s), "
@@ -2786,6 +3573,7 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
 
     report, stats = reconcile_round(run_dir, rnd, roster, nodes)
     stats["spent"] = explorer.spent()
+    stats["support_spent"] = support_spent
     stats["elapsed"] = round(elapsed, 2)
     print(f"    [+] Reconciled round {rnd:02d}: {stats['files']} file(s), "
           f"{stats['dup_content']} duplicate artifact(s), "
@@ -2817,7 +3605,8 @@ def writeback_test_scores(run_dir: Path, rnd: int, results: List[dict]) -> int:
         rate = passed / len(rs)
         n["test_pass_rate"] = round(rate, 4)
         n["test_count"] = len(rs)
-        n["score"] = blend_test_score(n.get("heuristic_score", n["score"]), rate)
+        n["score"] = blend_test_score(n.get("heuristic_score", n["score"]), rate,
+                                      bool(n.get("files")))
         touched += 1
     if touched:
         rewrite_tree(run_dir, rnd, nodes)
@@ -2982,36 +3771,168 @@ def _extract_error_line(output: str, lang: str) -> str:
     return filtered_lines[-1].strip()
 
 
-def _sanitize_requirements_file(filepath: Path) -> None:
+_REQ_LINE_RE = re.compile(
+    r'^([A-Za-z0-9][A-Za-z0-9._-]*)'                     # name
+    r'(\[[A-Za-z0-9._,\s-]+\])?'                          # extras
+    r'\s*((?:==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9.*+!_-]+'    # first specifier
+    r'(?:\s*,\s*(?:==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9.*+!_-]+)*)?\s*$')
+
+
+def sanitize_requirements(text: str) -> Tuple[List[str], List[str]]:
+    """Keep only plain `name[extras] <specifiers>` lines. Everything that can make
+    pip fetch or execute something other than a named index package is dropped:
+    URLs and `pkg @ url`, -e/-r/-c, --index-url/--extra-index-url, local paths,
+    environment markers. Returns (kept, dropped)."""
+    kept, dropped = [], []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        m = _REQ_LINE_RE.match(line)
+        if not m:
+            dropped.append(line)
+            continue
+        name = m.group(1).lower().replace("_", "-")
+        if TEST_PIP_ALLOWLIST and name not in TEST_PIP_ALLOWLIST:
+            dropped.append(line)
+            continue
+        kept.append(line)
+    return kept, dropped
+
+
+def _run_limited(cmd: List[str], timeout: float, cwd: Path, env: Dict[str, str],
+                 cpu: int = TEST_CPU_SECS, mem_mb: int = TEST_MEM_MB,
+                 fsize_mb: int = TEST_FSIZE_MB) -> Tuple[Optional[int], str, bool]:
+    """Run model-written code (or tooling acting on it) under CPU, address-space
+    and file-size limits in its own process group; a timeout kills the whole
+    group, not just the direct child. Returns (returncode, output, timed_out)."""
+    wrapped = ["bash", "-c",
+               'ulimit -t %d; ulimit -v %d; ulimit -f %d; ulimit -c 0; exec "$@"'
+               % (cpu, mem_mb * 1024, fsize_mb * 1024), "limited"] + cmd
+    proc = subprocess.Popen(wrapped, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            encoding="ascii", errors="ignore", start_new_session=True)
     try:
-        with open(filepath, 'r', encoding='utf-8', errors="ignore") as f:
-            lines = f.readlines()
-        cleaned_lines = []
-        valid_req_pattern = re.compile(r'^([A-Za-z0-9_\-\.\[\]]+\s*(==|>=|<=|~=|!=|<|>|@).*|-[re]\s+.*|#.*)$')
-        for line in lines:
-            s_line = line.strip()
-            if not s_line:
-                cleaned_lines.append(line)
-                continue
-            if valid_req_pattern.match(s_line) or (s_line.isalnum() or re.match(r'^[A-Za-z0-9_\-\.\[\]]+$', s_line)):
-                cleaned_lines.append(line)
-        with open(filepath, 'w', encoding='utf-8', errors="ignore") as f:
-            f.writelines(cleaned_lines)
-    except Exception as e:
-        print(f"Warning: Could not sanitize requirements file {filepath}: {e}")
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, out or "", False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        out, _ = proc.communicate()
+        return None, out or "", True
+
+
+def _test_env(test_root: Path, venv_bin: Optional[Path], pythonpath: str = "") -> Dict[str, str]:
+    """Clean environment for generated code: no inherited API keys or endpoints."""
+    home = test_root / ".home"
+    home.mkdir(parents=True, exist_ok=True)
+    path = "/usr/local/bin:/usr/bin:/bin"
+    if venv_bin:
+        path = f"{venv_bin}:{path}"
+    env = {"PATH": path, "HOME": str(home), "TMPDIR": str(home), "LANG": "C",
+           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"}
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
+    return env
+
+
+def ensure_test_venv(run_dir: Path) -> Tuple[str, Optional[Path]]:
+    """Run-scoped venv for Phase 5 so model-chosen dependencies never land in the
+    host interpreter. Inherits system site-packages for pytest and the numeric
+    stack. Falls back to the current interpreter WITHOUT installs if it cannot
+    be created."""
+    venv_dir = run_dir / "tests" / ".venv"
+    py = venv_dir / "bin" / "python"
+    if not py.exists():
+        try:
+            subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)],
+                           capture_output=True, timeout=180, check=True)
+        except Exception as exc:
+            print(f"    [!] Could not create test venv ({str(exc)[:80]}); tests run on the host "
+                  f"interpreter and dependency installs are skipped.", flush=True)
+            return sys.executable, None
+    env = _test_env(run_dir / "tests", venv_dir / "bin")
+    rc, _, _ = _run_limited([str(py), "-c", "import pytest"], 60, run_dir / "tests", env)
+    if rc != 0 and TEST_PIP_INSTALL:
+        _run_limited([str(py), "-m", "pip", "install", "--only-binary=:all:", "--no-input",
+                      "--disable-pip-version-check", "pytest"], 300, run_dir / "tests", env)
+    return str(py), venv_dir / "bin"
+
+
+def install_round_requirements(run_dir: Path, nodes_tested: List[dict], rnd: int,
+                               py: str, venv_bin: Optional[Path]) -> None:
+    """Install ONLY the requirements declared by the nodes under test this round,
+    after sanitising a COPY (the agents' deliverables are never rewritten), as
+    binary wheels only so no sdist build script runs."""
+    if not TEST_PIP_INSTALL or venv_bin is None:
+        return
+    wroot = work_dir_for(run_dir)
+    kept_all: List[str] = []
+    dropped_all: List[str] = []
+    for node in nodes_tested:
+        ndir = wroot / node.get("dir", "") / node["id"]
+        if not ndir.exists():
+            continue
+        for req in sorted(ndir.rglob("requirements*.txt")):
+            kept, dropped = sanitize_requirements(read_file_content_safe(req) or "")
+            kept_all.extend(k for k in kept if k not in kept_all)
+            dropped_all.extend(dropped)
+    if dropped_all:
+        print(f"    [!] Dropped {len(dropped_all)} requirement line(s) that were not plain "
+              f"index packages{' or not allowlisted' if TEST_PIP_ALLOWLIST else ''}: "
+              f"{', '.join(dropped_all[:5])}{' ...' if len(dropped_all) > 5 else ''}", flush=True)
+    if not kept_all:
+        return
+    test_root = run_dir / "tests" / f"round{rnd:02d}"
+    test_root.mkdir(parents=True, exist_ok=True)
+    req_copy = test_root / "requirements.sanitized.txt"
+    with open(req_copy, "w", encoding="ascii") as f:
+        f.write("\n".join(kept_all) + "\n")
+    env = _test_env(run_dir / "tests", venv_bin)
+    rc, out, timed_out = _run_limited(
+        [py, "-m", "pip", "install", "--only-binary=:all:", "--no-input",
+         "--disable-pip-version-check", "-r", str(req_copy)], 600, test_root, env)
+    if rc != 0:
+        tail = (out.strip().splitlines() or ["(no output)"])[-1]
+        print(f"    [!] Warning: pip install {'timed out' if timed_out else 'failed'} "
+              f"for round requirements: {tail[:120]}", flush=True)
+
+
+def top_nodes_per_task(nodes: List[dict], k: int) -> List[dict]:
+    """The k best nodes per task by decision-time score (deeper first on ties).
+    Testing more than the single best gives replay a test-informed signal on
+    whether continuing a line actually paid, not just on the winner."""
+    by_task: Dict[str, List[dict]] = {}
+    for n in nodes:
+        if n.get("task") and n.get("files"):
+            by_task.setdefault(n["task"], []).append(n)
+    out = []
+    for task in sorted(by_task):
+        ranked = sorted(by_task[task], key=lambda n: (n.get("score_online", n.get("score", 0.0)),
+                                                       n.get("depth", 0)), reverse=True)
+        out.extend(ranked[:k])
+    return out
+
+
+def _test_filename(artifact_name: str) -> str:
+    stem, suffix = Path(artifact_name).stem, Path(artifact_name).suffix.lower()
+    if suffix == ".h":
+        return f"test_{stem}_h.c"
+    if suffix == ".hpp":
+        return f"test_{stem}_hpp.cpp"
+    return f"test_{stem}{suffix}"
 
 
 def collect_testable_artifacts(run_dir: Path, roster: List[dict],
                                nodes: List[dict]) -> List[dict]:
-    """Only each task's BEST node is tested. Sibling attempts at the same
-    objective exist in the tree for replay, not for the test budget, so cost
-    stays proportional to the roster rather than to the node count."""
+    """Testable files of the top TEST_NODES_PER_TASK nodes per task."""
     wroot = work_dir_for(run_dir)
     if not wroot.exists():
         return []
-    best = best_nodes_for_round(nodes)
     artifacts = []
-    for task, node in sorted(best.items()):
+    for node in top_nodes_per_task(nodes, TEST_NODES_PER_TASK):
         ndir = wroot / node.get("dir", "") / node["id"]
         if not ndir.exists():
             continue
@@ -3025,19 +3946,22 @@ def collect_testable_artifacts(run_dir: Path, roster: List[dict],
             if content is None or not content.strip():
                 continue
             artifacts.append({
-                "agent": task,
+                "agent": node["task"],
                 "node": node["id"],
                 "filename": path.name,
                 "relative_path": str(path.relative_to(wroot)),
                 "language": lang,
                 "filepath": str(path),
                 "content": content,
+                "content_hash": content_hash(content),
             })
     return artifacts
 
 
 def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, test_output_dir: Path,
-                                  progress_lock: threading.Lock, progress_state: dict) -> Optional[dict]:
+                                  progress_lock: threading.Lock, progress_state: dict) -> Optional[str]:
+    """Generate one test for an artifact. Returns the generated test SOURCE (the
+    caller writes it into every node that carries identical content)."""
     endpoint_url = None
     deadline = time.time() + (MAX_RETRIES * TEST_TIMEOUT_SECS)
     while time.time() < deadline:
@@ -3053,9 +3977,15 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
 
     try:
         code_content = fit_context(artifact['content'], MAX_CONTEXT_CHARS)
+        lang = artifact['language']
+        extra = ""
+        if lang in ("c", "cpp"):
+            extra = (f"\nInclude it exactly as: #include \"{artifact['filename']}\". "
+                     f"If the file defines its own main(), it is renamed to "
+                     f"autoresearch_artifact_main() before compiling, so write your own main().")
         prompt = (
-            f"File: {artifact['filename']}\n"
-            f"```{artifact['language']}\n{code_content}\n```"
+            f"File: {artifact['filename']}{extra}\n"
+            f"```{lang}\n{code_content}\n```"
         )
         payload = {
             "model": WORKER_MODEL,
@@ -3069,122 +3999,118 @@ def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, t
             "presence_penalty": LLM_PRESENCE_PENALTY,
             "max_tokens": MAX_OUTPUT_TOKENS,
         }
-        generation_metadata = None
+        headers = {"Authorization": f"Bearer {WORKER_API_KEY}"}
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.post(endpoint_url, json=payload, timeout=TEST_TIMEOUT_SECS)
+                response = requests.post(endpoint_url, json=payload, headers=headers,
+                                         timeout=TEST_TIMEOUT_SECS)
                 response.raise_for_status()
                 result = response.json()
                 choices = result.get("choices")
-
-                if not choices:
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
-                        continue
-                    return None
-
-                test_code = choices[0].get("message", {}).get("content", "")
+                test_code = (choices[0].get("message", {}).get("content", "") if choices else "")
                 if not test_code:
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
                         continue
                     return None
-
                 test_code = enforce_ascii(_strip_markdown_fences(test_code))
-                agent_tag = artifact.get("agent", "agent")
-                node_tag = artifact.get("node", "n")
-                agent_test_dir = test_output_dir / agent_tag / node_tag
-                agent_test_dir.mkdir(parents=True, exist_ok=True)
-                test_filename = f"test_{artifact['filename']}"
-                test_filepath = agent_test_dir / test_filename
-
-                with open(test_filepath, "w", encoding="ascii") as f:
-                    f.write(test_code + "\n")
-
                 with progress_lock:
                     progress_state["done"] += 1
                     eta_str = _format_eta(progress_state["start_time"], progress_state["done"], progress_state["total"])
                     print(f"    [+] Generated tests ({progress_state['done']}/{progress_state['total']}) "
-                          f"| ETC: {eta_str} -> {agent_tag}/{node_tag}/{test_filename}", flush=True)
-
-                generation_metadata = {
-                    "filename": test_filename,
-                    "test_filepath": str(test_filepath),
-                    "language": artifact["language"],
-                    "artifact_filepath": artifact["filepath"],
-                    "agent": agent_tag,
-                    "node": node_tag,
-                }
-                break
-
+                          f"| ETC: {eta_str} -> {artifact['agent']}/{artifact['node']}/"
+                          f"{_test_filename(artifact['filename'])}", flush=True)
+                return test_code
             except requests.exceptions.RequestException:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
-
-        return generation_metadata
+        return None
     finally:
         endpoint_queue.put(endpoint_url)
+
+
+_C_MAIN_RE = re.compile(r'\bint\s+main\s*\(')
+_IMPL_SUFFIXES = {"c": [".c"], "cpp": [".cpp", ".cc", ".cxx", ".c"]}
+
+
+def _shim_main(src: str) -> str:
+    return _C_MAIN_RE.sub("int autoresearch_artifact_main(", src)
 
 
 def execute_test_artifact(test_meta: dict) -> dict:
     lang = test_meta["language"].lower()
     test_path = Path(test_meta["test_filepath"]).resolve()
     artifact_path = Path(test_meta["artifact_filepath"]).resolve()
+    py = test_meta.get("python", sys.executable)
+    venv_bin = Path(test_meta["venv_bin"]) if test_meta.get("venv_bin") else None
+    test_root = Path(test_meta["test_root"])
     result = {"agent": test_meta.get("agent", ""), "node": test_meta.get("node", ""),
               "filename": test_meta["filename"], "language": lang,
               "status": "UNKNOWN", "message": ""}
+
+    def _finish(rc, out, timed_out, t0):
+        if timed_out:
+            result["status"], result["message"] = "TIMEOUT", "Execution threshold exceeded"
+        elif rc == 0:
+            result["status"], result["message"] = "PASSED", f"OK ({time.time() - t0:.2f}s)"
+        else:
+            result["status"], result["message"] = "FAILED", _extract_error_line(out, lang)
+
     try:
         if lang in ("python", "py"):
-            env = os.environ.copy()
-            src_dir = str(test_path.parent)
-            existing_pypath = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(artifact_path.parent), src_dir, existing_pypath]))
-
-            cmd = ["python", "-m", "pytest", "-p", "no:cacheprovider", "--no-header", "--tb=short", "-q", str(test_path)]
-            start_time = time.time()
-            res = subprocess.run(cmd, capture_output=True, encoding="ascii", errors="ignore", timeout=45, cwd=str(test_path.parent), env=env)
-            duration = time.time() - start_time
-            if res.returncode == 0:
-                result["status"], result["message"] = "PASSED", f"OK ({duration:.2f}s)"
-            else:
-                result["status"], result["message"] = "FAILED", _extract_error_line(res.stderr + res.stdout, lang)
+            env = _test_env(test_root, venv_bin,
+                            os.pathsep.join([str(artifact_path.parent), str(test_path.parent)]))
+            cmd = [py, "-m", "pytest", "-p", "no:cacheprovider", "--no-header", "--tb=short", "-q", str(test_path)]
+            t0 = time.time()
+            rc, out, to = _run_limited(cmd, 45, test_path.parent, env)
+            _finish(rc, out, to, t0)
         elif lang in ("bash", "sh"):
-            start_time = time.time()
-            res = subprocess.run(["bash", str(test_path)], capture_output=True, encoding="ascii", errors="ignore", timeout=30)
-            duration = time.time() - start_time
-            if res.returncode == 0:
-                result["status"], result["message"] = "PASSED", f"OK ({duration:.2f}s)"
-            else:
-                result["status"], result["message"] = "FAILED", _extract_error_line(res.stderr + res.stdout, lang)
+            env = _test_env(test_root, venv_bin)
+            t0 = time.time()
+            rc, out, to = _run_limited(["bash", str(test_path)], 30, test_path.parent, env)
+            _finish(rc, out, to, t0)
         elif lang in ("c", "cpp"):
             compiler = "gcc" if lang == "c" else "g++"
-            binary_path = None
+            build = test_path.parent / f"build_{test_path.stem}"
+            shutil.rmtree(build, ignore_errors=True)
+            build.mkdir(parents=True)
             try:
-                with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
-                    binary_path = Path(tmp.name)
-
-                compile_cmd = [compiler, "-I", str(artifact_path.parent), str(test_path), "-o", str(binary_path)]
-                comp_res = subprocess.run(compile_cmd, capture_output=True, encoding="ascii", errors="ignore", timeout=20)
-                if comp_res.returncode != 0:
-                    result["status"], result["message"] = "COMPILE_ERROR", _extract_error_line(comp_res.stderr, lang)
+                # The test is compiled from build/, so `#include "artifact"` resolves
+                # to the copy placed beside it (main() renamed if present).
+                test_copy = build / test_path.name
+                shutil.copyfile(test_path, test_copy)
+                art_src = read_file_content_safe(artifact_path) or ""
+                with open(build / artifact_path.name, "w", encoding="ascii", errors="ignore") as f:
+                    f.write(_shim_main(art_src))
+                sources = [str(test_copy)]
+                # Testing a header: link its implementation sibling, if any.
+                if artifact_path.suffix.lower() in (".h", ".hpp"):
+                    for suf in _IMPL_SUFFIXES[lang]:
+                        impl = artifact_path.with_suffix(suf)
+                        if impl.exists():
+                            impl_copy = build / f"impl_{impl.name}"
+                            with open(impl_copy, "w", encoding="ascii", errors="ignore") as f:
+                                f.write(_shim_main(read_file_content_safe(impl) or ""))
+                            sources.append(str(impl_copy))
+                            break
+                binary = build / "test.bin"
+                env = _test_env(test_root, None)
+                compile_cmd = [compiler, "-O0", "-I", str(build), "-I", str(artifact_path.parent)] \
+                    + sources + ["-o", str(binary), "-lm"]
+                rc, out, to = _run_limited(compile_cmd, 60, build, env)
+                if to or rc != 0:
+                    result["status"] = "COMPILE_ERROR"
+                    result["message"] = "compile timed out" if to else _extract_error_line(out, lang)
                     return result
-
-                start_time = time.time()
-                res = subprocess.run([str(binary_path)], capture_output=True, encoding="ascii", errors="ignore", timeout=30)
-                duration = time.time() - start_time
-                if res.returncode == 0:
-                    result["status"], result["message"] = "PASSED", f"OK ({duration:.2f}s)"
-                else:
-                    result["status"], result["message"] = "FAILED", _extract_error_line(res.stderr + res.stdout, lang)
+                t0 = time.time()
+                rc, out, to = _run_limited([str(binary)], 30, build, env)
+                _finish(rc, out, to, t0)
             finally:
-                if binary_path and binary_path.exists():
-                    binary_path.unlink()
+                shutil.rmtree(build, ignore_errors=True)
         else:
             result["status"], result["message"] = "SKIPPED", f"No environment definition for: {lang}"
-    except subprocess.TimeoutExpired:
-        result["status"], result["message"] = "TIMEOUT", "Execution threshold exceeded"
     except Exception as exc:
-        result["status"], result["message"] = "ERROR", str(exc)
+        result["status"], result["message"] = "ERROR", str(exc)[:200]
     return result
 
 
@@ -3197,15 +4123,24 @@ def run_phase5_automatic_unittests(run_dir: Path, roster: List[dict],
 
     artifacts = collect_testable_artifacts(run_dir, roster, nodes)
     if not artifacts:
-        print("    [!] No testable deliverables among this round's best nodes.", flush=True)
+        print("    [!] No testable deliverables among this round's top nodes.", flush=True)
         return []
+
+    # Continuations inherit files, so identical content recurs across nodes.
+    # Generate one test per distinct (content, name, language); execute it in
+    # every node that carries it (siblings and imports may differ per node).
+    groups: Dict[Tuple[str, str, str], List[dict]] = {}
+    for a in artifacts:
+        groups.setdefault((a["content_hash"], a["filename"], a["language"]), []).append(a)
+    reps = [members[0] for members in groups.values()]
 
     by_agent: Dict[str, int] = {}
     for a in artifacts:
         by_agent[a["agent"]] = by_agent.get(a["agent"], 0) + 1
     for aid, n in sorted(by_agent.items()):
         print(f"    [+] {aid}: {n} testable file(s).", flush=True)
-    print(f"    [*] {len(artifacts)} testable deliverable(s) total.", flush=True)
+    print(f"    [*] {len(artifacts)} testable file(s) across top-{TEST_NODES_PER_TASK} node(s)/task; "
+          f"{len(reps)} distinct -> {len(reps)} test generation(s).", flush=True)
 
     endpoint_queue: queue.Queue = queue.Queue()
     for ep in TEST_WORKER_ENDPOINTS:
@@ -3214,35 +4149,44 @@ def run_phase5_automatic_unittests(run_dir: Path, roster: List[dict],
     total_gen_workers = max(1, len(TEST_WORKER_ENDPOINTS) * CONCURRENT_REQS_PER_ENDPOINT)
 
     progress_lock = threading.Lock()
-    progress_state = {"done": 0, "total": len(artifacts), "start_time": time.time()}
+    progress_state = {"done": 0, "total": len(reps), "start_time": time.time()}
+    generated: Dict[Tuple[str, str, str], str] = {}
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_gen_workers)
-    generated_tests: list = []
-
     try:
-        futures = [executor.submit(request_unittests_from_worker, artifact, endpoint_queue,
-                                   TEST_OUTPUT_DIR, progress_lock, progress_state)
-                   for artifact in artifacts]
-        for future in concurrent.futures.as_completed(futures):
+        fut_to_key = {executor.submit(request_unittests_from_worker, rep, endpoint_queue,
+                                      TEST_OUTPUT_DIR, progress_lock, progress_state):
+                      (rep["content_hash"], rep["filename"], rep["language"]) for rep in reps}
+        for future in concurrent.futures.as_completed(fut_to_key):
             try:
-                test_meta = future.result()
-                if test_meta:
-                    generated_tests.append(test_meta)
+                code = future.result()
+                if code:
+                    generated[fut_to_key[future]] = code
             except Exception:
                 pass
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    wroot = work_dir_for(run_dir)
-    if wroot.exists():
-        for req_path in wroot.rglob("requirements*.txt"):
-            _sanitize_requirements_file(req_path)
-            try:
-                res = subprocess.run(["python", "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
-                                     capture_output=True, encoding="ascii", errors="ignore", timeout=120)
-                if res.returncode != 0:
-                    print(f"    [!] Warning: pip install failed for {req_path.name}.", flush=True)
-            except Exception as e:
-                print(f"    [!] Warning: pip install exception for {req_path.name}: {e}", flush=True)
+    py, venv_bin = ensure_test_venv(run_dir)
+    tested_nodes = top_nodes_per_task(nodes, TEST_NODES_PER_TASK)
+    install_round_requirements(run_dir, tested_nodes, rnd, py, venv_bin)
+
+    generated_tests: List[dict] = []
+    for key, members in groups.items():
+        code = generated.get(key)
+        if not code:
+            continue
+        for a in members:
+            node_dir = TEST_OUTPUT_DIR / a["agent"] / a["node"]
+            node_dir.mkdir(parents=True, exist_ok=True)
+            tpath = node_dir / _test_filename(a["filename"])
+            with open(tpath, "w", encoding="ascii") as f:
+                f.write(code + "\n")
+            generated_tests.append({
+                "filename": tpath.name, "test_filepath": str(tpath), "language": a["language"],
+                "artifact_filepath": a["filepath"], "agent": a["agent"], "node": a["node"],
+                "python": py, "venv_bin": str(venv_bin) if venv_bin else "",
+                "test_root": str(TEST_OUTPUT_DIR),
+            })
 
     execution_results: list = []
     if generated_tests:
@@ -3272,7 +4216,7 @@ def run_phase5_automatic_unittests(run_dir: Path, roster: List[dict],
                 prior = json.loads(read_file_content_safe(cum_path) or "[]")
                 if isinstance(prior, list):
                     cumulative = [r for r in prior
-                                  if r.get("node", "").startswith(f"r{rnd:02d}n") is False]
+                                  if not str(r.get("node", "")).startswith(f"r{rnd:02d}n")]
             except json.JSONDecodeError:
                 cumulative = []
         cumulative.extend(execution_results)
@@ -3309,7 +4253,7 @@ def run_phase6_project_distillation(project_dir: Path, iterate: bool = False):
     # reconciliation reports. Agent deliverables under work/ are the product, not
     # the input, and the per-agent wave logs would swamp the apex window.
     exclude_dirs = {"tests", "tasks", "reports", WORK_DIRNAME,
-                    TREES_DIRNAME, POLICY_DIRNAME, DREAM_DIRNAME}
+                    TREES_DIRNAME, POLICY_DIRNAME, DREAM_DIRNAME, ABORTED_DIRNAME}
     p6_exclude_names = {"DISTILLED_TASKS", "project_state", "RUN_MANIFEST"}
 
     existing_tasks = ""
@@ -3432,6 +4376,44 @@ def run_phase6_project_distillation(project_dir: Path, iterate: bool = False):
 # Pipeline Executor (Main)
 # ==============================================================================
 
+def archive_partial_round(run_dir: Path, rnd: int) -> bool:
+    """A round without its done-marker was interrupted. Move everything it wrote
+    aside before re-running it: node ids restart at rNNn0000, so appending to the
+    old tree would collide ids and the last-write-wins merge would splice two
+    different trees together, while stale node directories would leak files into
+    reconciliation and Phase 5."""
+    if round_done_marker(run_dir, rnd).exists():
+        return False
+    prefix = f"r{rnd:02d}n"
+    moves: List[Tuple[Path, Path]] = []
+    dest = run_dir / ABORTED_DIRNAME / f"round{rnd:02d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    tree = tree_path_for(run_dir, rnd)
+    if tree.exists():
+        moves.append((tree, dest / TREES_DIRNAME / tree.name))
+    rdir = round_dir_for(run_dir, rnd)
+    if rdir.exists():
+        moves.append((rdir, dest / COMMS_DIRNAME / rdir.name))
+    tdir = run_dir / "tests" / f"round{rnd:02d}"
+    if tdir.exists():
+        moves.append((tdir, dest / "tests" / tdir.name))
+    wroot = work_dir_for(run_dir)
+    if wroot.exists():
+        for adir in wroot.iterdir():
+            if adir.is_dir():
+                for ndir in adir.glob(f"{prefix}*"):
+                    if ndir.is_dir():
+                        moves.append((ndir, dest / WORK_DIRNAME / adir.name / ndir.name))
+    if not moves:
+        return False
+    for src, dst in moves:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+    print(f"[*] Round {rnd:02d} was interrupted; moved {len(moves)} partial artifact(s) to "
+          f"{dest.relative_to(run_dir)} before re-running it.", flush=True)
+    append_event(run_dir, {"round": rnd, "event": "round_reset", "archived": str(dest.relative_to(run_dir))})
+    return True
+
+
 def signal_handler(sig, frame):
     if _shutdown_event.is_set():
         print("\n[!] Force exit triggered.", flush=True)
@@ -3447,6 +4429,21 @@ def round_budget(roster: List[dict]) -> int:
     dreamed policy cannot win by spending more than the one it replaces."""
     raw = int(round(len(roster) * ROUND_BUDGET_PER_TASK))
     return max(ROUND_BUDGET_MIN, min(ROUND_BUDGET_MAX, raw))
+
+
+def support_reserve(budget: int, n_tasks: int) -> int:
+    """Calls held back from the policy for off-policy support probes. Never so
+    many that the policy cannot open every task once."""
+    if SUPPORT_PROBE_FRAC <= 0:
+        return 0
+    want = int(round(SUPPORT_PROBE_FRAC * budget))
+    return max(0, min(want, budget - n_tasks))
+
+
+def policy_budget(budget: int, n_tasks: int) -> int:
+    """What the deployed policy may spend online - and therefore the cap it is
+    replayed under, so live and dream stay on the same footing."""
+    return budget - support_reserve(budget, n_tasks)
 
 
 def main():
@@ -3673,6 +4670,30 @@ def main():
                  if args.no_dream else f"{DREAM_CANDIDATES} policy revision(s) per dream")
               + ".", flush=True)
 
+        # A round that never finished is re-run from a clean slate.
+        if args.resume:
+            archive_partial_round(target_directory, start_round)
+
+        # Resuming past the last dreamed round: the policy for start_round was
+        # never written (no dream follows a run's final round in older runs, or
+        # the dream itself was interrupted). Dream now instead of silently
+        # redeploying pi_0.
+        if (not args.no_dream and start_round > 1
+                and not policy_path(target_directory, start_round).exists()):
+            pool = load_pool(target_directory)
+            if pool and apex_ok:
+                print(f"[*] {policy_path(target_directory, start_round).name} missing; "
+                      f"dreaming over the recorded pool before round {start_round:02d}.", flush=True)
+                _, dstats = dream_policy_improvement(
+                    target_directory, start_round - 1,
+                    load_or_init_policy(target_directory, start_round - 1),
+                    pool, tasks, budget)
+                dream_stats.append(dstats)
+            elif pool:
+                print(f"    [!] Apex offline; cannot dream the missing policy for round "
+                      f"{start_round:02d}. Stopping - re-run with -r once 8081 is healthy.", flush=True)
+                start_round = end_round + 1
+
         for rnd in range(start_round, end_round + 1):
             if _shutdown_event.is_set():
                 print(f"\n[!] Shutdown requested; stopping before round {rnd:02d}. "
@@ -3708,11 +4729,14 @@ def main():
                 print(f"    [i] Round {rnd:02d}: dreaming skipped; round {rnd + 1:02d} "
                       f"redeploys pi_0 unchanged.", flush=True)
                 continue
-            if rnd >= end_round:
+            if _shutdown_event.is_set():
                 break
+            # Dream after EVERY round, including the last, so pi_{rnd+1} always
+            # exists and a later `-r -n N+1` continues the lineage.
             if not apex_ok:
-                print(f"    [!] Apex offline; cannot improve the policy. Round {rnd + 1:02d} "
-                      f"would redeploy the current policy. Stopping - re-run with -r.", flush=True)
+                print(f"    [!] Apex offline; cannot improve the policy after round {rnd:02d}. "
+                      f"Stopping - re-run with -r (the missing policy is dreamed on resume).",
+                      flush=True)
                 break
 
             pool = load_pool(target_directory)
