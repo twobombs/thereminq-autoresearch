@@ -107,27 +107,27 @@ _TESTABLE_EXT_LANG = {
 #     going past it is rope extrapolation, not free context.
 #
 # TIER POLICY (post-stitcher-removal):
-#   * APEX (8081) runs non-worker, non-agent tasks only: Phase 1 generation,
+#   * APEX (9931) runs non-worker, non-agent tasks only: Phase 1 generation,
 #     Phase 2 distillation, Phase 3 decomposition (planning), Phase 6
 #     distillation. It is -np 1 and therefore strictly serial.
-#   * WORKERS (8033, 8034, 8070, 8071) run every agent assignment plus Phase 0
-#     repo map-reduce. 8070/8071 are the former stitcher nodes, folded into the
-#     agent pool.
+#   * WORKERS (8030-8035) run every agent assignment, Phase 0 repo map-reduce
+#     and the evaluator's unit-test generation. The former stitcher nodes are
+#     folded into this pool.
 #   * There is NO stitcher tier. Consolidation is mechanical (filesystem walk +
 #     hashing), never a model merge.
 #
-# The worker pool is now HETEROGENEOUS in -c (8033/8034 were 196608, 8070/8071
-# were 131072). Budget from the SMALLEST node in the pool or the larger nodes
-# will silently over-subscribe. WORKER_SERVER_CTX defaults to the 131072 floor.
+# Every worker node runs -c 196608 -np 2, i.e. a 98304-token window per slot.
+# If the pool ever becomes HETEROGENEOUS in -c, set WORKER_SERVER_CTX to the
+# SMALLEST node's value, or the larger nodes' budgets will over-subscribe it.
 # ==============================================================================
 
-# Apex / planning / generation / distillation node (port 8081): -c 65536 -np 1
+# Apex / planning / generation / distillation node (port 9931): -c 65536 -np 1
 APEX_SERVER_CTX = int(os.getenv("APEX_SERVER_CTX", "65536"))
 APEX_SERVER_NP = int(os.getenv("APEX_SERVER_NP", "1"))
 
-# Agent worker cluster (8033, 8034, 8070, 8071): -np 2 --kv-unified each.
+# Agent worker cluster (8030-8035): -np 2 --kv-unified each.
 # Budget against the smallest -c in the pool.
-WORKER_SERVER_CTX = int(os.getenv("WORKER_SERVER_CTX", "131072"))
+WORKER_SERVER_CTX = int(os.getenv("WORKER_SERVER_CTX", "196608"))
 WORKER_SERVER_NP = int(os.getenv("WORKER_SERVER_NP", "2"))
 
 # Concurrency-safe per-request windows.
@@ -244,11 +244,18 @@ DREAM_DIRNAME = "dream"
 ABORTED_DIRNAME = "aborted"
 
 # ------------------------------------------------------------------------------
-# Recursive self-improvement at the exploration layer (Dream-RSI).
+# Recursive self-improvement at the exploration layer (Dream-RSI; Zheng et al.,
+# "Dream-RSI: Recursive Self-Improvement through Evolving Worlds",
+# arXiv:2609.14858, Sec. 3).
 #
-# ROUND_BUDGET is the currency the exploration policy spends: one unit = one
-# agent call. It is what makes online rounds and dreamed replays comparable, so
-# a policy cannot win by quietly spending more.
+# The exploration policy acts in DECISION ROUNDS. In each round it selects one
+# batch C of at most W legal continuations (W = worker slots), observes their
+# evaluated outcomes, and decides again; an empty batch ends the rollout. An
+# online rollout allows at most K1 rounds, a replay at most K2.
+#
+# ROUND_BUDGET is the per-round resource cap in discovery-agent calls (retries
+# charged). It is identical online and in replay, matching the paper's equal
+# per-round budgets for Dream-RSI and Recursive Fixed Exploration.
 # ------------------------------------------------------------------------------
 DEFAULT_ROUNDS = int(os.getenv("RSI_ROUNDS", "1"))
 MAX_ROUNDS = int(os.getenv("RSI_MAX_ROUNDS", "12"))
@@ -256,73 +263,63 @@ ROUND_BUDGET_PER_TASK = float(os.getenv("ROUND_BUDGET_PER_TASK", "2.0"))
 ROUND_BUDGET_MIN = int(os.getenv("ROUND_BUDGET_MIN", "3"))
 ROUND_BUDGET_MAX = int(os.getenv("ROUND_BUDGET_MAX", "60"))
 
-# Offline policy improvement. Candidates are cheap (zero agent calls), but each
-# is one serial apex generation, so this is the real wall-clock cost of dreaming.
+# W: parallel workers, i.e. the maximum batch size of one decision round.
+MAX_PARALLELISM = max(1, int(os.getenv(
+    "MAX_PARALLELISM", str(max(1, len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS)))))
+# K1 / K2: maximum decision rounds per online rollout / per replay.
+ONLINE_MAX_DECISION_ROUNDS = max(1, int(os.getenv("ONLINE_MAX_DECISION_ROUNDS", "32")))
+REPLAY_MAX_DECISION_ROUNDS = max(1, int(os.getenv(
+    "REPLAY_MAX_DECISION_ROUNDS", str(ONLINE_MAX_DECISION_ROUNDS))))
+
+# M - 1: policy revisions per offline phase. Version m+1 is derived from version
+# m; the deployed policy is version 0, so M = DREAM_CANDIDATES + 1 versions are
+# evaluated and the argmax is deployed next.
 DREAM_CANDIDATES = int(os.getenv("DREAM_CANDIDATES", "3"))
-# Coverage weighting: a policy that reaches a few tasks brilliantly must not beat
-# one that reaches the whole roster well.
-DREAM_COVERAGE_FLOOR = float(os.getenv("DREAM_COVERAGE_FLOOR", "0.4"))
+
+# Replay objective, Eq. (1):
+#   V_i = quality_i - beta_1 * N_i + beta_2 * N_i / max(1, k_i*)
+# quality_i: best revealed score per assignment, averaged over the roster (an
+# unreached assignment contributes the root's score, 0). N_i: revealed non-root
+# nodes. k_i*: completed decision rounds. The policy's score is the mean of V_i
+# over every recorded tree.
+DREAM_BETA1 = float(os.getenv("DREAM_BETA1", "0.002"))
+DREAM_BETA2 = float(os.getenv("DREAM_BETA2", "0.004"))
+# Characters of per-round replay trace shown to the policy-development agent.
+DREAM_TRACE_CHARS = int(os.getenv("DREAM_TRACE_CHARS", "6000"))
 
 # Policy sandbox limits.
 POLICY_MAX_CHARS = int(os.getenv("POLICY_MAX_CHARS", "20000"))
-POLICY_MAX_STEPS = int(os.getenv("POLICY_MAX_STEPS", "400"))
-POLICY_MAX_FANOUT = int(os.getenv("POLICY_MAX_FANOUT", "16"))
 # Cap on ALL interface calls (reads included), so a loop that only polls
-# budget_left() and swallows errors still terminates promptly.
-POLICY_MAX_RPC = int(os.getenv("POLICY_MAX_RPC", str(POLICY_MAX_STEPS * 10)))
+# budget_left() or keeps submitting illegal batches still terminates promptly.
+POLICY_MAX_RPC = int(os.getenv("POLICY_MAX_RPC", "4000"))
 
-# Evaluator weights. Deterministic and cheap by requirement: replay reads stored
-# node scores rather than recomputing, so nondeterminism here would make
-# dreaming lie about the past.
+# Evaluator. Fixed and applied ONCE per attempt, at creation (Sec. 3: a fixed
+# evaluator scores each candidate and returns diagnostic feedback). The stored
+# score is final; replay reveals exactly what the online policy observed.
 EVAL_W_STATUS = float(os.getenv("EVAL_W_STATUS", "0.35"))
 EVAL_W_FILES = float(os.getenv("EVAL_W_FILES", "0.25"))
 EVAL_W_LOG = float(os.getenv("EVAL_W_LOG", "0.15"))
 EVAL_W_NOVELTY = float(os.getenv("EVAL_W_NOVELTY", "0.25"))
 EVAL_W_VIOLATION = float(os.getenv("EVAL_W_VIOLATION", "0.20"))
 EVAL_W_TRUNCATED = float(os.getenv("EVAL_W_TRUNCATED", "0.15"))
-# Mix of creation-time heuristic vs Phase 5 pass rate once tests have run.
+# Mix of heuristic vs. unit-test pass rate in the evaluator score.
 EVAL_HEURISTIC_MIX = float(os.getenv("EVAL_HEURISTIC_MIX", "0.6"))
-# Untested nodes are blended against this prior instead of being left on the raw
-# heuristic scale. Without it a tested node (<= heuristic unless every test
-# passes) is systematically outranked by its untested siblings.
+# Pass-rate term for an attempt that has deliverables but none that could be
+# tested (non-testable file types, test generation failed, or tests disabled).
 EVAL_UNTESTED_PRIOR = float(os.getenv("EVAL_UNTESTED_PRIOR", "0.5"))
 # Status credit for an attempt that hit its output limit but still yielded
 # complete, closed <file> blocks (salvaged).
 EVAL_PARTIAL_STATUS_FRAC = float(os.getenv("EVAL_PARTIAL_STATUS_FRAC", "0.5"))
+# Generate and run unit tests for every attempt as part of its evaluation.
+EVAL_INLINE_TESTS = os.getenv("EVAL_INLINE_TESTS", "1") == "1"
+EVAL_MAX_TEST_FILES = max(1, int(os.getenv("EVAL_MAX_TEST_FILES", "6")))
 
-# Replay accounting. A request for a branch history never recorded would have
-# cost a real agent call online, so replay charges for it as well. Otherwise
-# probing the edge of the dream is free and replay cost stops meaning anything.
-REPLAY_CHARGE_UNRECORDED = os.getenv("REPLAY_CHARGE_UNRECORDED", "1") == "1"
-
-# Dream selection. Scores within DREAM_TIE_EPS of the incumbent are ties; ties
-# keep the incumbent unless DREAM_PREFER_CHEAPER=1. Cheaper-on-tie is what turns
-# a saturated evaluator into a ratchet toward shallower search.
-DREAM_TIE_EPS = float(os.getenv("DREAM_TIE_EPS", "0.001"))
-DREAM_PREFER_CHEAPER = os.getenv("DREAM_PREFER_CHEAPER", "0") == "1"
-
-# Replay cost term (the paper's beta_1). Without it the objective is blind to
-# spend: under a shared budget cap a policy that exhausts the cap weakly
-# dominates one that stops early, so "conserve while progress is good" can never
-# win a dream. Cost is normalised by the policy budget: 0.05 means spending the
-# whole budget costs 0.05 score. 0 restores the old spend-blind objective.
-DREAM_COST_WEIGHT = float(os.getenv("DREAM_COST_WEIGHT", "0.05"))
-
-# Replay evaluates untested nodes against the pool's empirical test pass rate
-# instead of the fixed EVAL_UNTESTED_PRIOR. With a fixed 0.5 and a real pass
-# rate below it, replay rewards policies that route AROUND tested nodes.
-# "fixed" restores the old behaviour. Below the minimum sample size the fixed
-# prior is used.
-EVAL_UNTESTED_PRIOR_MODE = os.getenv("EVAL_UNTESTED_PRIOR_MODE", "empirical").lower()
-EVAL_EMPIRICAL_MIN_TESTED = int(os.getenv("EVAL_EMPIRICAL_MIN_TESTED", "4"))
-
-# Off-policy support probes. A fraction of each live round is held back from the
-# deployed policy and spent mechanically on expansions the policy family tends
-# not to make (refine each task's best node; open a further independent root
-# attempt). Without them the recorded pool only contains branches the logging
-# policy chose, and replay can only ever confirm that policy. Applied in BOTH
-# arms (dream and --no-dream) so the comparison stays at equal budget.
-SUPPORT_PROBE_FRAC = float(os.getenv("SUPPORT_PROBE_FRAC", "0.15"))
+# Off-policy support probes. EXTENSION, not part of Dream-RSI: a fraction of
+# each live round is held back from the deployed policy and spent on
+# deterministic refine-best / open-new-root continuations, widening the support
+# of the recorded pool. Off (0) by default to follow the paper; if enabled it is
+# applied in both arms (dream and --no-dream) so budgets stay equal.
+SUPPORT_PROBE_FRAC = float(os.getenv("SUPPORT_PROBE_FRAC", "0.0"))
 
 # Policy isolation. Policies run in a child process that talks to the explorer
 # over a line-JSON RPC; these are that child's resource limits.
@@ -330,8 +327,7 @@ POLICY_CPU_SECS = int(os.getenv("POLICY_CPU_SECS", "20"))
 POLICY_MEM_MB = int(os.getenv("POLICY_MEM_MB", "512"))
 POLICY_REPLAY_WALL_SECS = float(os.getenv("POLICY_REPLAY_WALL_SECS", "60"))
 
-# Phase 5 hardening.
-TEST_NODES_PER_TASK = max(1, int(os.getenv("TEST_NODES_PER_TASK", "2")))
+# Test execution hardening (evaluator).
 TEST_PIP_INSTALL = os.getenv("TEST_PIP_INSTALL", "1") == "1"
 TEST_PIP_ALLOWLIST = {p.strip().lower().replace("_", "-")
                       for p in os.getenv("TEST_PIP_ALLOWLIST", "").split(",") if p.strip()}
@@ -342,7 +338,7 @@ TEST_FSIZE_MB = int(os.getenv("TEST_FSIZE_MB", "128"))
 # Phase 0: permit LAN git hosts (e.g. a self-hosted Gitea). Off = fail closed.
 GIT_ALLOW_PRIVATE_HOSTS = os.getenv("GIT_ALLOW_PRIVATE_HOSTS", "0") == "1"
 
-# Phase 5: Automatic Unittests Config (runs on the agent worker pool)
+# Evaluator unit-test generation (runs on the agent worker pool)
 TEST_WORKER_ENDPOINTS = [ep.rstrip("/") + "/chat/completions" for ep in WORKER_ENDPOINTS]
 CONCURRENT_REQS_PER_ENDPOINT = WORKER_PARALLEL_SLOTS
 MAX_OUTPUT_TOKENS = min(
@@ -356,7 +352,6 @@ LLM_FREQUENCY_PENALTY = 0.5
 LLM_PRESENCE_PENALTY = 0.2
 RETRY_BASE_DELAY = 2.0
 RETRY_JITTER = 0.5
-MAX_EXEC_WORKERS = 4
 EXECUTION_RESULT_FIELDS = ["agent", "node", "filename", "language", "status", "message"]
 
 TEST_MIN_DECODE_TPS = float(os.getenv("TEST_MIN_DECODE_TPS", "10.0"))
@@ -459,19 +454,21 @@ _PROMPT_POLICY_DEV = (
     "multi-agent discovery system. You do not do the discovery work yourself and you "
     "never change what the agents are assigned.\n"
     "\n"
-    "The policy is executable Python that decides where the agent team continues "
-    "searching, which attempts run concurrently, and when exploration stops. It is "
-    "scored by replaying it over recorded discovery trees: every outcome it asks for is "
-    "already on disk, so evaluation costs no agent calls, and a branch that history never "
-    "recorded is simply unavailable.\n"
+    "The policy is executable Python. One decision round at a time, it selects a batch of "
+    "legal continuations to run in parallel (at most W per round) and decides when to stop "
+    "by submitting no further batch. It is evaluated by replaying it over recorded discovery "
+    "trees: every outcome it can reveal is already on disk, so evaluation costs no agent "
+    "calls, and only continuations that history recorded are legal in replay.\n"
     "\n"
-    "What actually moves the score:\n"
-    "1. Allocate depth where continuation has been paying and breadth where it has not.\n"
-    "2. Cover the whole roster - unreached assignments are scored as zero.\n"
-    "3. Group expansions into parallel batches; serial expansion wastes slots.\n"
-    "4. Stop lines that stop improving rather than spending the budget evenly.\n"
-    "5. Be adaptive, not uniformly greedier or broader. Conserving calls while progress "
-    "is good and spending them when it plateaus is a real strategy.\n"
+    "You are given the CURRENT policy version, its replay scores, its per-round execution "
+    "traces, and the scores of earlier versions. Examine the traces to identify successful "
+    "decisions and recurring failures - serial or undersized batches, premature stops, "
+    "over-pruning, calls wasted on lines that stopped improving, abandoned branches that "
+    "were repairable, assignments never reached - and revise the code to produce the next "
+    "version.\n"
+    "\n"
+    "Every decision must be derived from what the policy itself has revealed through ctx. "
+    "Never hard-code node ids, round numbers, scores or targets seen in the traces.\n"
     "\n"
     "Output ONLY Python source for the policy module. No prose, no markdown fences."
 )
@@ -738,7 +735,7 @@ def describe_budget_alignment() -> str:
     lines = []
     lines.append("[BUDGET] Server context alignment (stitcher tier removed)")
     lines.append(
-        f"    apex    :8081  -c {APEX_SERVER_CTX} -np {APEX_SERVER_NP}"
+        f"    apex    :{urllib.parse.urlparse(GEN_API_BASE).port or '-'}  -c {APEX_SERVER_CTX} -np {APEX_SERVER_NP}"
         f"  -> {APEX_CONTEXT_TOKENS//1024}k tok/req"
         f" | input<={MAX_CONTEXT_CHARS:,} chars"
         f" (~{int(MAX_CONTEXT_CHARS/CHARS_PER_TOKEN)//1024}k tok)"
@@ -806,19 +803,21 @@ def describe_budget_alignment() -> str:
     )
     lines.append(
         f"    [i] Policies run isolated (cpu {POLICY_CPU_SECS}s, mem {POLICY_MEM_MB}MB, no fs/fds); "
-        f"replay charges unrecorded branches: {'yes' if REPLAY_CHARGE_UNRECORDED else 'no'}; "
-        f"ties keep incumbent{' unless cheaper' if DREAM_PREFER_CHEAPER else ''}"
+        f"decision rounds: W={MAX_PARALLELISM} per batch, K1={ONLINE_MAX_DECISION_ROUNDS}, "
+        f"K2={REPLAY_MAX_DECISION_ROUNDS}"
     )
     lines.append(
-        f"    [i] Tests: top-{TEST_NODES_PER_TASK} node(s)/task, run-scoped venv, wheels only"
+        f"    [i] Evaluator: fixed at creation; inline unit tests {'ON' if EVAL_INLINE_TESTS else 'OFF'}"
+        f" (<= {EVAL_MAX_TEST_FILES} file(s)/attempt), run-scoped venv, wheels only"
         f"{', allowlist ' + str(len(TEST_PIP_ALLOWLIST)) + ' pkg(s)' if TEST_PIP_ALLOWLIST else ''}"
         f"{'' if TEST_PIP_INSTALL else ', installs OFF'}; untested prior {EVAL_UNTESTED_PRIOR}"
     )
     lines.append(
         f"    [i] RSI: budget {ROUND_BUDGET_PER_TASK} agent call(s)/task per round"
         f" (clamped {ROUND_BUDGET_MIN}-{ROUND_BUDGET_MAX})"
-        f" | {DREAM_CANDIDATES} policy revision(s) per dream on apex"
-        f" | replay costs 0 agent calls"
+        f" | M={DREAM_CANDIDATES + 1} chained policy version(s) per dream on apex"
+        f" | V = quality - {DREAM_BETA1}*N + {DREAM_BETA2}*N/k | replay costs 0 agent calls"
+        + (f" | support probes {SUPPORT_PROBE_FRAC:.0%} (extension)" if SUPPORT_PROBE_FRAC > 0 else "")
     )
     return "\n".join(lines)
 
@@ -1418,19 +1417,23 @@ def save_distilled_output(output_text: str, original_path: Path) -> Path:
 # Structure follows Dream-RSI (Zheng et al., 2026): recursive self-improvement is
 # applied at the EXPLORATION layer, not to the agents themselves.
 #
-#   round t: deploy policy pi_t online -> agents expand a discovery TREE, every
-#            node carrying its realized outcome -> append the tree to the pool ->
-#            a policy-development agent (APEX) writes M revisions of the policy's
-#            CODE -> each is scored by REPLAY over the whole pool at zero agent
-#            calls -> the winner becomes pi_{t+1}.
+#   round t: deploy policy pi_t online -> in decision rounds it selects batches of
+#            at most W legal continuations; agents run them and a FIXED evaluator
+#            scores each attempt at creation -> the resulting discovery TREE is
+#            appended to the history H_t -> offline, a policy-development agent
+#            (APEX) derives versions pi_t^1..pi_t^(M-1), each from the previous
+#            one, using the replay scores and execution traces of its
+#            predecessor -> every version is scored by REPLAY over all of H_t at
+#            zero agent calls (Eq. 1) -> the argmax becomes pi_{t+1}.
 #
 # Two properties this buys, both load-bearing:
 #   * Replay is exact, not approximate. The simulator IS the realized search
-#     space; every outcome a candidate policy asks for is already on disk. Its
-#     limit is equally sharp - a policy can only be dreamt where history went,
+#     space; every outcome a candidate policy can reveal is already on disk, and
+#     the score it reveals is the score the online policy saw. Its limit is
+#     equally sharp - only continuations history recorded are legal in replay -
 #     which is why this must be a loop rather than a one-off tuning pass.
-#   * Monotonicity. The deployed policy pi^0 is itself in the candidate set, so
-#     the winner can never score worse than the policy it replaces.
+#   * Monotonicity. The deployed policy pi_t^0 is itself a candidate, so the
+#     selected policy is no worse than it in mean replay score on H_t.
 #
 # The exploration policy is executable Python controlling WHERE the agent
 # continues, WHAT runs in parallel, and WHEN to stop. The same policy source runs
@@ -1640,7 +1643,7 @@ def load_tree(run_dir: Path, rnd: int) -> List[dict]:
             nodes.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    # A node id may be rewritten by score writeback; last write wins.
+    # A node id recorded twice (e.g. by a re-run append); last write wins.
     merged: Dict[str, dict] = {}
     for n in nodes:
         if "id" in n:
@@ -1649,21 +1652,16 @@ def load_tree(run_dir: Path, rnd: int) -> List[dict]:
 
 
 def _normalise_node(n: dict) -> dict:
-    """Bring nodes recorded by earlier revisions onto the current score scale.
+    """Bring nodes recorded by earlier revisions onto the current scale.
 
-    score_online is what a policy SAW when it made its decisions (heuristic +
-    untested prior); score is the final, test-informed value that replay
-    EVALUATES against. Legacy nodes carried a single raw-heuristic score."""
-    if not n.get("task"):
-        n.setdefault("score_online", n.get("score", 0.0))
-        return n
-    if "score_online" not in n:
-        h = n.get("heuristic_score", n.get("score", 0.0))
-        n["heuristic_score"] = h
-        has_files = bool(n.get("files"))
-        n["score_online"] = blend_test_score(h, None, has_files)
-        n["score"] = blend_test_score(h, n.get("test_pass_rate"), has_files)
-    n.setdefault("cost", 1)
+    Earlier revisions stored two scores: score_online (what the policy saw at
+    decision time) and a test-informed score written back after the round. The
+    evaluator is now fixed at creation, so a legacy node's creation-time value
+    is its evaluator score, and replay reveals exactly that."""
+    if "score_online" in n:
+        n["score"] = n.pop("score_online")
+    n.setdefault("score", 0.0)
+    n.setdefault("cost", 1 if n.get("task") else 0)
     n.setdefault("files", [])
     n.setdefault("file_hashes", [])
     n.setdefault("gain", None)
@@ -1714,19 +1712,18 @@ def ancestors_of(nodes: List[dict], node_id: str) -> List[dict]:
 # ------------------------------------------------------------------
 # Evaluator
 # ------------------------------------------------------------------
-# A fixed evaluator scoring each node in [0,1]. It must be cheap and
-# deterministic: replay reads these scores rather than recomputing anything, so
-# any nondeterminism here would make dreaming lie about the past.
+# A fixed evaluator scores every attempt ONCE, at creation, as part of its
+# generation-evaluation request. The stored score s_v is final: the online
+# policy decides on it and replay reveals the same value, so replay evaluates a
+# policy against exactly the outcomes it would have observed.
 #
-# Every node carries two scores:
-#   score_online - heuristic blended with EVAL_UNTESTED_PRIOR. This is what the
-#                  policy saw when it made its decisions, and what replay SHOWS
-#                  a policy, so replaying the incumbent over its own tree stays
-#                  exact even after test telemetry lands.
-#   score        - heuristic blended with the real pass rate once Phase 5 has
-#                  run. This is what replay EVALUATES a policy against.
-# Tested and untested nodes share one scale, so testing a node can no longer
-# only ever push it below its untested siblings.
+#   s_v = EVAL_HEURISTIC_MIX * h_v + (1 - EVAL_HEURISTIC_MIX) * rho_v
+#
+#   h_v   - deterministic contract/novelty heuristic (score_node_heuristic)
+#   rho_v - pass rate of the unit tests generated and executed for this
+#           attempt's testable deliverables (EVAL_INLINE_TESTS=1);
+#           EVAL_UNTESTED_PRIOR if it has deliverables but none were tested;
+#           0 if it has no deliverables.
 # ------------------------------------------------------------------
 
 def _normalise_for_hash(body: str) -> str:
@@ -1763,8 +1760,8 @@ def score_node_heuristic(status: str, files: List[str], violations: List[str],
 
 def blend_test_score(heuristic: float, pass_rate: Optional[float],
                      has_files: bool = True) -> float:
-    """A node with nothing on disk has nothing to test: its rate is 0, not the
-    optimistic prior, so failed attempts do not earn score for free."""
+    """Evaluator score. A node with nothing on disk has nothing to test: its
+    rate is 0, not the prior, so failed attempts do not earn score for free."""
     if pass_rate is not None:
         rate = float(pass_rate)
     else:
@@ -1775,14 +1772,29 @@ def blend_test_score(heuristic: float, pass_rate: Optional[float],
 # ------------------------------------------------------------------
 # Explorer interface - identical surface for live and replay
 # ------------------------------------------------------------------
+# Decision-round semantics (Dream-RSI, Sec. 3):
+#   * The eligible continuation set is A(T) = {root} U {leaves of T}. The root is
+#     shared by all assignments, so a root action names the assignment it opens
+#     a new branch for; a leaf is continued only by its own assignment.
+#   * One call to expand_parallel(C) is ONE decision round. C is a set of at most
+#     W distinct actions that are legal in the tree as it stood BEFORE the call.
+#     Illegal, duplicate or over-W requests return None and cost nothing; if no
+#     request is admissible, no round is consumed.
+#   * An online rollout allows at most K1 decision rounds, a replay K2. The
+#     rollout also ends when the policy returns (the empty batch) or when the
+#     per-round agent-call budget is exhausted.
+#   * In replay, the continuation of v reveals Child(v; T), the recorded child of
+#     v; an action whose child was never recorded is not legal (legal_actions()
+#     lists only recorded continuations).
 # The policy never touches an explorer object directly: it runs in a child
 # process and reaches these methods through a line-JSON RPC (see run_policy).
 # Only the names in _POLICY_API are dispatchable, and every return value is a
 # plain JSON projection, so there is no Path, queue or roster to reach through.
 # ------------------------------------------------------------------
 
-_POLICY_API = {"tasks", "root", "budget_left", "spent", "nodes", "frontier", "best",
-               "best_per_task", "note", "expand", "expand_parallel"}
+_POLICY_API = {"tasks", "root", "budget_left", "spent", "max_parallelism", "rounds_left",
+               "legal_actions", "nodes", "frontier", "best", "best_per_task", "note",
+               "expand", "expand_parallel"}
 
 
 class PolicyAborted(Exception):
@@ -1793,12 +1805,21 @@ class PolicyAborted(Exception):
 
 
 def _node_view(n: dict) -> dict:
-    """What a policy is allowed to see of a node: decision-time score only."""
+    """What a policy observes of a revealed node: its evaluator score and the
+    evaluator's diagnostics. Deliverable bodies stay on disk; the policy sees
+    their paths."""
     return {
         "id": n.get("id"), "parent": n.get("parent"), "task": n.get("task"),
-        "depth": n.get("depth", 0), "score": n.get("score_online", n.get("score", 0.0)),
+        "depth": n.get("depth", 0), "score": float(n.get("score", 0.0)),
         "gain": n.get("gain"), "status": n.get("status"), "cost": n.get("cost", 1),
         "files": list(n.get("files", [])),
+        "diagnostics": {
+            "violations": [str(v)[:160] for v in (n.get("violations") or [])[:5]],
+            "truncated": bool(n.get("truncated", False)),
+            "emitted": n.get("emitted", 0), "inherited": n.get("inherited", 0),
+            "tests_passed": n.get("tests_passed"), "tests_total": n.get("test_count"),
+            "test_failures": [str(x)[:160] for x in (n.get("test_failures") or [])[:5]],
+        },
     }
 
 
@@ -1806,16 +1827,21 @@ class ExplorerBase:
     """What an exploration policy is allowed to do. Live and replay implement the
     same methods, so one policy source runs in both worlds unchanged."""
 
-    def __init__(self, tasks: List[str], budget: int):
+    def __init__(self, tasks: List[str], budget: int, max_parallelism: int, max_rounds: int):
         self._tasks = list(tasks)
         self._budget = int(budget)
         self._spent = 0
         self._nodes: List[dict] = []
-        self._steps = 0
         self._log: List[str] = []
         self._root_id = "root"
+        self._W = max(1, int(max_parallelism))
+        self._K = max(1, int(max_rounds))
+        self._rounds = 0
+        self._trace: List[dict] = []
+        self._stop: Optional[str] = None
+        self._support_mode = False
 
-    # --- read-only views (decision-time scores) ---
+    # --- read-only views ---
     def tasks(self) -> List[str]:
         return list(self._tasks)
 
@@ -1828,22 +1854,46 @@ class ExplorerBase:
     def spent(self) -> int:
         return self._spent
 
+    def max_parallelism(self) -> int:
+        return self._W
+
+    def rounds_left(self) -> int:
+        return max(0, self._K - self._rounds)
+
     def _real(self) -> List[dict]:
         return [n for n in self._nodes if n.get("task")]
+
+    def _parents(self) -> Set[str]:
+        return {n.get("parent") for n in self._nodes if n.get("parent")}
+
+    def _legal_set(self) -> List[Tuple[str, str]]:
+        """A(T): one root action per assignment plus every leaf of the tree."""
+        parents = self._parents()
+        acts = [(self._root_id, t) for t in self._tasks]
+        for n in self._real():
+            if n["id"] not in parents and n["task"] in self._tasks:
+                acts.append((n["id"], n["task"]))
+        return acts
+
+    def _available(self, req: Tuple[str, str]) -> bool:
+        return True
+
+    def legal_actions(self) -> List[List[str]]:
+        return [[p, t] for p, t in self._legal_set() if self._available((p, t))]
 
     def nodes(self) -> List[dict]:
         return [_node_view(n) for n in self._real()]
 
     def frontier(self) -> List[dict]:
-        """Expanded nodes with no expanded children yet."""
-        parents = {n.get("parent") for n in self._nodes}
+        """The current leaves: expanded nodes with no expanded children."""
+        parents = self._parents()
         return [_node_view(n) for n in self._real() if n["id"] not in parents]
 
     def best(self) -> Optional[dict]:
         real = self._real()
         if not real:
             return None
-        return _node_view(max(real, key=lambda n: _node_view(n)["score"]))
+        return _node_view(max(real, key=lambda n: float(n.get("score", 0.0))))
 
     def best_per_task(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}
@@ -1858,21 +1908,7 @@ class ExplorerBase:
         if len(self._log) < 200:
             self._log.append(str(msg)[:200])
 
-    # --- evaluation views (final scores; never exposed to the policy) ---
-    def final_best_per_task(self) -> Dict[str, dict]:
-        out: Dict[str, dict] = {}
-        for n in self._real():
-            cur = out.get(n["task"])
-            if cur is None or n.get("score", 0.0) > cur.get("score", 0.0):
-                out[n["task"]] = n
-        return out
-
     # --- actions ---
-    def _tick(self):
-        self._steps += 1
-        if self._steps > POLICY_MAX_STEPS:
-            raise PolicyAborted(f"policy exceeded {POLICY_MAX_STEPS} interface calls")
-
     @staticmethod
     def _normalise_request(req) -> Optional[Tuple[str, str]]:
         try:
@@ -1880,49 +1916,69 @@ class ExplorerBase:
         except Exception:
             return None
 
-    def _valid(self, req: Optional[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-        if req is None:
-            return None
-        parent_id, task = req
-        if task not in self._tasks:
-            return None
-        if not any(n["id"] == parent_id for n in self._nodes):
-            return None
-        return req
-
     def expand(self, parent_id: str, task: str) -> Optional[dict]:
         res = self.expand_parallel([(parent_id, task)])
         return res[0] if res else None
 
     def expand_parallel(self, requests) -> List[Optional[dict]]:
-        """Always returns a list aligned 1:1 with `requests`. Requests beyond
-        POLICY_MAX_FANOUT are run in further batches (each batch is one interface
-        call) instead of being silently dropped."""
-        reqs = [self._valid(self._normalise_request(r)) for r in list(requests)]
+        """One decision round. Returns a list aligned 1:1 with `requests`."""
+        reqs = [self._normalise_request(r) for r in list(requests)]
         results: List[Optional[dict]] = [None] * len(reqs)
-        for start in range(0, len(reqs), POLICY_MAX_FANOUT):
-            self._tick()
-            chunk = reqs[start:start + POLICY_MAX_FANOUT]
-            for off, res in enumerate(self._expand_batch(chunk)):
-                results[start + off] = res
-            if self.budget_left() <= 0:
-                break
+        if self.rounds_left() <= 0:
+            if self._stop is None:
+                self._stop = f"decision-round cap reached (K={self._K})"
+            return results
+        if self.budget_left() <= 0:
+            if self._stop is None:
+                self._stop = "agent-call budget exhausted"
+            return results
+        legal = set(self._legal_set())
+        batch: List[Tuple[int, Tuple[str, str]]] = []
+        seen: Set[Tuple[str, str]] = set()
+        rejected = {"illegal": 0, "duplicate": 0, "over_w": 0}
+        for i, r in enumerate(reqs):
+            if r is None or r not in legal or not self._available(r):
+                rejected["illegal"] += 1
+            elif r in seen:
+                rejected["duplicate"] += 1
+            elif len(batch) >= self._W:
+                rejected["over_w"] += 1
+            else:
+                seen.add(r)
+                batch.append((i, r))
+        if not batch:
+            return results
+        self._rounds += 1
+        outs = self._expand_batch([r for _, r in batch])
+        for (i, _), o in zip(batch, outs):
+            results[i] = o
+        revealed = [o for o in outs if o]
+        self._trace.append({
+            "k": self._rounds,
+            "batch": len(batch),
+            "roots": sum(1 for _, r in batch if r[0] == self._root_id),
+            "refines": sum(1 for _, r in batch if r[0] != self._root_id),
+            "rejected": {k: v for k, v in rejected.items() if v},
+            "revealed": len(revealed),
+            "scores": [round(o["score"], 3) for o in revealed],
+            "best": round(max([float(n.get("score", 0.0)) for n in self._real()] or [0.0]), 4),
+            "spent": self._spent,
+            "support": bool(self._support_mode),
+        })
         return results
 
-    def _expand_batch(self, reqs: List[Optional[Tuple[str, str]]]) -> List[Optional[dict]]:
+    def _expand_batch(self, reqs: List[Tuple[str, str]]) -> List[Optional[dict]]:
         raise NotImplementedError
 
 
 class ReplayExplorer(ExplorerBase):
-    """Dreaming. Resolves each requested expansion against a recorded node and
-    charges its recorded cost; nothing is executed and no agent is called.
+    """Dreaming. Continuing v reveals Child(v; T) - the recorded child of v for
+    that assignment - and charges its recorded cost; nothing is executed and no
+    agent is called. A continuation history never recorded is not legal."""
 
-    A valid request for a branch history never recorded returns None - that is
-    the edge of the dream - and, with REPLAY_CHARGE_UNRECORDED, costs one unit,
-    because online it would have cost at least one real agent call."""
-
-    def __init__(self, recorded: List[dict], tasks: List[str], budget: int):
-        super().__init__(tasks, budget)
+    def __init__(self, recorded: List[dict], tasks: List[str], budget: int,
+                 max_parallelism: int, max_rounds: int):
+        super().__init__(tasks, budget, max_parallelism, max_rounds)
         self._by_parent: Dict[str, List[dict]] = {}
         for n in recorded:
             self._by_parent.setdefault(n.get("parent") or "", []).append(n)
@@ -1931,29 +1987,29 @@ class ReplayExplorer(ExplorerBase):
         roots = [n for n in recorded if not n.get("parent")]
         self._root_id = roots[0]["id"] if roots else "root"
         self._consumed: Set[str] = set()
-        self._unrecorded = 0
         if roots:
             self._nodes.append(dict(roots[0]))
         else:
             self._nodes.append({"id": "root", "parent": None, "task": None, "depth": 0,
-                                "score": 0.0, "score_online": 0.0})
+                                "score": 0.0})
+
+    def _next_child(self, parent_id: str, task: str) -> Optional[dict]:
+        for cand in self._by_parent.get(parent_id, []):
+            if cand.get("task") == task and cand["id"] not in self._consumed:
+                return cand
+        return None
+
+    def _available(self, req: Tuple[str, str]) -> bool:
+        return self._next_child(req[0], req[1]) is not None
 
     def _expand_batch(self, reqs):
         out: List[Optional[dict]] = []
-        for req in reqs:
-            if req is None or self.budget_left() <= 0:
+        for parent_id, task in reqs:
+            if self.budget_left() <= 0:
                 out.append(None)
                 continue
-            parent_id, task = req
-            match = None
-            for cand in self._by_parent.get(parent_id, []):
-                if cand.get("task") == task and cand["id"] not in self._consumed:
-                    match = cand
-                    break
+            match = self._next_child(parent_id, task)
             if match is None:
-                self._unrecorded += 1
-                if REPLAY_CHARGE_UNRECORDED:
-                    self._spent += 1
                 out.append(None)
                 continue
             self._consumed.add(match["id"])
@@ -1964,15 +2020,17 @@ class ReplayExplorer(ExplorerBase):
 
 
 class LiveExplorer(ExplorerBase):
-    """Online deployment. Each expansion is a real agent call whose outcome is
-    recorded into the tree, so this round's exploration becomes next round's
-    simulator."""
+    """Online deployment. Each expansion is a real agent call followed by the
+    fixed evaluator; the outcome is recorded into the tree, so this round's
+    exploration becomes next round's simulator."""
 
     def __init__(self, tasks: List[str], budget: int, roster: List[dict], rnd: int,
                  background: str, run_dir: Path, slot_queue: queue.Queue,
+                 max_parallelism: int, max_rounds: int,
                  prior_hashes: Optional[Dict[str, Set[str]]] = None,
-                 semantic_guidance: bool = False):
-        super().__init__(tasks, budget)
+                 semantic_guidance: bool = False,
+                 test_ctx: Optional[dict] = None):
+        super().__init__(tasks, budget, max_parallelism, max_rounds)
         self.roster = roster
         self.rnd = rnd
         self.background = background
@@ -1980,13 +2038,13 @@ class LiveExplorer(ExplorerBase):
         self.slot_queue = slot_queue
         self.semantic_guidance = semantic_guidance
         self.prior_hashes = prior_hashes or {}
+        self.test_ctx = test_ctx
         self._seq = 0
         self._lock = threading.Lock()
-        self._support_mode = False
         self._root_id = new_node_id(rnd, 0)
         root = {"id": self._root_id, "seq": 0, "round": rnd, "parent": None,
                 "depth": 0, "task": None, "status": "root", "score": 0.0,
-                "score_online": 0.0, "cost": 0, "files": [], "violations": []}
+                "cost": 0, "files": [], "violations": [], "max_parallelism": self._W}
         self._nodes.append(root)
         append_node(run_dir, rnd, root)
 
@@ -1995,16 +2053,22 @@ class LiveExplorer(ExplorerBase):
             self._seq += 1
             return self._seq
 
+    def _real(self) -> List[dict]:
+        with self._lock:
+            return [n for n in self._nodes if n.get("task")]
+
+    def _parents(self) -> Set[str]:
+        with self._lock:
+            return {n.get("parent") for n in self._nodes if n.get("parent")}
+
     def _expand_batch(self, reqs):
         results: List[Optional[dict]] = [None] * len(reqs)
-        runnable = [(i, v) for i, v in enumerate(reqs) if v is not None]
         with self._lock:
             allowance = self.budget_left()
-        runnable = runnable[:allowance]
+        runnable = list(enumerate(reqs))[:allowance]
         if not runnable:
             return results
-        pool = max(1, min(len(runnable), POLICY_MAX_FANOUT))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=pool) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(runnable))) as ex:
             futs = {ex.submit(self._run_one, v[0], v[1]): i for i, v in runnable}
             for fut in concurrent.futures.as_completed(futs):
                 i = futs[fut]
@@ -2017,31 +2081,28 @@ class LiveExplorer(ExplorerBase):
         return results
 
     def run_support_probes(self, n: int) -> int:
-        """Spend up to n calls on off-policy expansions, chosen deterministically
-        from the tree the policy grew:
-          deep - refine each task's best node that has no same-task child yet
-                 (pi_0-style policies refine the WEAKEST half and never do this)
-          wide - a further independent root attempt, fewest-roots tasks first
-                 (replay can only serve one root child per recorded attempt)
-        The two lists are interleaved so both kinds of support accumulate."""
+        """EXTENSION (SUPPORT_PROBE_FRAC > 0): spend up to n calls on off-policy
+        continuations chosen deterministically from the tree the policy grew,
+        using the same legality and batch rules as the policy:
+          deep - continue each assignment's best leaf that has deliverables
+          wide - open a further root branch, fewest-branches assignments first
+        The two lists are interleaved and dispatched in batches of W."""
         if n <= 0:
             return 0
-        with self._lock:
-            real = [dict(x) for x in self._nodes if x.get("task")]
-        has_child = {(x.get("parent"), x["task"]) for x in real}
+        real = [dict(x) for x in self._real()]
+        parents = self._parents()
         roots: Dict[str, int] = {}
         best: Dict[str, dict] = {}
         for x in real:
             if x.get("parent") == self._root_id:
                 roots[x["task"]] = roots.get(x["task"], 0) + 1
-            if not x.get("files"):
+            if x["id"] in parents or not x.get("files"):
                 continue
             cur = best.get(x["task"])
-            if cur is None or x.get("score_online", 0.0) > cur.get("score_online", 0.0):
+            if cur is None or x.get("score", 0.0) > cur.get("score", 0.0):
                 best[x["task"]] = x
         deep = [(b["id"], t) for t, b in sorted(best.items(),
-                                                key=lambda kv: (-kv[1].get("score_online", 0.0), kv[0]))
-                if (b["id"], t) not in has_child]
+                                                key=lambda kv: (-kv[1].get("score", 0.0), kv[0]))]
         wide = [(self._root_id, t) for t in sorted(self._tasks, key=lambda t: (roots.get(t, 0), t))]
         reqs: List[Tuple[str, str]] = []
         di = wi = 0
@@ -2053,10 +2114,13 @@ class LiveExplorer(ExplorerBase):
         if not reqs:
             return 0
         self._support_mode = True
-        self._steps = 0
+        self._K = self._rounds + (len(reqs) + self._W - 1) // self._W
         before = self.spent()
         try:
-            self.expand_parallel(reqs)
+            for i in range(0, len(reqs), self._W):
+                if self.budget_left() <= 0 or _shutdown_event.is_set():
+                    break
+                self.expand_parallel(reqs[i:i + self._W])
         finally:
             self._support_mode = False
         return self.spent() - before
@@ -2070,7 +2134,8 @@ class LiveExplorer(ExplorerBase):
 
     def _run_one(self, parent_id: str, task: str) -> Optional[dict]:
         # One unit per REAL agent call: the first attempt is reserved here, every
-        # retry reserves again and is refused once the budget is gone.
+        # retry reserves again and is refused once the budget is gone. Evaluator
+        # calls (test generation) are not discovery-agent calls and are not charged.
         if not self._reserve():
             return None
         seq = self._next_seq()
@@ -2111,6 +2176,14 @@ class LiveExplorer(ExplorerBase):
                                  parent_task_node=parent_task_node, reference_hashes=reference,
                                  attempt=attempt, semantic_guidance=self.semantic_guidance)
                 if node["status"] in ("success", "partial"):
+                    # Fixed evaluator, part of the same generation-evaluation
+                    # request; runs on the slot this attempt already holds.
+                    if EVAL_INLINE_TESTS and self.test_ctx is not None and node.get("files"):
+                        try:
+                            evaluate_node_inline(node, endpoint, self.run_dir, self.rnd,
+                                                 self.test_ctx)
+                        except Exception as exc:
+                            print(f"\n    [!] {task} evaluation raised {str(exc)[:80]}", flush=True)
                     break
             except Exception as exc:
                 print(f"\n    [!] {task} attempt {attempt} raised {str(exc)[:80]}", flush=True)
@@ -2125,7 +2198,6 @@ class LiveExplorer(ExplorerBase):
             node = {"id": node_id, "seq": seq, "round": self.rnd, "parent": parent_id,
                     "depth": depth, "task": task, "dir": agent["dir"], "status": "error",
                     "heuristic_score": h, "score_parts": parts,
-                    "score_online": blend_test_score(h, None, False),
                     "score": blend_test_score(h, None, False),
                     "test_pass_rate": None, "files": [], "file_hashes": [], "violations": [],
                     "notes": [], "elapsed": 0, "prompt_tokens": 0, "completion_tokens": 0,
@@ -2134,7 +2206,7 @@ class LiveExplorer(ExplorerBase):
         node["attempts"] = attempts
         node["support"] = bool(self._support_mode)
         if parent_task_node is not None:
-            node["gain"] = round(node["score_online"] - parent_task_node.get("score_online", 0.0), 6)
+            node["gain"] = round(node["score"] - parent_task_node.get("score", 0.0), 6)
         else:
             node["gain"] = None
 
@@ -2144,14 +2216,15 @@ class LiveExplorer(ExplorerBase):
         append_event(self.run_dir, {
             "round": self.rnd, "event": "node", "node": node_id, "parent": parent_id,
             "task": task, "depth": depth, "status": node["status"], "cost": node["cost"],
-            "score": node["score_online"], "gain": node["gain"], "files": len(node["files"]),
+            "score": node["score"], "gain": node["gain"], "files": len(node["files"]),
+            "tests": node.get("test_pass_rate"),
         })
         with self._lock:
             real = [n for n in self._nodes if n.get("task")]
             spent = self._spent
-        sys.stdout.write("\r    [+] round {:02d}: {} node(s), budget {}/{}, best {:.3f}   ".format(
-            self.rnd, len(real), spent, self._budget,
-            max([n["score_online"] for n in real] or [0.0])))
+        sys.stdout.write("\r    [+] round {:02d}: {} node(s), budget {}/{}, decision round {}, best {:.3f}   ".format(
+            self.rnd, len(real), spent, self._budget, self._rounds,
+            max([n["score"] for n in real] or [0.0])))
         sys.stdout.flush()
         return node
 
@@ -2356,7 +2429,7 @@ def build_comms_digest(run_dir: Path, task: str, rnd: int, live_nodes: List[dict
             if lp:
                 body = (read_file_content_safe(run_dir / lp) or "").strip()
             if body:
-                blocks.append(f"--- attempt {n['id']} (score {n.get('score_online', n['score']):.3f}) ---\n"
+                blocks.append(f"--- attempt {n['id']} (score {n.get('score', 0.0):.3f}) ---\n"
                               f"{body[:COMMS_PEER_SUMMARY_CHARS * 2]}")
         if blocks:
             sections.append("THE ATTEMPT YOU ARE CONTINUING (LOGS)\n\n" + "\n\n".join(blocks)
@@ -2376,7 +2449,7 @@ def build_comms_digest(run_dir: Path, task: str, rnd: int, live_nodes: List[dict
         if not n.get("task") or n["task"] == task:
             continue
         cur = best.get(n["task"])
-        if cur is None or n.get("score_online", 0) > cur.get("score_online", 0):
+        if cur is None or n.get("score", 0) > cur.get("score", 0):
             best[n["task"]] = n
     for tid in sorted(best):
         n = best[tid]
@@ -2650,11 +2723,13 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     elapsed = round(time.time() - start_time, 2)
     h, parts = score_node_heuristic(status, saved_files, violations, truncated,
                                     len(log_body or ""), novel_frac)
+    # Heuristic part of the fixed evaluator; the test part is applied by
+    # evaluate_node_inline before the node is recorded.
     online = blend_test_score(h, None, bool(saved_files))
     return {
         "id": node_id, "seq": seq, "round": rnd, "parent": parent_id, "depth": depth,
         "task": task, "dir": agent["dir"], "status": status,
-        "score": online, "score_online": online, "heuristic_score": h, "score_parts": parts,
+        "score": online, "heuristic_score": h, "score_parts": parts,
         "test_pass_rate": None, "cost": 1,
         "files": saved_files, "file_hashes": sorted(set(file_hashes)),
         "emitted": emitted, "inherited": len(parent_files),
@@ -2672,24 +2747,38 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
 # ------------------------------------------------------------------
 
 DEFAULT_POLICY_SOURCE = '''\
-# Exploration policy pi_0: hand-written parallel-refine.
-# Both Dream-RSI and the fixed-exploration control start from this, so round 1 is
-# identical by construction and later divergence is attributable to dreaming.
+# Exploration policy pi_0: hand-written parallel refine (the initial policy of
+# Dream-RSI Sec. 4). One independent workspace (branch) per assignment is opened
+# from the root; every following decision round refines the current leaf of every
+# open branch, in batches of at most W. Each branch keeps its own local trajectory.
+# Both Dream-RSI and the fixed-exploration control start from this policy, so
+# round 1 is identical by construction and later divergence is due to dreaming.
+
+
+def chunks(items, size):
+    out = []
+    for i in range(0, len(items), size):
+        out.append(items[i:i + size])
+    return out
+
 
 def explore(ctx):
+    w = ctx.max_parallelism()
     root = ctx.root()
-    opened = ctx.expand_parallel([(root, t) for t in ctx.tasks()])
-    frontier = [n for n in opened if n]
-
-    while ctx.budget_left() > 0 and frontier:
-        frontier.sort(key=lambda n: n["score"])
-        half = max(1, len(frontier) // 2)
-        weakest = frontier[:half]
-        nxt = ctx.expand_parallel([(n["id"], n["task"]) for n in weakest])
-        nxt = [n for n in nxt if n]
+    leaves = []
+    for group in chunks([(root, t) for t in ctx.tasks()], w):
+        if ctx.budget_left() <= 0 or ctx.rounds_left() <= 0:
+            return
+        leaves.extend([n for n in ctx.expand_parallel(group) if n])
+    while leaves and ctx.budget_left() > 0 and ctx.rounds_left() > 0:
+        nxt = []
+        for group in chunks([(n["id"], n["task"]) for n in leaves], w):
+            if ctx.budget_left() <= 0 or ctx.rounds_left() <= 0:
+                break
+            nxt.extend([n for n in ctx.expand_parallel(group) if n])
         if not nxt:
             break
-        frontier = nxt
+        leaves = nxt
 '''
 
 _POLICY_BLOCKED_NAMES = {
@@ -2831,6 +2920,9 @@ class Ctx:
     def frontier(self): return _call("frontier")
     def best(self): return _call("best")
     def best_per_task(self): return _call("best_per_task")
+    def max_parallelism(self): return _call("max_parallelism")
+    def rounds_left(self): return _call("rounds_left")
+    def legal_actions(self): return _call("legal_actions")
     def note(self, msg): return _call("note", str(msg)[:200])
     def expand(self, parent_id, task): return _call("expand", str(parent_id), str(task))
     def expand_parallel(self, requests):
@@ -3008,109 +3100,119 @@ def load_or_init_policy(run_dir: Path, rnd: int) -> str:
 # Replay scoring and dreaming
 # ------------------------------------------------------------------
 
-def pool_untested_prior(pool: List[Tuple[int, List[dict]]]) -> Tuple[float, int]:
-    """Prior pass rate for untested nodes during replay evaluation. Tested nodes
-    are the top-k by online score, so this mean is if anything optimistic for
-    the untested remainder - but it tracks reality, unlike a constant."""
-    rates = [n["test_pass_rate"] for _, nodes in pool for n in nodes
-             if n.get("task") and n.get("test_pass_rate") is not None]
-    if EVAL_UNTESTED_PRIOR_MODE != "empirical" or len(rates) < EVAL_EMPIRICAL_MIN_TESTED:
-        return EVAL_UNTESTED_PRIOR, len(rates)
-    return sum(rates) / len(rates), len(rates)
+def replay_tree(source: str, nodes: List[dict], tasks: List[str],
+                budget: int) -> Tuple[ReplayExplorer, bool, str]:
+    """Replay one policy over one recorded world, from its root."""
+    ex = ReplayExplorer(nodes, tasks, budget, MAX_PARALLELISM, REPLAY_MAX_DECISION_ROUNDS)
+    ok, detail = run_policy(source, ex, wall_secs=POLICY_REPLAY_WALL_SECS)
+    if ex._stop is None:
+        ex._stop = "policy returned (empty batch)" if (ok and detail == "ok") else detail
+    return ex, ok, detail
 
 
-def _replay_eval_score(n: dict, prior: float) -> float:
-    """Final score of a node for replay EVALUATION. Tested nodes keep their
-    test-informed score; untested nodes with files are re-blended against the
-    pool prior; nodes with no files keep their (zero-rate) score."""
-    if n.get("test_pass_rate") is not None or not n.get("files"):
-        return float(n.get("score", 0.0))
-    h = n.get("heuristic_score")
-    if h is None:
-        return float(n.get("score", 0.0))
-    return EVAL_HEURISTIC_MIX * float(h) + (1.0 - EVAL_HEURISTIC_MIX) * prior
+def replay_value(ex: ExplorerBase, tasks: List[str]) -> dict:
+    """Eq. (1) for one replay world:
+        V = quality - beta_1 * N + beta_2 * N / max(1, k*)
+    quality: best revealed score per assignment, averaged over the roster; an
+    assignment never opened contributes the root's score (0). N: revealed
+    non-root nodes (generation-evaluation requests represented). k*: completed
+    decision rounds."""
+    best = {t: 0.0 for t in tasks}
+    for n in ex._real():
+        t = n.get("task")
+        if t in best:
+            best[t] = max(best[t], float(n.get("score", 0.0)))
+    quality = sum(best.values()) / max(1, len(tasks))
+    real = ex._real()
+    N, k = len(real), ex._rounds
+    parallel = (N / max(1, k)) if N > 0 else 0.0
+    V = quality - DREAM_BETA1 * N + DREAM_BETA2 * parallel
+    reached = {n.get("task") for n in real}
+    return {"V": round(V, 6), "quality": round(quality, 6), "N": N, "k": k,
+            "parallelism": round(parallel, 4),
+            "coverage": round(len(reached & set(tasks)) / max(1, len(tasks)), 4),
+            "cost": ex.spent(), "stop": ex._stop}
 
 
 def replay_score(source: str, pool: List[Tuple[int, List[dict]]], tasks: List[str],
-                 budget: int, prior: Optional[float] = None) -> dict:
-    """Score a candidate policy by dreaming it over every recorded tree. Zero
-    agent calls: each expansion resolves to a node whose outcome is already on
-    disk. The policy decides on score_online (what it would have seen live); the
-    result is evaluated on the final, test-informed score."""
-    if prior is None:
-        prior, _ = pool_untested_prior(pool)
-    per_tree = []
+                 budget: int) -> dict:
+    """Score a policy version by dreaming it over every recorded tree at zero
+    agent calls: V^m = (1/t) * sum_i V_i^m."""
+    per_tree, traces = [], []
     for rnd, nodes in pool:
-        ex = ReplayExplorer(nodes, tasks, budget)
-        ok, detail = run_policy(source, ex, wall_secs=POLICY_REPLAY_WALL_SECS)
+        ex, ok, detail = replay_tree(source, nodes, tasks, budget)
         if not ok:
-            return {"valid": False, "detail": detail, "score": -1.0,
-                    "cost": 0, "per_tree": []}
-        covered: Dict[str, float] = {}
-        for n in ex._real():
-            v = _replay_eval_score(n, prior)
-            if v > covered.get(n["task"], -1.0):
-                covered[n["task"]] = v
-        coverage = len(covered) / max(1, len(tasks))
-        per_tree.append({
-            "round": rnd, "best": round(max(covered.values(), default=0.0), 6),
-            "cost": ex.spent(), "unrecorded": ex._unrecorded,
-            "coverage": round(coverage, 4),
-            "mean_best": round(sum(covered.values()) / len(covered), 6) if covered else 0.0,
-        })
-
+            return {"valid": False, "detail": detail, "score": None,
+                    "per_tree": per_tree, "traces": traces}
+        v = replay_value(ex, tasks)
+        v["round"] = rnd
+        per_tree.append(v)
+        traces.append({"round": rnd, "stop": ex._stop, "decision_rounds": ex._trace,
+                       "notes": ex._log[:20]})
     if not per_tree:
-        return {"valid": False, "detail": "empty simulator pool", "score": -1.0,
-                "cost": 0, "per_tree": []}
+        return {"valid": False, "detail": "empty simulator pool", "score": None,
+                "per_tree": [], "traces": []}
+    T = len(per_tree)
 
-    mean_best = sum(t["mean_best"] for t in per_tree) / len(per_tree)
-    mean_cov = sum(t["coverage"] for t in per_tree) / len(per_tree)
-    mean_cost = sum(t["cost"] for t in per_tree) / len(per_tree)
-    quality = mean_best * (DREAM_COVERAGE_FLOOR + (1 - DREAM_COVERAGE_FLOOR) * mean_cov)
-    cost_pen = DREAM_COST_WEIGHT * mean_cost / max(1, budget)
-    score = quality - cost_pen
+    def _mean(key: str) -> float:
+        return sum(float(t[key]) for t in per_tree) / T
+
     return {
-        "valid": True, "detail": "ok", "score": round(score, 6),
-        "quality": round(quality, 6), "cost_penalty": round(cost_pen, 6),
-        "prior": round(prior, 4),
-        "mean_best": round(mean_best, 6), "coverage": round(mean_cov, 4),
-        "cost": round(mean_cost, 2),
-        "unrecorded": sum(t["unrecorded"] for t in per_tree),
-        "efficiency": round(score / mean_cost, 6) if mean_cost else 0.0,
-        "per_tree": per_tree,
+        "valid": True, "detail": "ok", "score": round(_mean("V"), 6),
+        "quality": round(_mean("quality"), 6), "N": round(_mean("N"), 2),
+        "k": round(_mean("k"), 2), "parallelism": round(_mean("parallelism"), 4),
+        "coverage": round(_mean("coverage"), 4), "cost": round(_mean("cost"), 2),
+        "per_tree": per_tree, "traces": traces,
     }
 
 
-def _policy_interface_doc() -> str:
+def _policy_interface_doc(budget: int) -> str:
     return (
         "POLICY INTERFACE (this is the whole API; nothing else is available)\n"
-        "  ctx.tasks() -> list of task ids, e.g. ['t01','t02']\n"
-        "  ctx.root() -> id of the tree root\n"
-        "  ctx.expand(parent_id, task) -> node dict or None\n"
-        "  ctx.expand_parallel([(parent_id, task), ...]) -> list of node-or-None, aligned 1:1\n"
-        f"      with the requests. Runs concurrently in batches of {POLICY_MAX_FANOUT}; each batch\n"
-        "      counts as one interface call.\n"
-        "  ctx.frontier() -> expanded nodes with no expanded children\n"
-        "  ctx.nodes() -> every node expanded so far this run\n"
-        "  ctx.best() -> highest-scoring node so far, or None\n"
-        "  ctx.best_per_task() -> dict task -> best node\n"
-        "  ctx.budget_left() / ctx.spent() -> ints, budget is in agent calls\n"
+        "  ctx.tasks() -> assignment ids, e.g. ['t01','t02']\n"
+        "  ctx.root() -> id of the shared tree root\n"
+        f"  ctx.max_parallelism() -> W = {MAX_PARALLELISM}, the largest batch one decision round may hold\n"
+        "  ctx.rounds_left() -> decision rounds remaining in this rollout\n"
+        "  ctx.legal_actions() -> list of [parent_id, task] actions legal right now\n"
+        "  ctx.expand_parallel([(parent_id, task), ...]) -> ONE decision round; list of\n"
+        "      node-or-None aligned 1:1 with the requests\n"
+        "  ctx.expand(parent_id, task) -> a decision round with a batch of one\n"
+        "  ctx.frontier() -> current leaves; ctx.nodes() -> every revealed node\n"
+        "  ctx.best() / ctx.best_per_task() -> best revealed node / dict task -> node\n"
+        "  ctx.budget_left() / ctx.spent() -> agent-call units\n"
         "  ctx.note(msg) -> record a short diagnostic string\n"
         "\n"
-        "A node dict has: id, parent, task, depth, score (0..1), gain, status, cost, files.\n"
-        "  gain = score minus the parent attempt's score for a continuation (None at depth 1).\n"
+        "LEGALITY (evaluated against the tree as it stood BEFORE the call)\n"
+        "  * (root, task) opens a new independent branch for that assignment.\n"
+        "  * (leaf_id, leaf_task) continues a branch from its current leaf; a node that\n"
+        "    already has a child is no longer continuable.\n"
+        "  * A batch holds at most W distinct legal actions. Illegal, duplicate or over-W\n"
+        "    requests return None and cost nothing; a batch with no admissible request\n"
+        "    consumes no round. Returning from explore() is the empty batch: it stops.\n"
+        "  * In replay only continuations that history recorded are legal; legal_actions()\n"
+        "    lists exactly those. Online every root/leaf action is legal.\n"
+        "\n"
+        "A node dict has: id, parent, task, depth, score (0..1, final evaluator score),\n"
+        "  gain (score minus the parent attempt's score; None at depth 1), status, cost\n"
+        "  (agent calls incl. retries), files, and diagnostics {violations, truncated,\n"
+        "  emitted, inherited, tests_passed, tests_total, test_failures}.\n"
         "  A continuation starts from its parent's files and only changes what it improves.\n"
-        "  cost can exceed 1: failed attempts are retried and every real call is charged.\n"
-        "expand returns None when the budget is exhausted, the request is malformed, or\n"
-        "- during replay - history never recorded that branch. An unrecorded branch still\n"
-        "costs 1 budget unit, exactly as a real call would online. None is information.\n"
+        "  A failed test or a truncated output is often repairable by continuing the leaf.\n"
+        "\n"
+        "OBJECTIVE (per recorded tree, averaged over all trees)\n"
+        f"  V = quality - {DREAM_BETA1} * N + {DREAM_BETA2} * N / max(1, k)\n"
+        "  quality = mean over ALL assignments of the best revealed score (0 if never opened)\n"
+        "  N = revealed nodes, k = decision rounds used. Each replay is capped at "
+        f"{budget} agent calls and {REPLAY_MAX_DECISION_ROUNDS} decision rounds.\n"
+        "  So: cover the roster, reveal only promising continuations, stop lines that\n"
+        "  plateau, and batch independent continuations instead of expanding serially.\n"
         "\n"
         "HARD RULES\n"
         "  1. Define exactly one top-level function: explore(ctx). Helper defs and constants are ok.\n"
         "  2. No imports, no print, no file/network/system access. Pure control flow.\n"
         "  3. No attribute or name starting with '_', no bare 'except:'.\n"
-        f"  4. At most {POLICY_MAX_STEPS} interface calls total; exceeding it ends the run.\n"
-        "  5. Terminate. Every loop must make progress toward budget exhaustion or break.\n"
+        f"  4. At most {POLICY_MAX_RPC} interface calls in total, reads included.\n"
+        "  5. Terminate: every loop must reach an empty batch, the budget or the round cap.\n"
         "  6. Output ONLY Python source, no markdown fences, no commentary."
     )
 
@@ -3130,7 +3232,7 @@ def _pool_summary(pool: List[Tuple[int, List[dict]]], tasks: List[str]) -> str:
                 gains.setdefault(d, []).append(n["gain"])
         by_task: Dict[str, List[float]] = {}
         for n in real:
-            by_task.setdefault(n["task"], []).append(n.get("score_online", n.get("score", 0.0)))
+            by_task.setdefault(n["task"], []).append(float(n.get("score", 0.0)))
         best = []
         for t in sorted(by_task):
             s = sorted(by_task[t])
@@ -3148,119 +3250,125 @@ def _pool_summary(pool: List[Tuple[int, List[dict]]], tasks: List[str]) -> str:
     return "\n".join(lines) or "(pool is empty)"
 
 
+def _result_line(name: str, r: dict) -> str:
+    if not r.get("valid"):
+        return f"{name}: INVALID - {str(r.get('detail', ''))[:160]}"
+    trees = "; ".join(
+        f"r{t['round']:02d} V {t['V']:.4f} q {t['quality']:.3f} N {t['N']} k {t['k']} "
+        f"cov {t['coverage']:.2f} stop '{str(t['stop'])[:40]}'" for t in r.get("per_tree", []))
+    return (f"{name}: V {r['score']:.4f} (quality {r['quality']:.4f}, N {r['N']}, k {r['k']}, "
+            f"N/k {r['parallelism']:.2f}, coverage {r['coverage']:.2f}) [{trees}]")
+
+
+def _trace_digest(r: dict, limit: int) -> str:
+    """Per-decision-round replay trajectories of one policy version, compacted."""
+    out = []
+    for tr in r.get("traces", []):
+        out.append(f"-- world r{tr['round']:02d}: stop = {tr['stop']}")
+        for d in tr["decision_rounds"]:
+            rej = (" rejected " + ",".join(f"{k}={v}" for k, v in d["rejected"].items())
+                   if d.get("rejected") else "")
+            out.append(f"   k{d['k']:02d}: batch {d['batch']} ({d['roots']} open, "
+                       f"{d['refines']} refine){rej} -> revealed {d['revealed']} "
+                       f"scores {d['scores']} best {d['best']:.3f} spent {d['spent']}")
+        if tr.get("notes"):
+            out.append("   notes: " + " | ".join(tr["notes"][:5]))
+    return fit_context("\n".join(out) or "(no trajectories)", limit,
+                       note="...[TRACES TRUNCATED]...")
+
+
 def _select_winner(results: List[dict]) -> dict:
-    """Incumbent-stable selection. A challenger must beat the incumbent by more
-    than DREAM_TIE_EPS; ties keep the incumbent (or, with DREAM_PREFER_CHEAPER,
-    the cheapest tied policy)."""
-    valid = [r for r in results if r["valid"]]
-    incumbent = results[0] if results and results[0]["valid"] else None
+    """argmax over all evaluated versions of the mean replay score; ties go to
+    the earliest version, so the deployed policy (version 0) is kept on a tie."""
+    valid = [r for r in results if r.get("valid")]
     if not valid:
         return results[0]
-    best = max(valid, key=lambda r: r["score"])
-    if incumbent is None:
-        return best
-    if best["score"] > incumbent["score"] + DREAM_TIE_EPS:
-        return best
-    if DREAM_PREFER_CHEAPER:
-        tied = [r for r in valid if r["score"] >= incumbent["score"] - DREAM_TIE_EPS]
-        return min(tied, key=lambda r: (r.get("cost", 0), -r["score"], r["index"]))
-    return incumbent
+    return max(valid, key=lambda r: (r["score"], -r["index"]))
 
 
 def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
                              pool: List[Tuple[int, List[dict]]],
                              tasks: List[str], budget: int) -> Tuple[str, dict]:
-    """Offline policy improvement. The policy-development agent runs on APEX -
-    it is a planning task, not an agent assignment and not a merge.
-
-    The deployed policy is entered as candidate 0 and wins ties, so the winner
-    is never worse than what it replaces on the recorded pool."""
-    # Candidates are replayed under the cap the policy actually gets online.
+    """Offline policy improvement (Dream-RSI Sec. 3, 'Policy improvement and
+    selection'). Version 0 is the deployed policy. For m = 0..M-2 the
+    policy-development agent (APEX) examines the replay trajectories and scores
+    of version m, together with the scores of all earlier versions, and revises
+    version m's code into version m+1. All M versions are replayed on the same
+    fixed history and the argmax is deployed next."""
     budget = policy_budget(budget, len(tasks))
-    prior, n_tested = pool_untested_prior(pool)
-    print(f"\n[DREAM] Round {rnd:02d}: replaying candidate policies over "
-          f"{len(pool)} recorded tree(s) at zero agent calls "
-          f"(policy budget {budget}, untested prior {prior:.3f} from {n_tested} tested node(s), "
-          f"cost weight {DREAM_COST_WEIGHT})...", flush=True)
-
-    def _board(name: str, r: dict) -> str:
-        if not r["valid"]:
-            return f"{name}: REJECTED - {r['detail'][:80]}"
-        trees = "; ".join(f"r{t['round']:02d} cost {t['cost']} off-map {t['unrecorded']} "
-                          f"cov {t['coverage']:.2f}" for t in r.get("per_tree", []))
-        return (f"{name}: score {r['score']:.4f} (quality {r.get('quality', 0):.4f} "
-                f"- cost {r.get('cost_penalty', 0):.4f}), mean cost {r.get('cost', 0)}, "
-                f"off-map requests {r.get('unrecorded', 0)} [{trees}]")
+    print(f"\n[DREAM] Round {rnd:02d}: replaying policy versions over {len(pool)} recorded "
+          f"tree(s) at zero agent calls (budget {budget}, W {MAX_PARALLELISM}, "
+          f"K2 {REPLAY_MAX_DECISION_ROUNDS}, beta1 {DREAM_BETA1}, beta2 {DREAM_BETA2})...",
+          flush=True)
 
     ddir = dream_dir_for(run_dir) / f"round{rnd:02d}"
     ddir.mkdir(parents=True, exist_ok=True)
+    versions: List[dict] = []
 
-    candidates = [{"name": "pi_0 (deployed)", "source": current_source}]
-    base = replay_score(current_source, pool, tasks, budget, prior)
-    results = [dict(base, name="pi_0 (deployed)", index=0)]
-    if base["valid"]:
-        print(f"    [+] pi_0 (deployed): score {base['score']:.4f} "
-              f"| mean_best {base.get('mean_best', 0):.4f} "
-              f"| coverage {base.get('coverage', 0):.2f} | cost {base.get('cost', 0)}", flush=True)
-        leaderboard = _board("pi_0 (deployed)", base)
-    else:
-        print(f"    [!] Deployed policy does not replay ({base['detail'][:80]}); "
-              f"any valid revision will replace it.", flush=True)
-        leaderboard = f"pi_0 (deployed): INVALID IN REPLAY - {base['detail'][:80]}"
+    def _evaluate(name: str, idx: int, src: str) -> dict:
+        res = replay_score(src, pool, tasks, budget)
+        res.update({"name": name, "index": idx})
+        versions.append({"name": name, "index": idx, "source": src, "result": res})
+        if res["valid"]:
+            print(f"    [+] {name}: V {res['score']:.4f} | quality {res['quality']:.4f} "
+                  f"| N {res['N']} | k {res['k']} | N/k {res['parallelism']:.2f} "
+                  f"| coverage {res['coverage']:.2f}", flush=True)
+        else:
+            print(f"    [!] {name}: invalid in replay ({str(res['detail'])[:80]})", flush=True)
+        return res
+
+    _evaluate("pi_0 (deployed)", 0, current_source)
     client = apex_client(timeout=WORKER_TIMEOUT_SECS)
 
     for m in range(1, DREAM_CANDIDATES + 1):
         if _shutdown_event.is_set():
             break
+        prev = versions[-1]
+        earlier = "\n".join(_result_line(v["name"], v["result"]) for v in versions)
         user = (
-            f"{_policy_interface_doc()}\n\n"
-            f"===== CURRENT POLICY SOURCE =====\n{fit_context(current_source, 6000)}\n\n"
-            f"===== RECORDED DISCOVERY HISTORY =====\n{fit_context(_pool_summary(pool, tasks), 6000)}\n\n"
-            f"===== REPLAY LEADERBOARD SO FAR =====\n{leaderboard}\n\n"
-            f"===== BUDGET AND OBJECTIVE =====\nEach replay is capped at {budget} agent calls. "
-            f"score = quality - {DREAM_COST_WEIGHT} * (calls spent / {budget}), where quality is "
-            f"mean best-per-task score scaled by roster coverage. Unspent calls are saved, so "
-            f"stopping a line that has plateaued is rewarded. 'off-map' counts requests for "
-            f"branches history never recorded: each returned None and still cost a call - "
-            f"a high count means the policy is steering where the recorded trees cannot follow. "
-            f"A revision must beat the incumbent by more than {DREAM_TIE_EPS} to be adopted.\n\n"
-            f"Write revision {m} of the exploration policy. Change the search SHAPE - "
-            f"branching, parallel grouping, depth allocation, stopping - not the agents' "
-            f"objectives. Output only Python."
+            f"{_policy_interface_doc(budget)}\n\n"
+            f"===== CURRENT POLICY: VERSION {prev['index']} SOURCE =====\n"
+            f"{fit_context(prev['source'], 6000)}\n\n"
+            f"===== REPLAY SCORES OF VERSION {prev['index']} =====\n"
+            f"{_result_line(prev['name'], prev['result'])}\n\n"
+            f"===== REPLAY TRAJECTORIES OF VERSION {prev['index']} (per decision round) =====\n"
+            f"{_trace_digest(prev['result'], DREAM_TRACE_CHARS)}\n\n"
+            f"===== ALL VERSIONS EVALUATED SO FAR =====\n{earlier}\n\n"
+            f"===== RECORDED DISCOVERY HISTORY =====\n"
+            f"{fit_context(_pool_summary(pool, tasks), 4000)}\n\n"
+            f"Revise version {prev['index']} into version {m}. Keep what the trajectories show "
+            f"working, fix what they show failing. Change the search SHAPE - which "
+            f"continuations, batch composition, depth versus breadth, stopping - never the "
+            f"agents' objectives. Output only Python."
         )
         try:
             raw, _, _ = _apex_completion(client, _PROMPT_POLICY_DEV, user,
                                          APEX_POLICY_TOKENS, 0.8)
         except Exception as exc:
-            print(f"    [!] Candidate {m} generation failed: {str(exc)[:120]}", flush=True)
-            continue
-
+            print(f"    [!] Version {m} generation failed: {str(exc)[:120]}", flush=True)
+            break
         source = re.sub(r'^```[a-zA-Z]*\s*|```\s*$', '', raw.strip(), flags=re.MULTILINE).strip()
+        source = enforce_ascii(source)
         with open(ddir / f"candidate_{m:02d}.py", "w", encoding="ascii") as f:
-            f.write(enforce_ascii(source) + "\n")
+            f.write(source + "\n")
+        _evaluate(f"pi_{m}", m, source)
 
-        res = replay_score(source, pool, tasks, budget, prior)
-        res.update({"name": f"pi_{m}", "index": m})
-        results.append(res)
-        candidates.append({"name": f"pi_{m}", "source": source})
-
-        if res["valid"]:
-            print(f"    [+] pi_{m}: score {res['score']:.4f} "
-                  f"| mean_best {res.get('mean_best', 0):.4f} "
-                  f"| coverage {res.get('coverage', 0):.2f} | cost {res.get('cost', 0)}", flush=True)
-        else:
-            print(f"    [!] pi_{m}: rejected ({res['detail'][:80]})", flush=True)
-        leaderboard += "\n" + _board(f"pi_{m}", res)
-
+    results = [v["result"] for v in versions]
     winner = _select_winner(results)
-    if not winner["valid"]:
-        # Nothing replays - not even the incumbent. Keep deploying it rather than
-        # crash; the live round falls back to pi_0 if it fails there too.
-        winner = results[0]
-    winner_source = next(c["source"] for c in candidates if c["name"] == winner["name"])
+    winner_source = versions[winner["index"]]["source"]
+    base = results[0]
 
+    with open(ddir / "policy_execution_traces.jsonl", "w", encoding="ascii") as f:
+        for v in versions:
+            for tr in v["result"].get("traces", []):
+                f.write(json.dumps({"version": v["index"], "name": v["name"], **tr},
+                                   ensure_ascii=True) + "\n")
     with open(ddir / "scores.json", "w", encoding="ascii") as f:
-        json.dump(results, f, indent=2)
+        json.dump([{k: val for k, val in r.items() if k != "traces"} for r in results],
+                  f, indent=2)
+
+    def _fmt(r: dict) -> float:
+        return float(r["score"]) if r.get("valid") else -1.0
 
     next_path = policy_path(run_dir, rnd + 1)
     next_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3269,24 +3377,23 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     body = re.sub(r'\A(# Deployed for round .*\n# Replay score .*\n)+', '', body + "\n").rstrip()
     with open(next_path, "w", encoding="ascii") as f:
         f.write(f"# Deployed for round {rnd + 1}. Selected by replay over {len(pool)} tree(s).\n"
-                f"# Replay score {winner['score']:.4f} (pi_0 baseline {base['score']:.4f}).\n"
+                f"# Replay score {_fmt(winner):.4f} (deployed version {_fmt(base):.4f}).\n"
                 + body + "\n")
 
-    improved = winner["name"] != "pi_0 (deployed)"
-    print(f"    [+] Winner: {winner['name']} (score {winner['score']:.4f} vs "
-          f"pi_0 {base['score']:.4f}) -> {next_path.name}"
-          + ("" if improved else "  [no revision beat the incumbent; policy unchanged]"), flush=True)
+    improved = winner["index"] != 0
+    print(f"    [+] Selected: {winner['name']} (V {_fmt(winner):.4f} vs deployed "
+          f"{_fmt(base):.4f}) -> {next_path.name}"
+          + ("" if improved else "  [no version beat the deployed policy; unchanged]"), flush=True)
 
     append_event(run_dir, {
         "round": rnd, "event": "dream", "candidates": len(results),
         "valid": len([r for r in results if r["valid"]]), "winner": winner["name"],
-        "winner_score": winner["score"], "baseline_score": base["score"],
-        "improved": improved,
+        "winner_score": _fmt(winner), "baseline_score": _fmt(base), "improved": improved,
     })
 
     return winner_source, {
-        "round": rnd, "winner": winner["name"], "winner_score": winner["score"],
-        "baseline_score": base["score"], "candidates": len(results),
+        "round": rnd, "winner": winner["name"], "winner_score": _fmt(winner),
+        "baseline_score": _fmt(base), "candidates": len(results),
         "valid": len([r for r in results if r["valid"]]), "improved": improved,
     }
 
@@ -3518,15 +3625,17 @@ def reconcile_round(run_dir: Path, rnd: int, roster: List[dict],
 def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Path,
                      policy_source: str, budget: int,
                      semantic_guidance: bool = False) -> Tuple[List[dict], dict]:
-    """Deploy the policy online. It drives the agents; the tree it grows is the
-    world the next round dreams in."""
+    """Deploy the policy online. It drives the agents in decision rounds; every
+    attempt is scored by the fixed evaluator at creation; the tree it grows is
+    the world the next offline phase dreams in."""
     tasks = [r["id"] for r in roster]
     slot_queue, slot_count = build_worker_slot_queue(prefix="A-Slot")
+    reserve = support_reserve(budget, len(tasks))
 
     print(f"\n[3] ROUND {rnd:02d}: deploying {policy_path(run_dir, rnd).name} over "
-          f"{len(tasks)} assignment(s), budget {budget} agent call(s) "
-          f"({budget - support_reserve(budget, len(tasks))} policy + "
-          f"{support_reserve(budget, len(tasks))} support), "
+          f"{len(tasks)} assignment(s), budget {budget} agent call(s)"
+          + (f" ({budget - reserve} policy + {reserve} support)" if reserve else "")
+          + f", W {MAX_PARALLELISM}, K1 {ONLINE_MAX_DECISION_ROUNDS}, "
           f"{slot_count} slot(s) [{WORKER_MODEL}]...", flush=True)
 
     # Novelty reference for fresh (depth-1) attempts: everything this task has
@@ -3539,10 +3648,11 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
             if n.get("task"):
                 prior_hashes.setdefault(n["task"], set()).update(n.get("file_hashes", []))
 
-    reserve = support_reserve(budget, len(tasks))
+    test_ctx = new_test_context(run_dir) if EVAL_INLINE_TESTS else None
     explorer = LiveExplorer(tasks, budget - reserve, roster, rnd, background, run_dir,
-                            slot_queue, prior_hashes=prior_hashes,
-                            semantic_guidance=semantic_guidance)
+                            slot_queue, MAX_PARALLELISM, ONLINE_MAX_DECISION_ROUNDS,
+                            prior_hashes=prior_hashes, semantic_guidance=semantic_guidance,
+                            test_ctx=test_ctx)
     start = time.time()
     ok, detail = run_policy(policy_source, explorer)
     print()
@@ -3551,12 +3661,19 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
         print(f"    [!] Policy stopped for shutdown ({detail}).", flush=True)
     elif not ok:
         print(f"    [!] Deployed policy failed ({detail}). Falling back to pi_0 for the "
-              f"remaining budget.", flush=True)
+              f"remaining budget and decision rounds.", flush=True)
         append_event(run_dir, {"round": rnd, "event": "policy_failure", "detail": detail})
-        run_policy(DEFAULT_POLICY_SOURCE, explorer)
+        fb_ok, fb_detail = run_policy(DEFAULT_POLICY_SOURCE, explorer)
         print()
+        if explorer._stop is None:
+            explorer._stop = ("pi_0 fallback returned (empty batch)" if (fb_ok and fb_detail == "ok")
+                              else f"pi_0 fallback: {fb_detail}")
+        explorer._stop = f"{explorer._stop} [deployed policy failed: {detail[:80]}]"
     elif detail != "ok":
         print(f"    [~] Policy {detail}", flush=True)
+    if explorer._stop is None:
+        explorer._stop = "policy returned (empty batch)" if (ok and detail == "ok") else detail
+    policy_rounds, policy_stop = explorer._rounds, explorer._stop
 
     support_spent = 0
     if reserve > 0 and not _shutdown_event.is_set():
@@ -3571,14 +3688,28 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
         append_event(run_dir, {"round": rnd, "event": "support", "reserved": reserve,
                                "spent": support_spent})
 
-    nodes = [n for n in explorer._nodes if n.get("task")]
+    nodes = explorer._real()
     elapsed = time.time() - start
     print(f"    [+] Round {rnd:02d} online phase complete: {len(nodes)} node(s), "
-          f"{explorer.spent()}/{budget} agent call(s), {elapsed:.1f}s.", flush=True)
+          f"{explorer.spent()}/{budget} agent call(s), {policy_rounds} decision round(s), "
+          f"stop: {policy_stop}, {elapsed:.1f}s.", flush=True)
+
+    rdir = round_dir_for(run_dir, rnd)
+    rdir.mkdir(parents=True, exist_ok=True)
+    with open(rdir / "online_trace.json", "w", encoding="ascii") as f:
+        json.dump({"round": rnd, "policy": policy_path(run_dir, rnd).name,
+                   "max_parallelism": MAX_PARALLELISM, "max_rounds": ONLINE_MAX_DECISION_ROUNDS,
+                   "decision_rounds": policy_rounds, "stop": policy_stop,
+                   "trace": explorer._trace}, f, indent=2)
+
+    test_results = list(test_ctx["results"]) if test_ctx else []
+    write_round_test_reports(run_dir, rnd, test_results)
 
     report, stats = reconcile_round(run_dir, rnd, roster, nodes)
     stats["spent"] = explorer.spent()
     stats["support_spent"] = support_spent
+    stats["decision_rounds"] = policy_rounds
+    stats["stop"] = policy_stop
     stats["elapsed"] = round(elapsed, 2)
     print(f"    [+] Reconciled round {rnd:02d}: {stats['files']} file(s), "
           f"{stats['dup_content']} duplicate artifact(s), "
@@ -3586,37 +3717,6 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
           flush=True)
 
     return nodes, stats
-
-
-def writeback_test_scores(run_dir: Path, rnd: int, results: List[dict]) -> int:
-    """Fold Phase 5 telemetry back onto the tree nodes. The next round's dreaming
-    then scores policies against test-informed outcomes rather than the
-    creation-time heuristic alone - this is how the worlds improve, not just the
-    policy."""
-    if not results:
-        return 0
-    nodes = load_tree(run_dir, rnd)
-    by_node: Dict[str, List[dict]] = {}
-    for r in results:
-        nid = r.get("node")
-        if nid:
-            by_node.setdefault(nid, []).append(r)
-    touched = 0
-    for n in nodes:
-        rs = by_node.get(n["id"])
-        if not rs:
-            continue
-        passed = sum(1 for r in rs if r.get("status") == "PASSED")
-        rate = passed / len(rs)
-        n["test_pass_rate"] = round(rate, 4)
-        n["test_count"] = len(rs)
-        n["score"] = blend_test_score(n.get("heuristic_score", n["score"]), rate,
-                                      bool(n.get("files")))
-        touched += 1
-    if touched:
-        rewrite_tree(run_dir, rnd, nodes)
-        append_event(run_dir, {"round": rnd, "event": "score_writeback", "nodes": touched})
-    return touched
 
 
 def build_run_manifest(run_dir: Path, roster: List[dict], pool: List[Tuple[int, List[dict]]],
@@ -3664,10 +3764,10 @@ def build_run_manifest(run_dir: Path, roster: List[dict], pool: List[Tuple[int, 
 
     lines.append("## Recursive Rounds")
     lines.append("")
-    lines.append("| Round | Policy | Agent calls | Nodes | Mean best score | Duplicates | Violations |")
-    lines.append("|-------|--------|-------------|-------|-----------------|------------|------------|")
+    lines.append("| Round | Policy | Agent calls | Decision rounds | Nodes | Mean best score | Duplicates | Violations |")
+    lines.append("|-------|--------|-------------|-----------------|-------|-----------------|------------|------------|")
     for i, s in enumerate(round_stats, start=1):
-        lines.append(f"| {i} | `{POLICY_DIRNAME}/pi_r{i:02d}.py` | {s.get('spent', 0)} | "
+        lines.append(f"| {i} | `{POLICY_DIRNAME}/pi_r{i:02d}.py` | {s.get('spent', 0)} | {s.get('decision_rounds', '-')} | "
                      f"{s.get('nodes', 0)} | {s.get('best_mean', 0):.3f} | "
                      f"{s.get('dup_content', 0)} | {s.get('violations', 0)} |")
     lines.append("")
@@ -3675,16 +3775,17 @@ def build_run_manifest(run_dir: Path, roster: List[dict], pool: List[Tuple[int, 
     if dream_stats:
         lines.append("## Dreaming (offline policy improvement)")
         lines.append("")
-        lines.append("| After round | Candidates | Valid | Winner | Replay score | pi_0 baseline | Changed |")
+        lines.append("| After round | Versions | Valid | Selected | Replay score | Deployed version | Changed |")
         lines.append("|-------------|------------|-------|--------|--------------|---------------|---------|")
         for d in dream_stats:
             lines.append(f"| {d['round']} | {d['candidates']} | {d['valid']} | {d['winner']} | "
                          f"{d['winner_score']:.4f} | {d['baseline_score']:.4f} | "
                          f"{'yes' if d['improved'] else 'no'} |")
         lines.append("")
-        lines.append("Replay costs zero agent calls: every outcome a candidate policy asks for "
-                     "is already recorded. The deployed policy is always a candidate, so the "
-                     "selected policy is never worse than the one it replaces.")
+        lines.append("Replay costs zero agent calls: every outcome a policy version can reveal "
+                     "is already recorded. Versions are chained (each revises its predecessor) and "
+                     "the deployed policy is version 0, so the selected policy is never worse than "
+                     "it in mean replay score on the recorded history.")
         lines.append("")
 
     lines.append("## Discovery Tree")
@@ -3728,11 +3829,12 @@ def build_run_manifest(run_dir: Path, roster: List[dict], pool: List[Tuple[int, 
     lines.append("")
     return enforce_ascii("\n".join(lines))
 # ==============================================================================
-# Phase 5: Automatic Unittests over real agent deliverables
+# Phase 5: Unit tests as part of the fixed evaluator
 # ------------------------------------------------------------------------------
-# Agents now write real files, so there is no markdown code-fence extraction
-# step. Phase 5 walks work/, selects testable files by extension, and namespaces
-# generated tests by owning agent.
+# Every attempt's testable deliverables are tested at creation, inside the same
+# generation-evaluation request (evaluate_node_inline); the pass rate enters the
+# node's final score. At the end of a round the executions are written as
+# reports for Phase 6.
 # ==============================================================================
 
 def _format_execution_report_as_markdown(report_data: list) -> str:
@@ -3866,59 +3968,55 @@ def ensure_test_venv(run_dir: Path) -> Tuple[str, Optional[Path]]:
     return str(py), venv_dir / "bin"
 
 
-def install_round_requirements(run_dir: Path, nodes_tested: List[dict], rnd: int,
-                               py: str, venv_bin: Optional[Path]) -> None:
-    """Install ONLY the requirements declared by the nodes under test this round,
-    after sanitising a COPY (the agents' deliverables are never rewritten), as
-    binary wheels only so no sdist build script runs."""
+def new_test_context(run_dir: Path) -> dict:
+    """Per-round evaluator state shared by the concurrent attempts: the test
+    venv, a cache of generated tests keyed by (content, name, language), the set
+    of already-installed requirement lines, and the collected results."""
+    py, venv_bin = ensure_test_venv(run_dir)
+    return {"python": py, "venv_bin": venv_bin, "cache": {}, "cache_lock": threading.Lock(),
+            "install_lock": threading.Lock(), "installed": set(), "results": [],
+            "results_lock": threading.Lock()}
+
+
+def install_node_requirements(run_dir: Path, node: dict, rnd: int, test_ctx: dict) -> None:
+    """Install ONLY the requirements declared by this attempt, after sanitising a
+    COPY (deliverables are never rewritten), as binary wheels only so no sdist
+    build script runs. Serialised: one pip at a time per run."""
+    venv_bin = test_ctx.get("venv_bin")
     if not TEST_PIP_INSTALL or venv_bin is None:
         return
-    wroot = work_dir_for(run_dir)
-    kept_all: List[str] = []
-    dropped_all: List[str] = []
-    for node in nodes_tested:
-        ndir = wroot / node.get("dir", "") / node["id"]
-        if not ndir.exists():
-            continue
-        for req in sorted(ndir.rglob("requirements*.txt")):
-            kept, dropped = sanitize_requirements(read_file_content_safe(req) or "")
-            kept_all.extend(k for k in kept if k not in kept_all)
-            dropped_all.extend(dropped)
-    if dropped_all:
-        print(f"    [!] Dropped {len(dropped_all)} requirement line(s) that were not plain "
-              f"index packages{' or not allowlisted' if TEST_PIP_ALLOWLIST else ''}: "
-              f"{', '.join(dropped_all[:5])}{' ...' if len(dropped_all) > 5 else ''}", flush=True)
-    if not kept_all:
+    ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
+    if not ndir.exists():
         return
-    test_root = run_dir / "tests" / f"round{rnd:02d}"
-    test_root.mkdir(parents=True, exist_ok=True)
-    req_copy = test_root / "requirements.sanitized.txt"
-    with open(req_copy, "w", encoding="ascii") as f:
-        f.write("\n".join(kept_all) + "\n")
-    env = _test_env(run_dir / "tests", venv_bin)
-    rc, out, timed_out = _run_limited(
-        [py, "-m", "pip", "install", "--only-binary=:all:", "--no-input",
-         "--disable-pip-version-check", "-r", str(req_copy)], 600, test_root, env)
-    if rc != 0:
-        tail = (out.strip().splitlines() or ["(no output)"])[-1]
-        print(f"    [!] Warning: pip install {'timed out' if timed_out else 'failed'} "
-              f"for round requirements: {tail[:120]}", flush=True)
-
-
-def top_nodes_per_task(nodes: List[dict], k: int) -> List[dict]:
-    """The k best nodes per task by decision-time score (deeper first on ties).
-    Testing more than the single best gives replay a test-informed signal on
-    whether continuing a line actually paid, not just on the winner."""
-    by_task: Dict[str, List[dict]] = {}
-    for n in nodes:
-        if n.get("task") and n.get("files"):
-            by_task.setdefault(n["task"], []).append(n)
-    out = []
-    for task in sorted(by_task):
-        ranked = sorted(by_task[task], key=lambda n: (n.get("score_online", n.get("score", 0.0)),
-                                                       n.get("depth", 0)), reverse=True)
-        out.extend(ranked[:k])
-    return out
+    kept: List[str] = []
+    dropped: List[str] = []
+    for req in sorted(ndir.rglob("requirements*.txt")):
+        k, d = sanitize_requirements(read_file_content_safe(req) or "")
+        kept.extend(x for x in k if x not in kept)
+        dropped.extend(d)
+    if dropped:
+        print(f"\n    [!] {node['id']}: dropped {len(dropped)} requirement line(s) that were not "
+              f"plain index packages{' or not allowlisted' if TEST_PIP_ALLOWLIST else ''}.",
+              flush=True)
+    with test_ctx["install_lock"]:
+        todo = [k for k in kept if k not in test_ctx["installed"]]
+        if not todo:
+            return
+        test_root = run_dir / "tests" / f"round{rnd:02d}" / node["task"] / node["id"]
+        test_root.mkdir(parents=True, exist_ok=True)
+        req_copy = test_root / "requirements.sanitized.txt"
+        with open(req_copy, "w", encoding="ascii") as f:
+            f.write("\n".join(todo) + "\n")
+        env = _test_env(run_dir / "tests", venv_bin)
+        rc, out, timed_out = _run_limited(
+            [test_ctx["python"], "-m", "pip", "install", "--only-binary=:all:", "--no-input",
+             "--disable-pip-version-check", "-r", str(req_copy)], 600, test_root, env)
+        if rc == 0:
+            test_ctx["installed"].update(todo)
+        else:
+            tail = (out.strip().splitlines() or ["(no output)"])[-1]
+            print(f"\n    [!] Warning: pip install {'timed out' if timed_out else 'failed'} "
+                  f"for {node['id']}: {tail[:120]}", flush=True)
 
 
 def _test_filename(artifact_name: str) -> str:
@@ -3930,108 +4028,121 @@ def _test_filename(artifact_name: str) -> str:
     return f"test_{stem}{suffix}"
 
 
-def collect_testable_artifacts(run_dir: Path, roster: List[dict],
-                               nodes: List[dict]) -> List[dict]:
-    """Testable files of the top TEST_NODES_PER_TASK nodes per task."""
-    wroot = work_dir_for(run_dir)
-    if not wroot.exists():
+def collect_node_artifacts(run_dir: Path, node: dict) -> List[dict]:
+    """Testable files of one attempt (its own and inherited deliverables)."""
+    ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
+    if not ndir.exists():
         return []
+    wroot = work_dir_for(run_dir)
     artifacts = []
-    for node in top_nodes_per_task(nodes, TEST_NODES_PER_TASK):
-        ndir = wroot / node.get("dir", "") / node["id"]
-        if not ndir.exists():
+    for path in sorted(ndir.rglob("*")):
+        if not path.is_file() or path.is_symlink():
             continue
-        for path in sorted(ndir.rglob("*")):
-            if not path.is_file() or path.is_symlink():
-                continue
-            lang = _TESTABLE_EXT_LANG.get(path.suffix.lower())
-            if not lang:
-                continue
-            content = read_file_content_safe(path)
-            if content is None or not content.strip():
-                continue
-            artifacts.append({
-                "agent": node["task"],
-                "node": node["id"],
-                "filename": path.name,
-                "relative_path": str(path.relative_to(wroot)),
-                "language": lang,
-                "filepath": str(path),
-                "content": content,
-                "content_hash": content_hash(content),
-            })
+        lang = _TESTABLE_EXT_LANG.get(path.suffix.lower())
+        if not lang:
+            continue
+        content = read_file_content_safe(path)
+        if content is None or not content.strip():
+            continue
+        artifacts.append({
+            "agent": node["task"], "node": node["id"], "filename": path.name,
+            "relative_path": str(path.relative_to(wroot)), "language": lang,
+            "filepath": str(path), "content": content, "content_hash": content_hash(content),
+        })
     return artifacts
 
 
-def request_unittests_from_worker(artifact: dict, endpoint_queue: queue.Queue, test_output_dir: Path,
-                                  progress_lock: threading.Lock, progress_state: dict) -> Optional[str]:
-    """Generate one test for an artifact. Returns the generated test SOURCE (the
-    caller writes it into every node that carries identical content)."""
-    endpoint_url = None
-    deadline = time.time() + (MAX_RETRIES * TEST_TIMEOUT_SECS)
-    while time.time() < deadline:
+def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
+    """One evaluator call on the worker slot the attempt already holds. Returns
+    test SOURCE, or None."""
+    url = endpoint.rstrip("/") + "/chat/completions"
+    code_content = fit_context(artifact["content"], MAX_CONTEXT_CHARS)
+    lang = artifact["language"]
+    extra = ""
+    if lang in ("c", "cpp"):
+        extra = (f"\nInclude it exactly as: #include \"{artifact['filename']}\". "
+                 f"If the file defines its own main(), it is renamed to "
+                 f"autoresearch_artifact_main() before compiling, so write your own main().")
+    prompt = f"File: {artifact['filename']}{extra}\n```{lang}\n{code_content}\n```"
+    payload = {
+        "model": WORKER_MODEL,
+        "messages": [{"role": "system", "content": _PROMPT_PHASE5_UNITTEST},
+                     {"role": "user", "content": prompt}],
+        "temperature": LLM_TEMPERATURE, "top_p": LLM_TOP_P,
+        "frequency_penalty": LLM_FREQUENCY_PENALTY, "presence_penalty": LLM_PRESENCE_PENALTY,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+    }
+    headers = {"Authorization": f"Bearer {WORKER_API_KEY}"}
+    for attempt in range(1, MAX_RETRIES + 1):
+        if _shutdown_event.is_set():
+            return None
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=TEST_TIMEOUT_SECS)
+            response.raise_for_status()
+            choices = response.json().get("choices")
+            test_code = choices[0].get("message", {}).get("content", "") if choices else ""
+            if test_code:
+                return enforce_ascii(_strip_markdown_fences(test_code))
+        except (requests.exceptions.RequestException, ValueError):
+            pass
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
+    return None
+
+
+def evaluate_node_inline(node: dict, endpoint: str, run_dir: Path, rnd: int,
+                         test_ctx: dict) -> None:
+    """The test component of the fixed evaluator, applied once at creation.
+    Generates (or reuses) a unit test for each testable deliverable, executes it
+    in the sandboxed venv, and sets the node's final score and diagnostics."""
+    artifacts = collect_node_artifacts(run_dir, node)[:EVAL_MAX_TEST_FILES]
+    if not artifacts:
+        return
+    install_node_requirements(run_dir, node, rnd, test_ctx)
+    test_root = run_dir / "tests" / f"round{rnd:02d}"
+    node_dir = test_root / node["task"] / node["id"]
+    venv_bin = test_ctx.get("venv_bin")
+    results: List[dict] = []
+    for a in artifacts:
         if _shutdown_event.is_set():
             break
-        try:
-            endpoint_url = endpoint_queue.get(timeout=5.0)
-            break
-        except queue.Empty:
+        key = (a["content_hash"], a["filename"], a["language"])
+        with test_ctx["cache_lock"]:
+            code = test_ctx["cache"].get(key)
+        if code is None:
+            code = generate_unittest(a, endpoint)
+            if code:
+                with test_ctx["cache_lock"]:
+                    test_ctx["cache"][key] = code
+        if not code:
             continue
-    if endpoint_url is None:
-        return None
-
-    try:
-        code_content = fit_context(artifact['content'], MAX_CONTEXT_CHARS)
-        lang = artifact['language']
-        extra = ""
-        if lang in ("c", "cpp"):
-            extra = (f"\nInclude it exactly as: #include \"{artifact['filename']}\". "
-                     f"If the file defines its own main(), it is renamed to "
-                     f"autoresearch_artifact_main() before compiling, so write your own main().")
-        prompt = (
-            f"File: {artifact['filename']}{extra}\n"
-            f"```{lang}\n{code_content}\n```"
-        )
-        payload = {
-            "model": WORKER_MODEL,
-            "messages": [
-                {"role": "system", "content": _PROMPT_PHASE5_UNITTEST},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": LLM_TEMPERATURE,
-            "top_p": LLM_TOP_P,
-            "frequency_penalty": LLM_FREQUENCY_PENALTY,
-            "presence_penalty": LLM_PRESENCE_PENALTY,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-        }
-        headers = {"Authorization": f"Bearer {WORKER_API_KEY}"}
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = requests.post(endpoint_url, json=payload, headers=headers,
-                                         timeout=TEST_TIMEOUT_SECS)
-                response.raise_for_status()
-                result = response.json()
-                choices = result.get("choices")
-                test_code = (choices[0].get("message", {}).get("content", "") if choices else "")
-                if not test_code:
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
-                        continue
-                    return None
-                test_code = enforce_ascii(_strip_markdown_fences(test_code))
-                with progress_lock:
-                    progress_state["done"] += 1
-                    eta_str = _format_eta(progress_state["start_time"], progress_state["done"], progress_state["total"])
-                    print(f"    [+] Generated tests ({progress_state['done']}/{progress_state['total']}) "
-                          f"| ETC: {eta_str} -> {artifact['agent']}/{artifact['node']}/"
-                          f"{_test_filename(artifact['filename'])}", flush=True)
-                return test_code
-            except requests.exceptions.RequestException:
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
-        return None
-    finally:
-        endpoint_queue.put(endpoint_url)
+        node_dir.mkdir(parents=True, exist_ok=True)
+        tpath = node_dir / _test_filename(a["filename"])
+        with open(tpath, "w", encoding="ascii") as f:
+            f.write(code + "\n")
+        results.append(execute_test_artifact({
+            "filename": tpath.name, "test_filepath": str(tpath), "language": a["language"],
+            "artifact_filepath": a["filepath"], "agent": a["agent"], "node": a["node"],
+            "python": test_ctx["python"], "venv_bin": str(venv_bin) if venv_bin else "",
+            "test_root": str(test_root),
+        }))
+    if not results:
+        return
+    passed = sum(1 for r in results if r["status"] == "PASSED")
+    rate = passed / len(results)
+    node["test_pass_rate"] = round(rate, 4)
+    node["test_count"] = len(results)
+    node["tests_passed"] = passed
+    node["test_failures"] = [f"{r['filename']}: {r['status']} {r['message']}"[:200]
+                             for r in results if r["status"] != "PASSED"][:5]
+    node["score"] = blend_test_score(node.get("heuristic_score", 0.0), rate,
+                                     bool(node.get("files")))
+    with test_ctx["results_lock"]:
+        test_ctx["results"].extend(results)
+    for r in results:
+        append_event(run_dir, {"round": rnd, "event": "test_result", "agent": r.get("agent", ""),
+                               "node": r.get("node", ""), "artifact": r.get("filename", ""),
+                               "status": r.get("status", "")})
 
 
 _C_MAIN_RE = re.compile(r'\bint\s+main\s*\(')
@@ -4119,131 +4230,37 @@ def execute_test_artifact(test_meta: dict) -> dict:
     return result
 
 
-def run_phase5_automatic_unittests(run_dir: Path, roster: List[dict],
-                                   nodes: List[dict], rnd: int) -> List[dict]:
-    print(f"\n[PHASE 5] ROUND {rnd:02d}: AUTOMATED UNITTEST PIPELINE", flush=True)
-
-    TEST_OUTPUT_DIR = run_dir / "tests" / f"round{rnd:02d}"
-    REPORT_OUTPUT_DIR = run_dir / "reports"
-
-    artifacts = collect_testable_artifacts(run_dir, roster, nodes)
-    if not artifacts:
-        print("    [!] No testable deliverables among this round's top nodes.", flush=True)
-        return []
-
-    # Continuations inherit files, so identical content recurs across nodes.
-    # Generate one test per distinct (content, name, language); execute it in
-    # every node that carries it (siblings and imports may differ per node).
-    groups: Dict[Tuple[str, str, str], List[dict]] = {}
-    for a in artifacts:
-        groups.setdefault((a["content_hash"], a["filename"], a["language"]), []).append(a)
-    reps = [members[0] for members in groups.values()]
-
-    by_agent: Dict[str, int] = {}
-    for a in artifacts:
-        by_agent[a["agent"]] = by_agent.get(a["agent"], 0) + 1
-    for aid, n in sorted(by_agent.items()):
-        print(f"    [+] {aid}: {n} testable file(s).", flush=True)
-    print(f"    [*] {len(artifacts)} testable file(s) across top-{TEST_NODES_PER_TASK} node(s)/task; "
-          f"{len(reps)} distinct -> {len(reps)} test generation(s).", flush=True)
-
-    endpoint_queue: queue.Queue = queue.Queue()
-    for ep in TEST_WORKER_ENDPOINTS:
-        for _ in range(CONCURRENT_REQS_PER_ENDPOINT):
-            endpoint_queue.put(ep)
-    total_gen_workers = max(1, len(TEST_WORKER_ENDPOINTS) * CONCURRENT_REQS_PER_ENDPOINT)
-
-    progress_lock = threading.Lock()
-    progress_state = {"done": 0, "total": len(reps), "start_time": time.time()}
-    generated: Dict[Tuple[str, str, str], str] = {}
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_gen_workers)
-    try:
-        fut_to_key = {executor.submit(request_unittests_from_worker, rep, endpoint_queue,
-                                      TEST_OUTPUT_DIR, progress_lock, progress_state):
-                      (rep["content_hash"], rep["filename"], rep["language"]) for rep in reps}
-        for future in concurrent.futures.as_completed(fut_to_key):
-            try:
-                code = future.result()
-                if code:
-                    generated[fut_to_key[future]] = code
-            except Exception:
-                pass
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
-
-    py, venv_bin = ensure_test_venv(run_dir)
-    tested_nodes = top_nodes_per_task(nodes, TEST_NODES_PER_TASK)
-    install_round_requirements(run_dir, tested_nodes, rnd, py, venv_bin)
-
-    generated_tests: List[dict] = []
-    for key, members in groups.items():
-        code = generated.get(key)
-        if not code:
-            continue
-        for a in members:
-            node_dir = TEST_OUTPUT_DIR / a["agent"] / a["node"]
-            node_dir.mkdir(parents=True, exist_ok=True)
-            tpath = node_dir / _test_filename(a["filename"])
-            with open(tpath, "w", encoding="ascii") as f:
-                f.write(code + "\n")
-            generated_tests.append({
-                "filename": tpath.name, "test_filepath": str(tpath), "language": a["language"],
-                "artifact_filepath": a["filepath"], "agent": a["agent"], "node": a["node"],
-                "python": py, "venv_bin": str(venv_bin) if venv_bin else "",
-                "test_root": str(TEST_OUTPUT_DIR),
-            })
-
-    execution_results: list = []
-    if generated_tests:
-        print(f"    [*] Executing {len(generated_tests)} generated test file(s)...", flush=True)
-        exec_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_EXEC_WORKERS)
+def write_round_test_reports(run_dir: Path, rnd: int, execution_results: List[dict]) -> None:
+    """Phase 5 reporting: the evaluator's test executions of this round, as a
+    per-round report plus the cumulative one Phase 6 reads."""
+    print(f"\n[PHASE 5] ROUND {rnd:02d}: EVALUATOR TEST TELEMETRY", flush=True)
+    if not execution_results:
+        print("    [!] No test executions recorded this round.", flush=True)
+        return
+    report_dir = run_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    with open(report_dir / f"execution_report_round{rnd:02d}.json", "w", encoding="ascii") as f:
+        json.dump(execution_results, f, indent=4)
+    cumulative: List[dict] = []
+    cum_path = report_dir / "execution_report.json"
+    if cum_path.exists():
         try:
-            exec_futures = [exec_executor.submit(execute_test_artifact, tm) for tm in generated_tests]
-            for future in concurrent.futures.as_completed(exec_futures):
-                try:
-                    execution_results.append(future.result())
-                except Exception:
-                    pass
-        finally:
-            exec_executor.shutdown(wait=True, cancel_futures=True)
-
-    if execution_results:
-        REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        # Per-round report plus a cumulative one, since Phase 6 reads the latter.
-        round_json = REPORT_OUTPUT_DIR / f"execution_report_round{rnd:02d}.json"
-        with open(round_json, "w", encoding="ascii") as f:
-            json.dump(execution_results, f, indent=4)
-
-        cumulative: List[dict] = []
-        cum_path = REPORT_OUTPUT_DIR / "execution_report.json"
-        if cum_path.exists():
-            try:
-                prior = json.loads(read_file_content_safe(cum_path) or "[]")
-                if isinstance(prior, list):
-                    cumulative = [r for r in prior
-                                  if not str(r.get("node", "")).startswith(f"r{rnd:02d}n")]
-            except json.JSONDecodeError:
-                cumulative = []
-        cumulative.extend(execution_results)
-        with open(cum_path, "w", encoding="ascii") as f:
-            json.dump(cumulative, f, indent=4)
-        with open(REPORT_OUTPUT_DIR / "execution_report.csv", "w", newline="", encoding="ascii") as f:
-            writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(cumulative)
-
-        passed = sum(1 for r in execution_results if r["status"] == "PASSED")
-        print(f"    [+] Test execution complete: {passed}/{len(execution_results)} passed. "
-              f"Reports in {REPORT_OUTPUT_DIR}", flush=True)
-
-        for r in execution_results:
-            append_event(run_dir, {
-                "round": rnd, "event": "test_result", "agent": r.get("agent", ""),
-                "node": r.get("node", ""), "artifact": r.get("filename", ""),
-                "status": r.get("status", ""),
-            })
-
-    return execution_results
+            prior = json.loads(read_file_content_safe(cum_path) or "[]")
+            if isinstance(prior, list):
+                cumulative = [r for r in prior
+                              if not str(r.get("node", "")).startswith(f"r{rnd:02d}n")]
+        except json.JSONDecodeError:
+            cumulative = []
+    cumulative.extend(execution_results)
+    with open(cum_path, "w", encoding="ascii") as f:
+        json.dump(cumulative, f, indent=4)
+    with open(report_dir / "execution_report.csv", "w", newline="", encoding="ascii") as f:
+        writer = csv.DictWriter(f, fieldnames=EXECUTION_RESULT_FIELDS, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(cumulative)
+    passed = sum(1 for r in execution_results if r["status"] == "PASSED")
+    print(f"    [+] {passed}/{len(execution_results)} evaluator test(s) passed. "
+          f"Reports in {report_dir}", flush=True)
 
 
 # ==============================================================================
@@ -4608,7 +4625,7 @@ def main():
     else:
         if not apex_ok:
             print("\n[!] Apex tier offline; Phase 2 distillation cannot run. "
-                  "Re-run with -r once 8081 is healthy.", flush=True)
+                  f"Re-run with -r once the apex ({GEN_API_BASE}) is healthy.", flush=True)
             sys.exit(1)
         raw_content = read_file_content_safe(raw_filepath)
         if raw_content is None:
@@ -4632,7 +4649,7 @@ def main():
     else:
         if not apex_ok:
             print("\n[!] Apex tier offline; agent partitioning cannot run. "
-                  "Re-run with -r once 8081 is healthy.", flush=True)
+                  f"Re-run with -r once the apex ({GEN_API_BASE}) is healthy.", flush=True)
             sys.exit(1)
         fragments, plan_p, plan_c = decompose_to_atomic_pieces(target_query)
         roster = build_roster(fragments)
@@ -4696,7 +4713,7 @@ def main():
                 dream_stats.append(dstats)
             elif pool:
                 print(f"    [!] Apex offline; cannot dream the missing policy for round "
-                      f"{start_round:02d}. Stopping - re-run with -r once 8081 is healthy.", flush=True)
+                      f"{start_round:02d}. Stopping - re-run with -r once the apex ({GEN_API_BASE}) is healthy.", flush=True)
                 start_round = end_round + 1
 
         for rnd in range(start_round, end_round + 1):
@@ -4717,14 +4734,6 @@ def main():
                                             policy_source, budget,
                                             semantic_guidance=args.semantic_guidance)
             round_stats.append(stats)
-
-            # Test telemetry is part of the world, not a postscript: it is folded
-            # back onto the nodes so the next dream scores against real outcomes.
-            test_results = run_phase5_automatic_unittests(target_directory, roster, nodes, rnd)
-            touched = writeback_test_scores(target_directory, rnd, test_results)
-            if touched:
-                print(f"    [+] Folded test telemetry back onto {touched} node(s); "
-                      f"future replays score against it.", flush=True)
 
             round_dir_for(target_directory, rnd).mkdir(parents=True, exist_ok=True)
             with open(round_done_marker(target_directory, rnd), "w", encoding="ascii") as f:
