@@ -179,9 +179,9 @@ MAX_RETRIES = 3
 WORKER_ENDPOINTS = [
     ep.strip() for ep in os.getenv(
         "WORKER_ENDPOINTS",
-        "http://localhost:8033/v1,http://localhost:8034/v1,"
-        "http://localhost:8035/v1,http://localhost:8036/v1,"
-        "http://localhost:8037/v1,http://localhost:8038/v1"
+        "http://localhost:8030/v1,http://localhost:8031/v1,"
+        "http://localhost:8032/v1,http://localhost:8033/v1,"
+        "http://localhost:8034/v1,http://localhost:8035/v1"
     ).split(",") if ep.strip()
 ]
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.8-9B-Q4_K_M.gguf")
