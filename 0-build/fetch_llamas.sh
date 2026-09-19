@@ -28,5 +28,5 @@ wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_
 wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
 
 # midApex CPUonly model - not leveraged in the current setup - placeholder for distilled Apex model 
-wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ1_M.gguf &
-wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf
+# wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ1_M.gguf &
+# wget https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF/resolve/main/Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf
