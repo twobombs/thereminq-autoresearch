@@ -137,7 +137,7 @@ WORKER_CONTEXT_TOKENS = max(4096, WORKER_SERVER_CTX // max(1, WORKER_SERVER_NP))
 # Phase 1: Raw Generation Config
 GEN_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:9931/v1")
 GEN_API_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.8-27B-UD-IQ3_XXS.gguf")
+LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.8-Flash-Next-UD-IQ4_XS")
 
 # Unified Context Limits
 CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "3.5"))
@@ -168,7 +168,7 @@ MAX_CHUNK_CHARS = min(
 
 # Phase 2: Distillation Config (apex tier)
 DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:9931/v1")
-DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.8-27B-UD-IQ3_XXS.gguf")
+DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.8-Flash-Next-UD-IQ4_XS")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
 # Restrict decomposer to not bloat out pipeline operations on simple prompts
