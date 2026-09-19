@@ -14,7 +14,6 @@ cmake --build build --config Release -j $(grep -c ^processor /proc/cpuinfo)
 
 cd ..
 
-cp -r ./llama.cpp ./llama.orch
 cp -r ./llama.cpp ./llama-vulkan
 cp -r ./llama.cpp ./llama-vulkan-cpu
 cp -r ./llama.cpp ./llama-vulkan-orchestrator
