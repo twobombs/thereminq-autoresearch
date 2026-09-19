@@ -7,7 +7,7 @@
 # ==============================================================================
 
 # Configuration
-MODEL="../0-build/Qwen3.5-9B-IQ4_XS.gguf"
+MODEL="../0-build/Qwen3.8-9B-Q4_K_M.gguf"
 SERVER_BIN="../0-build/llama.cpp/build/bin/llama-server"
 LOG_DIR="./agent_logs"
 
@@ -90,7 +90,6 @@ launch_node() {
             --split-mode none \
             --cache-type-k q8_0 \
             --cache-type-v q4_0 \
-            --no-mmap \
             --spec-type draft-mtp \
             --spec-draft-n-max 3 \
             --host 0.0.0.0 \
