@@ -1355,6 +1355,10 @@ def ingest_git_repository(git_url: str, target_dir: Path, focus: str = "", git_p
             body = "## Repository Analysis\n\n" + reduce_repo_summaries(summaries, focus, body_budget)
 
         document = f"{header}\n{body}"
+        ascii_document = enforce_ascii(document)
+        if len(ascii_document) < len(document):
+            print(f"    [!] Warning: Dropped {len(document) - len(ascii_document)} non-ASCII characters from repository source.", flush=True)
+        document = ascii_document
         filename = generate_safe_filename(f"git repo analysis {repo_name}")
         filepath = target_dir / filename
         with open(filepath, "w", encoding="ascii") as f:
