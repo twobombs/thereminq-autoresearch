@@ -22,3 +22,6 @@ cp -r ./llama.cpp ./llama-vulkan-orchestrator2
 cp -r ./llama.cpp ./llama-vulkan-worker1
 cp -r ./llama.cpp ./llama-vulkan-worker2
 cp -r ./llama.cpp ./llama-vulkan-worker3
+cp -r ./llama.cpp ./llama-vulkan-worker4
+cp -r ./llama.cpp ./llama-vulkan-worker5
+cp -r ./llama.cpp ./llama-vulkan-worker6
