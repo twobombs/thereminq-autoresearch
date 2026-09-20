@@ -103,7 +103,7 @@ GW_CLIENT_API_KEYS=sk-a,sk-b
 - `fetch_remote_media` makes the gateway download URLs supplied by clients. Downloads are streamed with a hard size cap, redirects are followed manually (max 5) and, with `media_block_private_hosts`, every hop must resolve to public addresses only. DNS rebinding can still defeat a resolve-then-connect check, so if untrusted clients can reach the gateway, also restrict egress at the network level or disable the feature.
 - Gemini returns no token counts for embeddings, so `usage` there is 0.
 - `GET /health` reports mode, upstream and whether a key is configured.
-- **Rate limits**: on an upstream 429 (or another status in `retry_statuses`) the gateway waits the delay Gemini asks for (`RetryInfo.retryDelay`, then `Retry-After`, then the "retry in Ns" text; otherwise exponential backoff from `retry_default_delay`) and retries, up to `retry_max_attempts` times. A delay longer than `retry_max_wait` (e.g. a daily quota) is not waited out: the 429 goes straight back to the client with a `Retry-After` header. Your client's own request timeout must exceed the wait, or it will give up first. Set `retry_max_attempts: 0` to disable.
+- **Rate limits and overload**: on an upstream 429 or 503 (`retry_statuses`) the gateway waits the delay Gemini asks for (`RetryInfo.retryDelay`, then `Retry-After`, then the "retry in Ns" text). If none is given, it uses the fixed per-status delay in `retry_status_delays` (503 "high demand": 10s), otherwise exponential backoff from `retry_default_delay`. Then it retries, up to `retry_max_attempts` times. A delay longer than `retry_max_wait` (e.g. a daily quota) is not waited out: the 429 goes straight back to the client with a `Retry-After` header. Your client's own request timeout must exceed the wait, or it will give up first. Set `retry_max_attempts: 0` to disable.
 
 CLI:
     python openai2gemini.py [-c config.yaml]      run the server
@@ -236,7 +236,8 @@ ERROR_BODY_MAX_CHARS = 4000                # upstream error text passed back to 
 DEBUG_PAYLOAD_MAX_CHARS = 4000             # payload preview in DEBUG logs
 
 # -- Upstream rate limiting / retries ----------------------------------------
-RETRY_STATUSES = [429]                     # upstream statuses that are waited out and retried
+RETRY_STATUSES = [429, 503]                # upstream statuses that are waited out and retried
+RETRY_STATUS_DELAYS = {"503": 10.0}         # fixed wait per status when Gemini gives no delay
 RETRY_MAX_ATTEMPTS = 5                     # retries per upstream call (0 = off)
 RETRY_MAX_WAIT = 120.0                     # seconds; a longer requested delay is returned to the client instead
 RETRY_DEFAULT_DELAY = 5.0                  # seconds, doubled per attempt when Gemini gives no delay
@@ -350,6 +351,9 @@ safety_settings: []
 # On these statuses, wait the delay Gemini asks for and retry. A requested delay
 # above retry_max_wait (e.g. an exhausted daily quota) is returned immediately.
 retry_statuses: {_j(RETRY_STATUSES)}
+# Fixed wait (seconds) per status when the response carries no delay; statuses
+# not listed back off exponentially from retry_default_delay.
+retry_status_delays: {_j(RETRY_STATUS_DELAYS)}
 retry_max_attempts: {RETRY_MAX_ATTEMPTS}   # 0 = never retry
 retry_max_wait: {RETRY_MAX_WAIT}
 retry_default_delay: {RETRY_DEFAULT_DELAY}
@@ -426,6 +430,7 @@ DEFAULTS: dict[str, Any] = {
 
     # upstream rate limits
     "retry_statuses": list(RETRY_STATUSES),
+    "retry_status_delays": dict(RETRY_STATUS_DELAYS),
     "retry_max_attempts": RETRY_MAX_ATTEMPTS,
     "retry_max_wait": RETRY_MAX_WAIT,
     "retry_default_delay": RETRY_DEFAULT_DELAY,
@@ -680,22 +685,31 @@ async def send_upstream(cfg: Config, http: httpx.AsyncClient, method: str, url: 
             return resp
         body = await resp.aread()
         asked = retry_delay(body, resp.headers)
-        delay = asked if asked is not None else cfg.retry_default_delay * (2 ** attempt)
+        fixed = (cfg.retry_status_delays or {}).get(str(resp.status_code))
+        if asked is not None:
+            delay = asked
+        elif fixed is not None:
+            delay = float(fixed)
+        else:
+            delay = cfg.retry_default_delay * (2 ** attempt)
         if delay > cfg.retry_max_wait:
             log.warning("upstream %s: requested wait %.0fs exceeds retry_max_wait (%.0fs); returning it",
                         resp.status_code, delay, cfg.retry_max_wait)
             return resp
         await resp.aclose()
         attempt += 1
-        log.warning("upstream %s rate limit; waiting %.1fs, then retry %d/%d",
-                    resp.status_code, delay, attempt, cfg.retry_max_attempts)
+        log.warning("upstream %s (%s); waiting %.1fs, then retry %d/%d", resp.status_code,
+                    "rate limit" if resp.status_code == 429 else "unavailable",
+                    delay, attempt, cfg.retry_max_attempts)
         await asyncio.sleep(delay + RETRY_PADDING)
 
 
 def upstream_error(status: int, body: bytes) -> JSONResponse:
     resp = _upstream_error(status, body)
-    if status == 429:
+    if status in (429, 503):
         delay = retry_delay(body)
+        if delay is None:
+            delay = RETRY_STATUS_DELAYS.get(str(status))
         if delay is not None:
             resp.headers["Retry-After"] = str(max(1, int(delay + 0.999)))
     return resp
