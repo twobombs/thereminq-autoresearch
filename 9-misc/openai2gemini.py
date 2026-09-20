@@ -175,7 +175,8 @@ MAX_CONNECTIONS = 100
 KEEPALIVE_FRACTION = 5                     # keep-alive pool = MAX_CONNECTIONS // this
 
 # -- Models -------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
+FORCE_MODEL = "gemini-3.1-pro-preview"    # every chat request uses this model ("" = honour the request)
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 EXAMPLE_MODEL_ALIASES = {                  # shown in --print-config; runtime default is none
     "gpt-4o": "gemini-2.5-pro",
@@ -295,7 +296,7 @@ max_connections: {MAX_CONNECTIONS}
 # -- Models -------------------------------------------------------------------
 default_model: {DEFAULT_MODEL}
 default_embedding_model: {DEFAULT_EMBEDDING_MODEL}
-force_model: ""
+force_model: {_j(FORCE_MODEL)}
 model_aliases: {_j(EXAMPLE_MODEL_ALIASES)}
 
 # -- Translation behaviour (native mode) --------------------------------------
@@ -361,7 +362,7 @@ DEFAULTS: dict[str, Any] = {
     # models
     "default_model": DEFAULT_MODEL,
     "default_embedding_model": DEFAULT_EMBEDDING_MODEL,
-    "force_model": "",                  # if set, every chat request uses this model
+    "force_model": FORCE_MODEL,         # if set, every chat request uses this model
     "model_aliases": {},                # e.g. {"gpt-4o": "gemini-2.5-pro"}
 
     # translation behaviour
