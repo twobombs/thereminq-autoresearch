@@ -178,12 +178,12 @@ MAX_CONNECTIONS = 100
 KEEPALIVE_FRACTION = 5                     # keep-alive pool = MAX_CONNECTIONS // this
 
 # -- Models -------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.8-flash"
-FORCE_MODEL = "gemini-3.8-flash"          # every chat request uses this model ("" = honour the request)
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+FORCE_MODEL = "gemini-3.5-flash-lite"          # every chat request uses this model ("" = honour the request)
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 EXAMPLE_MODEL_ALIASES = {                  # shown in --print-config; runtime default is none
-    "gpt-4o": "gemini-2.5-pro",
-    "gpt-4o-mini": "gemini-2.5-flash",
+    "gpt-4o": "gemini-3.1-pro",
+    "gpt-4o-mini": "gemini-3.5-flash",
     "text-embedding-3-small": "gemini-embedding-001",
 }
 
