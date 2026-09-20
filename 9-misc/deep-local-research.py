@@ -18,8 +18,8 @@ def secure_local_endpoint(url: str):
         raise ValueError(f"SECURITY HALT: Attempted to bind unauthenticated client to external endpoint: {url}")
     return url
 
-ORCHESTRATOR_URL = secure_local_endpoint(os.getenv("ORCHESTRATOR_URL", "http://192.168.2.134:8033/v1"))
-REASONING_URL = secure_local_endpoint(os.getenv("REASONING_URL", "http://192.168.2.137:8033/v1"))
+ORCHESTRATOR_URL = secure_local_endpoint(os.getenv("ORCHESTRATOR_URL", "http://localhost:9931/v1"))
+REASONING_URL = secure_local_endpoint(os.getenv("REASONING_URL", "http://localhost:9931/v1"))
 
 MAX_SEARCH_RESULTS = 4
 CHARS_PER_PAGE = 15000 
