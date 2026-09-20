@@ -18,10 +18,10 @@ OpenAI-compatible API (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) t
 
 ```bash
 pip install "fastapi>=0.110" "uvicorn[standard]>=0.29" "httpx[socks]>=0.27" "pyyaml>=6.0"
-# or, with uv (reads the inline metadata above):  uv run gateway.py
+# or, with uv (reads the inline metadata above):  uv run openai2gemini.py
 export GEMINI_API_KEY=...
-python gateway.py --print-config > config.yaml   # optional; env vars alone also work
-python gateway.py -c config.yaml
+python openai2gemini.py --print-config > config.yaml   # optional; env vars alone also work
+python openai2gemini.py -c config.yaml
 ```
 
 By default the gateway listens on 127.0.0.1 only. To bind a public interface (including `0.0.0.0` inside a container), set `client_api_keys` or `passthrough_client_key`; otherwise it refuses to start unless `allow_public_without_auth: true` is set explicitly.
@@ -31,7 +31,7 @@ Point any OpenAI client at it:
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:9931/v1", api_key="sk-local-change-me")
-client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}])
+client.chat.completions.create(model="gemini-3.8-flash", messages=[{"role": "user", "content": "hi"}])
 ```
 
 ## Upstream modes
@@ -48,6 +48,8 @@ client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "use
 - **Tools**: OpenAI function tools -> `functionDeclarations`. JSON Schema is reduced to Gemini's subset (`$ref`/`$defs` inlined with recursive refs cut off, `allOf` merged, `oneOf`->`anyOf`, `["x","null"]`->`nullable`, unsupported keys/formats dropped, empty-object params omitted). Set `schema_mode: jsonschema` to send the raw schema as `parametersJsonSchema` instead. `tool_choice` -> `functionCallingConfig` (AUTO/NONE/ANY + allowed names).
 - **Thought signatures**: signatures on returned `functionCall` parts are cached against the generated `tool_call` id and re-attached when the client sends the history back. For Gemini 3 history without a signature (e.g. from another model), `fallback_thought_signature` is inserted.
 - **Generation params**: temperature, top_p, top_k, max_tokens / max_completion_tokens, stop, n, penalties, seed, `response_format` (json_object / json_schema).
+- **Model routing**: `force_model` (default `gemini-3.8-flash`) overrides every chat request after `model_aliases` are applied; responses report the model that actually served the request. Set `force_model: ""` to honour client model names. Embeddings are never forced.
+- **Model quirks**: `model_quirks` holds per-model-prefix rules (longest prefix wins per key): generation params to drop (Gemini 3.8 Flash rejects temperature/top_p/top_k/penalties/candidateCount), a thinking-level table, an output-token cap, stripping a trailing prefilled assistant turn, and sending `id` on `functionCall`/`functionResponse` parts.
 - **Reasoning**: `reasoning_effort` -> `thinkingLevel` for models matching `thinking_level_prefixes`, otherwise `thinkingBudget` from `reasoning_budgets`, raised to the per-model floor in `reasoning_budget_min` (gemini-2.5-pro cannot turn thinking off). With `include_thoughts` (or per-request `include_reasoning: true`) thought summaries come back as `reasoning_content`.
 - **Responses**: finish reasons mapped (`MAX_TOKENS`->`length`, safety family->`content_filter`, calls->`tool_calls`), usage incl. reasoning and cached tokens, `stream_options.include_usage` honoured.
 - **Escape hatch**: anything Gemini-specific can go in a `gemini` object in the request body (`extra_body={"gemini": {...}}` in the OpenAI SDK): `tools` (e.g. `[{"googleSearch": {}}]`), `toolConfig`, `generationConfig`, `thinkingConfig`, `safetySettings`, `cachedContent`; for embeddings, `taskType`.
@@ -103,8 +105,8 @@ GW_CLIENT_API_KEYS=sk-a,sk-b
 - `GET /health` reports mode, upstream and whether a key is configured.
 
 CLI:
-    python gateway.py [-c config.yaml]      run the server
-    python gateway.py --print-config        print the annotated example config
+    python openai2gemini.py [-c config.yaml]      run the server
+    python openai2gemini.py --print-config        print the annotated example config
 """
 from __future__ import annotations
 
@@ -175,8 +177,8 @@ MAX_CONNECTIONS = 100
 KEEPALIVE_FRACTION = 5                     # keep-alive pool = MAX_CONNECTIONS // this
 
 # -- Models -------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
-FORCE_MODEL = "gemini-3.1-pro-preview"    # every chat request uses this model ("" = honour the request)
+DEFAULT_MODEL = "gemini-3.8-flash"
+FORCE_MODEL = "gemini-3.8-flash"          # every chat request uses this model ("" = honour the request)
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 EXAMPLE_MODEL_ALIASES = {                  # shown in --print-config; runtime default is none
     "gpt-4o": "gemini-2.5-pro",
@@ -189,6 +191,28 @@ REASONING_BUDGETS = {"none": 0, "minimal": 512, "low": 1024, "medium": 8192, "hi
 REASONING_BUDGET_MIN = {"gemini-2.5-pro": 128}          # per-model-prefix floor
 THINKING_LEVEL_PREFIXES = ["gemini-3"]
 THINKING_LEVELS = {"none": "low", "minimal": "low", "low": "low", "medium": "high", "high": "high"}
+
+# -- Per-model quirks ---------------------------------------------------------
+# Keyed by model-name prefix. For each key, the longest matching prefix wins.
+#   drop_generation_params: generationConfig keys removed before sending
+#   thinking_levels:        overrides THINKING_LEVELS for these models
+#   max_output_tokens:      clamp for maxOutputTokens
+#   strip_prefill:          drop a trailing assistant (model) turn without tool calls
+#   function_call_ids:      send `id` on functionCall / functionResponse parts
+MODEL_QUIRKS = {
+    "gemini-3": {
+        "drop_generation_params": ["candidateCount"],
+    },
+    "gemini-3.8-flash": {
+        "drop_generation_params": ["temperature", "topP", "topK", "candidateCount",
+                                   "presencePenalty", "frequencyPenalty"],
+        "thinking_levels": {"none": "low", "minimal": "low", "low": "low",
+                            "medium": "medium", "high": "high"},   # no "minimal" on 3.8 Flash
+        "max_output_tokens": 65536,
+        "strip_prefill": True,
+        "function_call_ids": True,
+    },
+}
 THOUGHT_SIGNATURE_PREFIXES = ["gemini-3"]
 FALLBACK_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 SIGNATURE_CACHE_SIZE = 20000               # tool_call ids remembered for signature round-trips
@@ -307,6 +331,8 @@ reasoning_budgets: {_j(REASONING_BUDGETS)}
 reasoning_budget_min: {_j(REASONING_BUDGET_MIN)}
 thinking_level_prefixes: {_j(THINKING_LEVEL_PREFIXES)}
 thinking_levels: {_j(THINKING_LEVELS)}
+# Per-model-prefix overrides (longest prefix wins per key); see MODEL_QUIRKS in the script.
+model_quirks: {_j(MODEL_QUIRKS)}
 thought_signature_prefixes: {_j(THOUGHT_SIGNATURE_PREFIXES)}
 fallback_thought_signature: {FALLBACK_THOUGHT_SIGNATURE}
 safety_settings: []
@@ -362,7 +388,7 @@ DEFAULTS: dict[str, Any] = {
     # models
     "default_model": DEFAULT_MODEL,
     "default_embedding_model": DEFAULT_EMBEDDING_MODEL,
-    "force_model": FORCE_MODEL,         # if set, every chat request uses this model
+    "force_model": FORCE_MODEL,         # if set, every chat request uses this model (after aliases)
     "model_aliases": {},                # e.g. {"gpt-4o": "gemini-2.5-pro"}
 
     # translation behaviour
@@ -372,6 +398,7 @@ DEFAULTS: dict[str, Any] = {
     "reasoning_budget_min": dict(REASONING_BUDGET_MIN),
     "thinking_level_prefixes": list(THINKING_LEVEL_PREFIXES),
     "thinking_levels": dict(THINKING_LEVELS),
+    "model_quirks": json.loads(json.dumps(MODEL_QUIRKS)),
     "thought_signature_prefixes": list(THOUGHT_SIGNATURE_PREFIXES),
     "fallback_thought_signature": FALLBACK_THOUGHT_SIGNATURE,
     "safety_settings": [],
@@ -612,10 +639,11 @@ def upstream_error(status: int, body: bytes) -> JSONResponse:
 
 def resolve_model(cfg: Config, requested: str | None, embedding: bool = False) -> str:
     m = requested or (cfg.default_embedding_model if embedding else cfg.default_model)
-    if cfg.force_model and not embedding:
-        m = cfg.force_model
     m = cfg.model_aliases.get(m, m)
-    return m[len("models/"):] if m.startswith("models/") else m
+    if cfg.force_model and not embedding and m != cfg.force_model:
+        log.debug("force_model: %s -> %s", m, cfg.force_model)
+        m = cfg.force_model
+    return m.removeprefix("models/")
 
 
 def native_url(cfg: Config, model: str, method: str) -> str:
@@ -684,6 +712,15 @@ def _prefix_lookup(model: str, table: dict[str, Any]) -> Any:
     return best[1] if best else None
 
 
+def quirk(cfg: Config, model: str, key: str, default: Any = None) -> Any:
+    """Longest model-prefix match in model_quirks that defines `key`."""
+    best: tuple[str, Any] | None = None
+    for p, q in (cfg.model_quirks or {}).items():
+        if model.startswith(p) and isinstance(q, dict) and key in q and (best is None or len(p) > len(best[0])):
+            best = (p, q[key])
+    return best[1] if best else default
+
+
 # --------------------------------------------------------------------------- #
 # OpenAI -> Gemini translation                                                #
 # --------------------------------------------------------------------------- #
@@ -748,7 +785,8 @@ async def url_to_part(cfg: Config, url: str, http: httpx.AsyncClient) -> dict:
     if url.startswith("data:"):
         mime, data = _parse_data_url(url)
         return {"inlineData": {"mimeType": mime, "data": data}}
-    if url.startswith("gs://") or (GEMINI_FILES_HOST in url and "/files/" in url):
+    if url.startswith("gs://") or (urllib.parse.urlsplit(url).hostname == GEMINI_FILES_HOST
+                                   and "/files/" in urllib.parse.urlsplit(url).path):
         return {"fileData": {"fileUri": url, "mimeType": guess or "application/octet-stream"}}
     if url.startswith(("http://", "https://")):
         if not cfg.fetch_remote_media:
@@ -820,6 +858,7 @@ async def build_contents(cfg: Config, messages: list[dict], model: str,
     system_parts: list[dict] = []
     contents: list[dict] = []
     id_to_name: dict[str, str] = {}
+    send_ids = bool(quirk(cfg, model, "function_call_ids", False))
 
     for m in messages:
         role = m.get("role")
@@ -838,6 +877,8 @@ async def build_contents(cfg: Config, messages: list[dict], model: str,
                 if tc.get("id"):
                     id_to_name[tc["id"]] = fn.get("name")
                 part = {"functionCall": {"name": fn.get("name"), "args": _parse_args(fn.get("arguments"))}}
+                if send_ids and tc.get("id"):
+                    part["functionCall"]["id"] = tc["id"]
                 sig = SIGNATURES.get(tc.get("id"))
                 if sig:
                     part["thoughtSignature"] = sig
@@ -851,7 +892,10 @@ async def build_contents(cfg: Config, messages: list[dict], model: str,
                     resp = {"result": resp}
             except (TypeError, json.JSONDecodeError):
                 resp = {"result": raw}
-            g_role, parts = "user", [{"functionResponse": {"name": name, "response": resp}}]
+            fr: dict[str, Any] = {"name": name, "response": resp}
+            if send_ids and m.get("tool_call_id"):
+                fr["id"] = m["tool_call_id"]
+            g_role, parts = "user", [{"functionResponse": fr}]
         else:
             log.warning("ignoring message with unknown role: %s", role)
             continue
@@ -874,6 +918,13 @@ async def build_contents(cfg: Config, messages: list[dict], model: str,
             fcs = [p for p in c["parts"] if "functionCall" in p]
             if fcs and not any("thoughtSignature" in p for p in fcs):
                 fcs[0]["thoughtSignature"] = cfg.fallback_thought_signature
+
+    # Some models reject a prefilled (trailing) model turn. Tool-call turns are never
+    # trailing in valid history, but keep them just in case.
+    if (contents and contents[-1]["role"] == "model" and quirk(cfg, model, "strip_prefill", False)
+            and not any("functionCall" in p for p in contents[-1]["parts"])):
+        log.info("dropping trailing assistant prefill: not supported by %s", model)
+        contents.pop()
 
     if not contents and system_parts:  # system-only prompt
         contents, system_parts = [{"role": "user", "parts": system_parts}], []
@@ -1069,8 +1120,9 @@ async def build_native_payload(cfg: Config, body: dict, model: str, http: httpx.
     if effort:
         e = str(effort).lower()
         if _starts(model, cfg.thinking_level_prefixes):
-            if e in cfg.thinking_levels:
-                thinking["thinkingLevel"] = cfg.thinking_levels[e]
+            levels = quirk(cfg, model, "thinking_levels") or cfg.thinking_levels
+            if e in levels:
+                thinking["thinkingLevel"] = levels[e]
         elif e in cfg.reasoning_budgets:
             budget = cfg.reasoning_budgets[e]
             floor = _prefix_lookup(model, cfg.reasoning_budget_min)
@@ -1082,7 +1134,15 @@ async def build_native_payload(cfg: Config, body: dict, model: str, http: httpx.
     if thinking:
         gc["thinkingConfig"] = thinking
 
+    dropped = [k for k in quirk(cfg, model, "drop_generation_params", []) if gc.pop(k, None) is not None]
+    if dropped:
+        log.debug("dropped generation params unsupported by %s: %s", model, dropped)
+    cap = quirk(cfg, model, "max_output_tokens")
+    if cap and gc.get("maxOutputTokens", 0) > cap:
+        gc["maxOutputTokens"] = cap
+
     # Escape hatch: {"gemini": {...}} in the request body (OpenAI SDKs: extra_body={"gemini": {...}})
+    # Applied after quirks on purpose: anything set here is sent as-is.
     extra = body.get("gemini") or {}
     if extra.get("tools"):
         payload.setdefault("tools", []).extend(extra["tools"])
@@ -1124,7 +1184,7 @@ def convert_parts(parts: list[dict]) -> tuple[str, str, list[dict]]:
     for p in parts:
         if "functionCall" in p:
             fc = p["functionCall"]
-            tid = "call_" + uuid.uuid4().hex[:24]
+            tid = fc.get("id") or "call_" + uuid.uuid4().hex[:24]
             if p.get("thoughtSignature"):
                 SIGNATURES.put(tid, p["thoughtSignature"])
             calls.append({"id": tid, "type": "function", "function": {
@@ -1203,9 +1263,12 @@ async def sse_native(resp: httpx.Response, model_label: str, include_usage: bool
             if data.get("usageMetadata"):
                 usage_md = data["usageMetadata"]
             if not data.get("candidates") and (data.get("promptFeedback") or {}).get("blockReason"):
-                state[0] = {"role": True, "tools": 0, "done": True}
-                yield chunk([{"index": 0, "delta": {"role": "assistant", "content": ""},
-                              "finish_reason": "content_filter", "logprobs": None}])
+                st0 = state.setdefault(0, {"role": False, "tools": 0, "done": False})
+                if not st0["done"]:
+                    delta0 = {} if st0["role"] else {"role": "assistant", "content": ""}
+                    st0["role"] = st0["done"] = True
+                    yield chunk([{"index": 0, "delta": delta0,
+                                  "finish_reason": "content_filter", "logprobs": None}])
             for i, cand in enumerate(data.get("candidates") or []):
                 idx = cand.get("index", i)
                 st = state.setdefault(idx, {"role": False, "tools": 0, "done": False})
@@ -1327,6 +1390,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         http: httpx.AsyncClient = request.app.state.http
         requested = body.get("model") or cfg.default_model
         model = resolve_model(cfg, requested)
+        label = model if cfg.force_model else requested  # never claim a model we didn't use
         try:
             payload = await build_native_payload(cfg, body, model, http)
         except ValueError as e:
@@ -1347,14 +1411,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     await resp.aclose()
                     return upstream_error(resp.status_code, content)
                 include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-                return StreamingResponse(sse_native(resp, requested, include_usage),
+                return StreamingResponse(sse_native(resp, label, include_usage),
                                          media_type="text/event-stream", headers=NO_BUFFER_HEADERS)
             resp = await http.post(url, json=payload, headers=headers, params=params)
         except httpx.HTTPError as e:
             return oai_error(502, f"upstream request failed: {e!r}", "api_error")
         if resp.status_code >= 400:
             return upstream_error(resp.status_code, resp.content)
-        return JSONResponse(native_to_openai(resp.json(), requested))
+        return JSONResponse(native_to_openai(resp.json(), label))
 
     @router.post("/embeddings")
     async def embeddings(request: Request):
