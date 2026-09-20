@@ -178,14 +178,14 @@ KEEPALIVE_FRACTION = 5                     # keep-alive pool = MAX_CONNECTIONS /
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 EXAMPLE_MODEL_ALIASES = {                  # shown in --print-config; runtime default is none
-    "gpt-4o": "gemini-3.1-pro",
-    "gpt-4o-mini": "gemini-3.8-flash",
+    "gpt-4o": "gemini-2.5-pro",
+    "gpt-4o-mini": "gemini-2.5-flash",
     "text-embedding-3-small": "gemini-embedding-001",
 }
 
 # -- Reasoning / thinking -----------------------------------------------------
 REASONING_BUDGETS = {"none": 0, "minimal": 512, "low": 1024, "medium": 8192, "high": 24576}
-REASONING_BUDGET_MIN = {"gemini-3.1-pro": 128}          # per-model-prefix floor
+REASONING_BUDGET_MIN = {"gemini-2.5-pro": 128}          # per-model-prefix floor
 THINKING_LEVEL_PREFIXES = ["gemini-3"]
 THINKING_LEVELS = {"none": "low", "minimal": "low", "low": "low", "medium": "high", "high": "high"}
 THOUGHT_SIGNATURE_PREFIXES = ["gemini-3"]
@@ -654,6 +654,21 @@ def authorize(cfg: Config, request: Request) -> tuple[str | None, JSONResponse |
             return token, None
         return None, oai_error(401, "Missing API key: send your own Gemini API key as the Bearer token.")
     return cfg.gemini_api_key, None
+
+
+def resolve_upstream_key(cfg: Config, request: Request) -> tuple[str | None, JSONResponse | None]:
+    """authorize(), then refuse to send a keyless request upstream (Google answers those
+    with a confusing 403 about 'unregistered callers')."""
+    key, err = authorize(cfg, request)
+    if err:
+        return None, err
+    if not key and cfg.auth_mode != "none":
+        return None, oai_error(
+            503, "Gateway has no Gemini API key configured: set " + " or ".join(API_KEY_ENV_VARS)
+            + " (or gemini_api_key in the config file) before starting the gateway, "
+            "or use auth_mode: none for an upstream that needs no key.",
+            "api_error", "gateway_key_missing")
+    return key, None
 
 
 def _starts(model: str, prefixes: list[str]) -> bool:
@@ -1242,6 +1257,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         app.state.http = build_http_client(cfg)
         log.info("upstream=%s mode=%s prefixes=%s root_path=%r", cfg.gemini_base_url,
                  cfg.upstream_mode, cfg.route_prefixes, cfg.root_path)
+        if not cfg.gemini_api_key and not cfg.passthrough_client_key and cfg.auth_mode != "none":
+            log.warning("no Gemini API key configured (%s unset): upstream requests will be refused "
+                        "until one is set and the gateway is restarted", " / ".join(API_KEY_ENV_VARS))
         yield
         await app.state.http.aclose()
 
@@ -1294,7 +1312,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @router.post("/chat/completions")
     async def chat_completions(request: Request):
-        key, err = authorize(cfg, request)
+        key, err = resolve_upstream_key(cfg, request)
         if err:
             return err
         body, err = await _json(request)
@@ -1339,7 +1357,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @router.post("/embeddings")
     async def embeddings(request: Request):
-        key, err = authorize(cfg, request)
+        key, err = resolve_upstream_key(cfg, request)
         if err:
             return err
         body, err = await _json(request)
@@ -1387,7 +1405,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @router.get("/models")
     async def list_models(request: Request):
-        key, err = authorize(cfg, request)
+        key, err = resolve_upstream_key(cfg, request)
         if err:
             return err
         if cfg.upstream_mode == "openai":
