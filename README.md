@@ -2,7 +2,7 @@
 
 **A fully local, multi-tier agentic research pipeline**
 
-`ThereminQ-Autoresearch` ingests a prompt, a document or a whole Git repository. It decomposes the work into atomic assignments and runs them on a swarm of locally hosted, quantized LLMs (GGUF via `llama.cpp`, Vulkan backend). The output is a tested, distilled list of actionable tasks. Nothing leaves the machine: every tier is an OpenAI-compatible endpoint you host yourself.
+`ThereminQ-Autoresearch` ingests a prompt, a document or a whole Git repository. It decomposes the work into atomic assignments and runs them on a swarm of locally hosted, quantized LLMs (GGUF via `llama.cpp`, Vulkan backend). The output is a tested, distilled list of actionable tasks. By default nothing leaves the machine: every tier is an OpenAI-compatible endpoint you host yourself. The one opt-in exception is the Gemini gateway in `9-misc/` (section 7). It lets the Google Gemini API stand in for the apex tier.
 
 The repository contains two self-contained pipeline scripts at its root. It also holds the infrastructure, helper tools and MCP servers around them, in numbered folders.
 
@@ -29,7 +29,7 @@ Detailed documentation lives in [`HOWTO-autoresearch-rsi-onefile.md`](HOWTO-auto
 | `4-MCPs/` | MCP servers: local agile-state MCP, Atlassian/Jira ingress MCP, and `pyQrack-mcp.py` (PyQrack as an agent-drivable quantum simulator) |
 | `5-viz/` | Turns orchestrator status output into a Stable Diffusion (A1111) prompt and image |
 | `7-workdir/`, `8-workdir/` | Working directories; `8-workdir/testprompt.txt` is a sample prompt |
-| `9-misc/` | Deep local research script, git compare-and-merge helper, local Discord bot |
+| `9-misc/` | `openai2gemini.py` (OpenAI-compatible gateway to the Gemini API, section 7), deep local research script, git compare-and-merge helper, local Discord bot |
 
 ---
 
@@ -236,7 +236,53 @@ Its ports do not match either script's defaults. When running a pipeline against
 
 ---
 
-## 7. Related work
+## 7. Optional: Gemini as the apex tier (`9-misc/openai2gemini.py`)
+
+`openai2gemini.py` is a single-file gateway that exposes an OpenAI-compatible API and routes it to the Google Gemini API. It serves `/v1/chat/completions` (streaming and non-streaming), `/v1/embeddings` and `/v1/models`. Its default port is **9931**, the same as the RSI apex tier, so it can replace a local apex model without changing the pipeline configuration.
+
+**Using this gateway sends every apex request to Google.** That covers the raw document, the distillation input, Phase 3 planning, the dreaming traces and the Phase 6 inputs, including ingested repository content. The worker tier stays local.
+
+### Running it
+
+```bash
+# with uv (reads the inline dependency block in the script)
+export GEMINI_API_KEY=...
+uv run 9-misc/openai2gemini.py
+
+# or with pip; Python >= 3.10
+python3 -m pip install "fastapi>=0.110" "uvicorn[standard]>=0.29" "httpx[socks]>=0.27" "pyyaml>=6.0"
+python3 9-misc/openai2gemini.py --print-config > gateway.yaml   # optional annotated config
+python3 9-misc/openai2gemini.py -c gateway.yaml
+```
+
+Then point the RSI pipeline's apex tier at it:
+
+```bash
+export OPENAI_API_BASE="http://localhost:9931/v1"
+export DISTILLER_URL="http://localhost:9931/v1"
+python3 autoresearch-rsi-onefile.py -p "..." -n 3
+```
+
+Do not run a local apex `llama-server` on port 9931 on the same host at the same time.
+
+### Behaviour worth knowing
+
+| Topic | Behaviour |
+|---|---|
+| Model selection | `force_model` (default `gemini-3.5-flash-lite`) overrides every chat request after `model_aliases` are applied. The pipeline's `LLM_MODEL` is therefore ignored unless you set `force_model: ""`. Embeddings are never forced |
+| Upstream modes | `native` (default) translates to `generateContent` / `streamGenerateContent`, including tools, JSON schema, thought signatures, reasoning effort and per-model quirks. `openai` forwards to Gemini's own OpenAI-compatible endpoint |
+| Binding and auth | Listens on `127.0.0.1` by default. Binding any other address (including `0.0.0.0` in a container) requires `client_api_keys` or `passthrough_client_key`. Otherwise it refuses to start unless `allow_public_without_auth: true` is set |
+| Rate limits | Upstream 429/503 responses are waited out using Gemini's requested delay, up to `retry_max_attempts` (5) and `retry_max_wait` (120 s). Longer waits, such as an exhausted daily quota, go back to the client with `Retry-After`. The pipeline's apex client timeout (`WORKER_TIMEOUT_SECS`, default 300 s) must exceed this wait |
+| Outbound network | `outbound_proxy` / `proxy_http` / `proxy_https` (HTTP or SOCKS5), `no_proxy`, `trust_env`, custom CA bundle via `verify_tls`. Upstream redirects are never followed, so the API key cannot be forwarded to another host |
+| Remote media | `http(s)` `image_url` parts are fetched by the gateway, with a size cap and a public-address check (`media_block_private_hosts`). Disable with `fetch_remote_media: false` if untrusted clients can reach it |
+| Server-geometry check | The gateway has no llama.cpp `/props` endpoint, so the pipeline's apex context check cannot verify it. `APEX_SERVER_CTX` still sets the apex budgets |
+| Health | `GET /health` reports mode, upstream and whether a key is configured |
+
+Every config key can also be set as an environment variable `GW_<KEY>`, for example `GW_FORCE_MODEL`, `GW_CLIENT_API_KEYS` or `GW_OUTBOUND_PROXY`. The script's docstring documents all options.
+
+---
+
+## 8. Related work
 
 - **MetaGPT** (Hong et al., 2023): multi-agent collaboration under standard operating procedures. ThereminQ likewise uses fixed roles and structured hand-offs.
 - **AutoGen** (Wu et al., 2023): conversational multi-agent applications. ThereminQ replaces conversational iteration with asynchronous, scope-isolated assignments and mechanical reconciliation.
