@@ -32,7 +32,7 @@ def secure_local_endpoint(url: str):
         raise ValueError(f"SECURITY HALT: Attempted to bind unauthenticated client to external endpoint: {url}")
     return url
 
-ORCHESTRATOR_URL = secure_local_endpoint(os.getenv("ORCHESTRATOR_URL", "http://localhost:9931/v1"))
+ORCHESTRATOR_URL = secure_local_endpoint(os.getenv("ORCHESTRATOR_URL", "http://localhost:8033/v1"))
 REASONING_URL = secure_local_endpoint(os.getenv("REASONING_URL", "http://localhost:9931/v1"))
 
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "nemotron-orchestrator-8b")
