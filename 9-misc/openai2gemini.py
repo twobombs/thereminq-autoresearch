@@ -103,6 +103,7 @@ GW_CLIENT_API_KEYS=sk-a,sk-b
 - `fetch_remote_media` makes the gateway download URLs supplied by clients. Downloads are streamed with a hard size cap, redirects are followed manually (max 5) and, with `media_block_private_hosts`, every hop must resolve to public addresses only. DNS rebinding can still defeat a resolve-then-connect check, so if untrusted clients can reach the gateway, also restrict egress at the network level or disable the feature.
 - Gemini returns no token counts for embeddings, so `usage` there is 0.
 - `GET /health` reports mode, upstream and whether a key is configured.
+- **Rate limits**: on an upstream 429 (or another status in `retry_statuses`) the gateway waits the delay Gemini asks for (`RetryInfo.retryDelay`, then `Retry-After`, then the "retry in Ns" text; otherwise exponential backoff from `retry_default_delay`) and retries, up to `retry_max_attempts` times. A delay longer than `retry_max_wait` (e.g. a daily quota) is not waited out: the 429 goes straight back to the client with a `Retry-After` header. Your client's own request timeout must exceed the wait, or it will give up first. Set `retry_max_attempts: 0` to disable.
 
 CLI:
     python openai2gemini.py [-c config.yaml]      run the server
@@ -234,6 +235,13 @@ SCHEMA_MAX_DEPTH = 40                      # recursion cap for JSON Schema sanit
 ERROR_BODY_MAX_CHARS = 4000                # upstream error text passed back to clients
 DEBUG_PAYLOAD_MAX_CHARS = 4000             # payload preview in DEBUG logs
 
+# -- Upstream rate limiting / retries ----------------------------------------
+RETRY_STATUSES = [429]                     # upstream statuses that are waited out and retried
+RETRY_MAX_ATTEMPTS = 5                     # retries per upstream call (0 = off)
+RETRY_MAX_WAIT = 120.0                     # seconds; a longer requested delay is returned to the client instead
+RETRY_DEFAULT_DELAY = 5.0                  # seconds, doubled per attempt when Gemini gives no delay
+RETRY_PADDING = 0.5                        # seconds added to the requested delay
+
 # =========================================================================== #
 
 log = logging.getLogger("gemini-openai-gateway")
@@ -338,6 +346,14 @@ fallback_thought_signature: {FALLBACK_THOUGHT_SIGNATURE}
 safety_settings: []
 #  - {{category: HARM_CATEGORY_DANGEROUS_CONTENT, threshold: BLOCK_ONLY_HIGH}}
 
+# -- Upstream rate limits ----------------------------------------------------
+# On these statuses, wait the delay Gemini asks for and retry. A requested delay
+# above retry_max_wait (e.g. an exhausted daily quota) is returned immediately.
+retry_statuses: {_j(RETRY_STATUSES)}
+retry_max_attempts: {RETRY_MAX_ATTEMPTS}   # 0 = never retry
+retry_max_wait: {RETRY_MAX_WAIT}
+retry_default_delay: {RETRY_DEFAULT_DELAY}
+
 # -- Remote media (http(s) image_url) -----------------------------------------
 fetch_remote_media: {_j(FETCH_REMOTE_MEDIA)}
 max_remote_media_bytes: {MAX_REMOTE_MEDIA_BYTES}
@@ -407,6 +423,12 @@ DEFAULTS: dict[str, Any] = {
     "fetch_remote_media": FETCH_REMOTE_MEDIA,
     "max_remote_media_bytes": MAX_REMOTE_MEDIA_BYTES,
     "media_block_private_hosts": MEDIA_BLOCK_PRIVATE_HOSTS,
+
+    # upstream rate limits
+    "retry_statuses": list(RETRY_STATUSES),
+    "retry_max_attempts": RETRY_MAX_ATTEMPTS,
+    "retry_max_wait": RETRY_MAX_WAIT,
+    "retry_default_delay": RETRY_DEFAULT_DELAY,
 }
 
 _TRUE = {"1", "true", "yes", "on"}
@@ -624,7 +646,62 @@ def oai_error(status: int, message: str, etype: str | None = None, code: Any = N
         "param": None, "code": code}})
 
 
+_RETRY_TEXT = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+
+
+def retry_delay(body: bytes, headers: httpx.Headers | dict | None = None) -> float | None:
+    """Seconds Gemini asks us to wait: RetryInfo.retryDelay, then Retry-After, then message text."""
+    try:
+        j = json.loads(body)
+        j = j[0] if isinstance(j, list) and j else j
+        for d in (j.get("error") or {}).get("details") or []:
+            if str(d.get("@type", "")).endswith("google.rpc.RetryInfo") and d.get("retryDelay"):
+                return float(str(d["retryDelay"]).rstrip("s"))
+    except Exception:
+        pass
+    ra = (headers or {}).get("retry-after")
+    if ra:
+        try:
+            return float(ra)
+        except ValueError:
+            pass
+    m = _RETRY_TEXT.search(body.decode("utf-8", "replace"))
+    return float(m.group(1)) if m else None
+
+
+async def send_upstream(cfg: Config, http: httpx.AsyncClient, method: str, url: str, *,
+                        stream: bool = False, **kw: Any) -> httpx.Response:
+    """Send one upstream request, waiting out rate limits (see retry_* settings).
+    Returns the final response; on a non-retried error its body has already been read."""
+    attempt = 0
+    while True:
+        resp = await http.send(http.build_request(method, url, **kw), stream=stream)
+        if resp.status_code not in cfg.retry_statuses or attempt >= cfg.retry_max_attempts:
+            return resp
+        body = await resp.aread()
+        asked = retry_delay(body, resp.headers)
+        delay = asked if asked is not None else cfg.retry_default_delay * (2 ** attempt)
+        if delay > cfg.retry_max_wait:
+            log.warning("upstream %s: requested wait %.0fs exceeds retry_max_wait (%.0fs); returning it",
+                        resp.status_code, delay, cfg.retry_max_wait)
+            return resp
+        await resp.aclose()
+        attempt += 1
+        log.warning("upstream %s rate limit; waiting %.1fs, then retry %d/%d",
+                    resp.status_code, delay, attempt, cfg.retry_max_attempts)
+        await asyncio.sleep(delay + RETRY_PADDING)
+
+
 def upstream_error(status: int, body: bytes) -> JSONResponse:
+    resp = _upstream_error(status, body)
+    if status == 429:
+        delay = retry_delay(body)
+        if delay is not None:
+            resp.headers["Retry-After"] = str(max(1, int(delay + 0.999)))
+    return resp
+
+
+def _upstream_error(status: int, body: bytes) -> JSONResponse:
     msg, code = body.decode("utf-8", "replace")[:ERROR_BODY_MAX_CHARS], None
     try:
         j = json.loads(body)
@@ -1353,8 +1430,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if body is not None:
             body = {**body, "model": resolve_model(cfg, body.get("model"), embedding)}
         try:
-            req = http.build_request(method, url, json=body, headers=headers, params=params)
-            resp = await http.send(req, stream=True)
+            resp = await send_upstream(cfg, http, method, url, stream=True,
+                                       json=body, headers=headers, params=params)
         except httpx.HTTPError as e:
             return oai_error(502, f"upstream request failed: {e!r}", "api_error")
         if resp.status_code >= 400:
@@ -1404,8 +1481,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         try:
             if stream:
                 params["alt"] = "sse"
-                req = http.build_request("POST", url, json=payload, headers=headers, params=params)
-                resp = await http.send(req, stream=True)
+                resp = await send_upstream(cfg, http, "POST", url, stream=True,
+                                           json=payload, headers=headers, params=params)
                 if resp.status_code >= 400:
                     content = await resp.aread()
                     await resp.aclose()
@@ -1413,7 +1490,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
                 return StreamingResponse(sse_native(resp, label, include_usage),
                                          media_type="text/event-stream", headers=NO_BUFFER_HEADERS)
-            resp = await http.post(url, json=payload, headers=headers, params=params)
+            resp = await send_upstream(cfg, http, "POST", url, json=payload, headers=headers, params=params)
         except httpx.HTTPError as e:
             return oai_error(502, f"upstream request failed: {e!r}", "api_error")
         if resp.status_code >= 400:
@@ -1454,7 +1531,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     r["taskType"] = extra["taskType"]
                 reqs.append(r)
             try:
-                resp = await http.post(url, json={"requests": reqs}, headers=headers, params=params)
+                resp = await send_upstream(cfg, http, "POST", url, json={"requests": reqs},
+                                           headers=headers, params=params)
             except httpx.HTTPError as e:
                 return oai_error(502, f"upstream request failed: {e!r}", "api_error")
             if resp.status_code >= 400:
@@ -1483,7 +1561,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         try:
             for _ in range(MODELS_MAX_PAGES):
                 q = {**params, "pageSize": MODELS_PAGE_SIZE, **({"pageToken": page} if page else {})}
-                resp = await http.get(url, headers=headers, params=q)
+                resp = await send_upstream(cfg, http, "GET", url, headers=headers, params=q)
                 if resp.status_code >= 400:
                     log.warning("model listing failed: %s %s", resp.status_code, resp.text[:300])
                     break
