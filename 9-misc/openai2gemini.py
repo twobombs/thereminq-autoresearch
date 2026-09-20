@@ -30,7 +30,7 @@ Point any OpenAI client at it:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="sk-local-change-me")
+client = OpenAI(base_url="http://localhost:9931/v1", api_key="sk-local-change-me")
 client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}])
 ```
 
@@ -73,7 +73,7 @@ client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "use
 
 ```nginx
 location /gemini/ {
-    proxy_pass http://127.0.0.1:8080/;   # strips /gemini -> set root_path: /gemini
+    proxy_pass http://127.0.0.1:9931/;   # strips /gemini -> set root_path: /gemini
     proxy_http_version 1.1;
     proxy_buffering off;
     proxy_read_timeout 600s;
@@ -142,7 +142,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # -- Inbound: where the gateway listens --------------------------------------
 LISTEN_HOST = "127.0.0.1"                  # loopback only; see ALLOW_PUBLIC_WITHOUT_AUTH
-LISTEN_PORT = 8080
+LISTEN_PORT = 9931
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 ROUTE_PREFIXES = ["/v1"]                   # every prefix gets the full OpenAI surface
