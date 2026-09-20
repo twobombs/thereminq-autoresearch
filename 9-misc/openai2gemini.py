@@ -178,14 +178,14 @@ KEEPALIVE_FRACTION = 5                     # keep-alive pool = MAX_CONNECTIONS /
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 EXAMPLE_MODEL_ALIASES = {                  # shown in --print-config; runtime default is none
-    "gpt-4o": "gemini-2.5-pro",
-    "gpt-4o-mini": "gemini-2.5-flash",
+    "gpt-4o": "gemini-3.1-pro",
+    "gpt-4o-mini": "gemini-3.8-flash",
     "text-embedding-3-small": "gemini-embedding-001",
 }
 
 # -- Reasoning / thinking -----------------------------------------------------
 REASONING_BUDGETS = {"none": 0, "minimal": 512, "low": 1024, "medium": 8192, "high": 24576}
-REASONING_BUDGET_MIN = {"gemini-2.5-pro": 128}          # per-model-prefix floor
+REASONING_BUDGET_MIN = {"gemini-3.1-pro": 128}          # per-model-prefix floor
 THINKING_LEVEL_PREFIXES = ["gemini-3"]
 THINKING_LEVELS = {"none": "low", "minimal": "low", "low": "low", "medium": "high", "high": "high"}
 THOUGHT_SIGNATURE_PREFIXES = ["gemini-3"]
