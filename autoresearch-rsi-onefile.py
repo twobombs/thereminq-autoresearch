@@ -608,6 +608,23 @@ def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
 _BAD_REQ_SEEN: set = set()
 _BAD_REQ_LOCK = threading.Lock()
 _DROPPABLE_PARAMS = ("stream_options", "frequency_penalty", "presence_penalty", "top_p")
+_PENALTY_PARAMS = ("frequency_penalty", "presence_penalty")
+# Params a given endpoint has rejected once; stripped up front on later calls so
+# every request doesn't pay a 400 round-trip (e.g. Gemini via gemini2openai:
+# "Penalty is not enabled for this model").
+_ENDPOINT_DROPS: Dict[str, set] = {}
+
+
+def _strip_known_rejects(where: str, kwargs: dict) -> None:
+    with _BAD_REQ_LOCK:
+        drops = set(_ENDPOINT_DROPS.get(where, ()))
+    for p in drops:
+        kwargs.pop(p, None)
+
+
+def _remember_drop(where: str, params) -> None:
+    with _BAD_REQ_LOCK:
+        _ENDPOINT_DROPS.setdefault(where, set()).update(params)
 
 
 def _bad_request_text(e) -> str:
@@ -660,7 +677,7 @@ def _fold_system_into_user(messages: list) -> list:
     return rest
 
 
-def _fix_payload_for_400(text: str, kwargs: dict) -> Optional[str]:
+def _fix_payload_for_400(text: str, kwargs: dict, where: str = "") -> Optional[str]:
     """Mutate kwargs to address a 400. Returns a description, or None if unfixable."""
     low = text.lower()
     mt = kwargs.get("max_tokens")
@@ -678,13 +695,23 @@ def _fix_payload_for_400(text: str, kwargs: dict) -> Optional[str]:
     for p in _DROPPABLE_PARAMS:
         if p in low and p in kwargs:
             kwargs.pop(p)
+            _remember_drop(where, [p])
             return f"dropped {p}"
+    # Generic penalty rejection that names no parameter (Gemini upstream).
+    if "penalty" in low:
+        present = [p for p in _PENALTY_PARAMS if p in kwargs]
+        if present:
+            for p in present:
+                kwargs.pop(p)
+            _remember_drop(where, _PENALTY_PARAMS)
+            return "dropped " + ", ".join(present) + " (endpoint rejects penalties)"
     return None
 
 
 def _safe_create(client: OpenAI, **kwargs):
     """chat.completions.create with visible 400 reasons and up to 3 targeted fixes."""
     where = str(getattr(client, "base_url", "?")).rstrip("/")
+    _strip_known_rejects(where, kwargs)
     for _ in range(4):
         try:
             return client.chat.completions.create(**kwargs)
@@ -693,7 +720,7 @@ def _safe_create(client: OpenAI, **kwargs):
                 raise
             text = _bad_request_text(e)
             _log_bad_request(where, text)
-            fix = _fix_payload_for_400(text, kwargs)
+            fix = _fix_payload_for_400(text, kwargs, where)
             if not fix:
                 raise
             print(f"    [*] retrying {where}: {fix}", flush=True)
@@ -4217,6 +4244,7 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
         if _shutdown_event.is_set():
             return None
         try:
+            _strip_known_rejects(endpoint.rstrip("/"), payload)
             response = requests.post(url, json=payload, headers=headers, timeout=TEST_TIMEOUT_SECS)
             if response.status_code == 400:
                 text = response.text
@@ -4226,7 +4254,7 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
                 except ValueError:
                     pass
                 _log_bad_request(endpoint, str(text))
-                fix = _fix_payload_for_400(str(text), payload)
+                fix = _fix_payload_for_400(str(text), payload, endpoint.rstrip("/"))
                 if not fix:
                     return None          # a 400 will not heal on retry
                 print(f"    [*] retrying {endpoint}: {fix}", flush=True)
