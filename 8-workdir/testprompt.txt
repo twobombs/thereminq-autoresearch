@@ -1,12 +1,85 @@
-​System Directive: Mandatory Verification Protocol
-You are acting as a quantum computing architect and theoretical physicist. You must explicitly use web search and literature retrieval tools at specific steps before generating your final response. Do not rely solely on your training data.
-​Step 1: Theoretical Verification (Search Required)
-Use web search to investigate the current academic consensus on observing a "negative energy spike" (or negative energy shockwave) during quantum teleportation in the context of the ER=EPR conjecture, traversable wormholes, and the SYK model.
-Output: List the 2-3 specific search queries you used, followed by a brief summary of the actual physical constraints and recent experiments (e.g., the 2022 Sycamore processor wormhole experiment) you found.
-​Step 2: Thesis Formulation
-Based strictly on the verified literature from Step 1, create a thesis defining how this negative energy phenomenon manifests during qubit teleportation, and how it serves as a measurable analogue for quantum gravity.
-​Step 3: Hardware & Tooling Verification (Search Required)
-Use web search to verify the current capabilities of quantum execution environments required to test this thesis. Check circuit depth limits, required qubit counts, and error rates for physical quantum computers (e.g., IBM, Google) versus high-performance local simulators (e.g., Qrack).
-Output: State the hardware and simulation constraints you discovered.
-​Step 4: Execution Strategy
-Devise a step-by-step strategy to execute this thesis as a proof of concept. Specify the exact quantum tooling, the circuit architecture required to simulate the negative energy shockwave, and how to measure the resulting teleportation fidelity to prove the ER=EPR link
+OBJECTIVE
+Build a working, tested Python proof of concept that simulates the traversable-wormhole
+teleportation protocol on a sparse SYK model and measures the negative-energy signature:
+a message qubit teleports with high fidelity for one sign of the boundary coupling (mu)
+and poorly for the other. The deliverable is runnable code plus the numbers it produces.
+Prose is only accepted where a deliverable below asks for it.
+
+SCIENTIFIC FRAMING (read before writing code)
+- Reference work: Jafferis et al., "Traversable wormhole dynamics on a quantum processor",
+  Nature 2022 (Google Sycamore, learned sparse SYK-like Hamiltonian); Brown et al. and
+  Nezami et al. on "teleportation by size" and size winding; Kobrin, Schuster, Yao 2023
+  comment arguing the learned model's signal is not generically holographic.
+- The simulation reproduces a signature. It does not prove ER=EPR. Every conclusion the
+  code or notes draw must be phrased as "the model shows X under assumptions Y".
+- The negative-energy shock is the coupling exp(i*mu*V), V = (1/K) * sum_j Z_L,j Z_R,j
+  (or the Majorana-bilinear equivalent), applied between the left and right systems.
+  The measurable claim: teleportation fidelity / mutual information is asymmetric in the
+  sign of mu, and the asymmetry depends on the Hamiltonian and the inverse temperature.
+- No web access is available to the agents. Do not claim to have searched. Any hardware
+  number (qubit counts, error rates, depth limits) comes from training data and must be
+  labelled "UNVERIFIED" with the year the figure is believed to date from.
+
+DELIVERABLES (each a complete file; no placeholders, no TODO, no pseudo-code)
+1. syk.py
+   - Build the sparse SYK Hamiltonian for N Majorana fermions (N even, 8 <= N <= 16),
+     q = 4, sparsity parameter k, fixed seed. Map Majoranas to qubits with Jordan-Wigner.
+   - Return both a dense matrix (numpy) and a list of weighted Pauli strings.
+   - Functions: majoranas(n_qubits), sparse_syk(N, k, seed) -> (H_dense, pauli_terms).
+2. circuit_ir.py
+   - A minimal gate-list IR: ("h", q), ("s", q), ("sdg", q), ("cx", c, t), ("rz", q, theta),
+     ("rx", q, theta). Nothing else.
+   - pauli_exponential(pauli_string, angle) -> gate list (basis change, CNOT ladder, RZ).
+   - trotter_step(pauli_terms, dt) -> gate list; trotterize(pauli_terms, t, steps) -> gate list.
+   - gate_count(gates) and depth(gates) helpers.
+3. backends.py
+   - NumpyBackend: exact statevector executor for the IR. This is the reference.
+   - QrackBackend: executes the same IR with PyQrack's QrackSimulator. All PyQrack calls
+     live in this one class. Use only PyQrack API you are certain exists; if unsure of a
+     call, implement the gate from primitives you are certain of.
+   - The file must contain this line verbatim, and export it to the environment before
+     pyqrack is imported:
+       QRACK_LIB_PATH = "/usr/local/lib/qrack/libqrack_pinvoke.so"
+   - If pyqrack cannot be imported, QrackBackend raises a clear error; NumpyBackend still works.
+4. protocol.py
+   - Full teleportation protocol on 2 * (N/2) system qubits + 1 message qubit + 1 reference
+     qubit: prepare TFD, entangle message with reference, swap message into the left system,
+     evolve left backward by time t0, apply exp(i*mu*V), evolve right forward by t0, swap
+     out of the right system, measure mutual information I(reference : output).
+   - TFD: beta = 0 as Bell pairs (pure circuit); beta > 0 prepared exactly in numpy and
+     used only by NumpyBackend.
+   - run_protocol(N, k, seed, mu, t0, beta, backend, trotter_steps) -> dict with fidelity,
+     mutual_information, gate_count, depth, qubits.
+5. run_experiment.py
+   - CLI: --n --k --seed --beta --t0 --steps --backend {numpy,qrack} --mu-min --mu-max
+     --mu-points --out DIR
+   - Sweeps mu, writes results.csv and summary.json.
+   - summary.json contains a top-level float "score" = mean I(mu<0) - mean I(mu>0),
+     plus the full sweep, runtime, gate counts and the exact CLI arguments.
+   - Default invocation (python3 run_experiment.py) uses N=8 and finishes in under 60 s on CPU.
+6. tests/test_wormhole.py (pytest)
+   - Every Majorana squares to identity and distinct Majoranas anticommute (N=8).
+   - H_dense is Hermitian and equals the sum of pauli_terms.
+   - pauli_exponential matches scipy.linalg.expm on random 3-qubit strings to 1e-9.
+   - Trotter error decreases as steps increase.
+   - Protocol with mu = 0 and t0 = 0 reproduces the known Bell-pair mutual information.
+   - If pyqrack is importable: NumpyBackend and QrackBackend agree on the N=8 beta=0
+     protocol to 1e-6; otherwise the test is skipped, not failed.
+7. RESULTS.md
+   - The command lines run, the resulting score, a table of I(mu) values, the scaling of
+     qubits and gate count with N computed by the code, and which N fit a local simulator.
+   - Hardware section: what the measured gate counts imply for current superconducting
+     devices, every figure marked UNVERIFIED as described above.
+
+CONSTRAINTS
+- Python 3.10+, numpy, scipy, pytest, pyqrack. No other dependencies. No network calls.
+- No CUDA anywhere. If GPU acceleration is mentioned or configured, it is OpenCL or Vulkan.
+- ASCII only in every file. Deterministic: every random draw takes an explicit seed.
+- Type hints and a one-line docstring on every public function.
+- Files import each other by module name from the same directory; no packages, no __init__.py.
+
+ACCEPTANCE CRITERIA
+- python3 -m pytest tests/ passes (qrack tests may skip if pyqrack is absent).
+- python3 run_experiment.py exits 0 and writes summary.json with a numeric "score".
+- A nonzero score must be explained in RESULTS.md by the parameters that produced it; a
+  score near zero is a valid result and must be reported as such, not tuned away.
