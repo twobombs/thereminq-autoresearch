@@ -661,44 +661,84 @@ def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
     return text, p_tok, c_tok
 
 
+def _probe_props(root: str):
+    """llama-server native endpoint. Returns (n_ctx, slots, source) or None if absent."""
+    resp = requests.get(f"{root}/props", timeout=5.0)
+    if resp.status_code in (404, 405, 501):
+        return None  # permanent: not llama-server (vLLM, LiteLLM, llama-cpp-python, ...)
+    resp.raise_for_status()
+    data = resp.json()
+    dgs = data.get("default_generation_settings", {}) or {}
+    n_ctx = dgs.get("n_ctx") or data.get("n_ctx") or 0
+    slots = data.get("total_slots") or dgs.get("n_parallel") or 0
+    return int(n_ctx or 0), int(slots or 0), "/props"
+
+
+def _probe_models(ep: str):
+    """OpenAI-compatible fallback via /v1/models. Slot count is not exposed here."""
+    resp = requests.get(f"{ep}/models", timeout=5.0,
+                        headers={"Authorization": f"Bearer {GEN_API_KEY}"})
+    resp.raise_for_status()
+    models = (resp.json() or {}).get("data") or []
+    if not models:
+        return 0, 0, "/v1/models (empty)"
+    m = next((x for x in models if x.get("id") == LLM_MODEL), models[0])
+    meta = m.get("meta") or {}
+    # vLLM: max_model_len | SGLang/others: context_length | llama-server: meta.n_ctx_train
+    for key, src in (("max_model_len", "max_model_len"),
+                     ("context_length", "context_length"),
+                     ("context_window", "context_window")):
+        if m.get(key):
+            return int(m[key]), 0, f"/v1/models:{src}"
+    if meta.get("n_ctx"):
+        return int(meta["n_ctx"]), 0, "/v1/models:meta.n_ctx"
+    if meta.get("n_ctx_train"):
+        return int(meta["n_ctx_train"]), 0, "/v1/models:meta.n_ctx_train (train ctx, not -c)"
+    return 0, 0, "/v1/models (no ctx field)"
+
+
 def verify_server_props(endpoints: List[str], label: str, expect_ctx: int, expect_np: int) -> None:
+    """Advisory context/slot check. Tries llama-server /props, falls back to
+    /v1/models on any OpenAI-compatible backend. Never fatal."""
+    if os.getenv("SKIP_PROPS_CHECK", "0") == "1":
+        return
+    per_slot = int(expect_ctx) // max(1, int(expect_np)) if expect_ctx else 0
     for ep in endpoints:
+        ep = ep.rstrip("/")
+        root = ep[:-3] if ep.endswith("/v1") else ep
+        result, last_err = None, None
         for attempt in range(3):
             try:
-                base = ep.rsplit("/v1", 1)[0]
-                props_url = f"{base}/props"
-                resp = requests.get(props_url, timeout=5.0)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    default_props = data.get("default_generation_settings", {})
-                    n_ctx = default_props.get("n_ctx", 0)
-                    slots = data.get("total_slots") or default_props.get("n_parallel") or 0
-
-                    # Handle false MISMATCH during unified KV startup where n_ctx defaults briefly
-                    per_slot = int(expect_ctx) // max(1, int(expect_np))
-                    if expect_ctx and n_ctx and int(n_ctx) not in (int(expect_ctx), per_slot) and int(n_ctx) in (512, 2048) and attempt < 2:
-                        time.sleep(2)
-                        continue
-
-                    note = "ok"
-                    if expect_ctx and n_ctx and int(n_ctx) < per_slot:
-                        note = ("UNDER-PROVISIONED: node window {} < budgeted per-slot {}"
-                                .format(n_ctx, per_slot))
-                    elif expect_ctx and n_ctx and int(n_ctx) not in (int(expect_ctx), per_slot):
-                        note = ("larger than budget (-c {} / per-slot {}); headroom unused"
-                                .format(expect_ctx, per_slot))
-                    elif expect_np and slots and int(slots) != int(expect_np):
-                        note = "MISMATCH: constant says -np {}".format(expect_np)
-                    print("    [+] {} {} n_ctx={} slots={} :: {}".format(label, ep, n_ctx, slots, note), flush=True)
-                    break
-                else:
-                    if attempt == 2:
-                        print(f"    [!] {label} {ep} /props check returned HTTP {resp.status_code}", flush=True)
+                result = _probe_props(root)
+                if result is None:          # 404 etc: don't retry, fall back once
+                    result = _probe_models(ep)
+                n_ctx = result[0]
+                # llama-server briefly reports 512/2048 during unified-KV startup
+                if (result[2] == "/props" and expect_ctx and n_ctx in (512, 2048)
+                        and n_ctx not in (int(expect_ctx), per_slot) and attempt < 2):
                     time.sleep(2)
+                    continue
+                break
             except Exception as exc:
-                if attempt == 2:
-                    print(f"    [!] {label} {ep} /props check failed: {str(exc)[:120]}", flush=True)
+                last_err, result = exc, None
                 time.sleep(2)
+        if result is None:
+            print(f"    [!] {label} {ep} ctx probe failed: {str(last_err)[:120]}", flush=True)
+            continue
+
+        n_ctx, slots, src = result
+        if not n_ctx:
+            note = "ctx not exposed by backend; trusting {}_SERVER_CTX".format(label.upper())
+        elif n_ctx < per_slot:
+            note = "UNDER-PROVISIONED: node window {} < budgeted per-slot {}".format(n_ctx, per_slot)
+        elif n_ctx not in (int(expect_ctx), per_slot):
+            note = "larger than budget (-c {} / per-slot {}); headroom unused".format(expect_ctx, per_slot)
+        elif expect_np and slots and slots != int(expect_np):
+            note = "MISMATCH: constant says -np {}".format(expect_np)
+        else:
+            note = "ok"
+        print("    [+] {} {} n_ctx={} slots={} via {} :: {}".format(
+            label, ep, n_ctx or "?", slots or "?", src, note), flush=True)
 
 
 def ping_tier(endpoints: List[str], model: str, api_key: str, label: str, timeout: float = 90.0) -> bool:
