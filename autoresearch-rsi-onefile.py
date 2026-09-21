@@ -600,6 +600,106 @@ def split_into_logical_chunks(text: str, max_chars: int) -> List[str]:
 # Apex tier (planning / generation / distillation only)
 # ------------------------------------------------------------------
 
+# ------------------------------------------------------------------
+# HTTP 400 diagnostics + recovery for non-llama-server OpenAI backends
+# (vLLM, LiteLLM, llama-cpp-python, SGLang). The SDK error text is otherwise
+# truncated to 160 chars inside agent violations and the cause is lost.
+# ------------------------------------------------------------------
+_BAD_REQ_SEEN: set = set()
+_BAD_REQ_LOCK = threading.Lock()
+_DROPPABLE_PARAMS = ("stream_options", "frequency_penalty", "presence_penalty", "top_p")
+
+
+def _bad_request_text(e) -> str:
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        msg = err.get("message") if isinstance(err, dict) else err
+        if msg:
+            return str(msg)
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            return resp.text
+        except Exception:
+            pass
+    return str(e)
+
+
+def _log_bad_request(where: str, text: str) -> None:
+    key = (where, re.sub(r"\d+", "#", text)[:200])
+    with _BAD_REQ_LOCK:
+        if key in _BAD_REQ_SEEN:
+            return
+        _BAD_REQ_SEEN.add(key)
+    print(f"    [!] HTTP 400 from {where}: {text[:600]}", flush=True)
+
+
+def _clamp_max_tokens_from_error(text: str, requested: int) -> Optional[int]:
+    """Parse vLLM/SGLang/LiteLLM context-overflow messages -> safe max_tokens."""
+    ctx = re.search(r"maximum context length is (\d+)", text) or \
+          re.search(r"max(?:imum)?[_ ]model[_ ]len(?:gth)?\D{0,20}(\d+)", text, re.I)
+    inp = (re.search(r"(\d+) in the messages", text)
+           or re.search(r"(\d+) input tokens", text)
+           or re.search(r"prompt (?:is|has|contains) (\d+) tokens", text, re.I))
+    if not ctx or not inp:
+        return None
+    room = int(ctx.group(1)) - int(inp.group(1)) - 64
+    if room < 256 or room >= requested:
+        return None
+    return room
+
+
+def _fold_system_into_user(messages: list) -> list:
+    sys_txt = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
+    rest = [dict(m) for m in messages if m.get("role") != "system"]
+    if sys_txt and rest and rest[0].get("role") == "user":
+        rest[0]["content"] = f"{sys_txt}\n\n{rest[0]['content']}"
+    elif sys_txt:
+        rest.insert(0, {"role": "user", "content": sys_txt})
+    return rest
+
+
+def _fix_payload_for_400(text: str, kwargs: dict) -> Optional[str]:
+    """Mutate kwargs to address a 400. Returns a description, or None if unfixable."""
+    low = text.lower()
+    mt = kwargs.get("max_tokens")
+    if mt and ("context length" in low or "max_model_len" in low or "too large" in low
+               or "maximum context" in low):
+        new_mt = _clamp_max_tokens_from_error(text, int(mt))
+        if new_mt:
+            kwargs["max_tokens"] = new_mt
+            return f"max_tokens {mt} -> {new_mt}"
+        return None
+    if "system" in low and ("not supported" in low or "alternate" in low):
+        if any(m.get("role") == "system" for m in kwargs.get("messages", [])):
+            kwargs["messages"] = _fold_system_into_user(kwargs["messages"])
+            return "folded system prompt into user turn"
+    for p in _DROPPABLE_PARAMS:
+        if p in low and p in kwargs:
+            kwargs.pop(p)
+            return f"dropped {p}"
+    return None
+
+
+def _safe_create(client: OpenAI, **kwargs):
+    """chat.completions.create with visible 400 reasons and up to 3 targeted fixes."""
+    where = str(getattr(client, "base_url", "?")).rstrip("/")
+    for _ in range(4):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if getattr(e, "status_code", None) != 400:
+                raise
+            text = _bad_request_text(e)
+            _log_bad_request(where, text)
+            fix = _fix_payload_for_400(text, kwargs)
+            if not fix:
+                raise
+            print(f"    [*] retrying {where}: {fix}", flush=True)
+    return client.chat.completions.create(**kwargs)
+
+
 def apex_client(base_url: Optional[str] = None, api_key: Optional[str] = None,
                 timeout: float = WORKER_TIMEOUT_SECS, max_retries: int = 0) -> OpenAI:
     return OpenAI(
@@ -633,12 +733,12 @@ def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
     if presence_penalty is not None:
         kwargs["presence_penalty"] = presence_penalty
     try:
-        response = client.chat.completions.create(**kwargs)
+        response = _safe_create(client, **kwargs)
     except Exception as e:
         low = str(e).lower()
         if _is_stream_options_rejection(low):
             kwargs.pop("stream_options")
-            response = client.chat.completions.create(**kwargs)
+            response = _safe_create(client, **kwargs)
         else:
             raise
 
@@ -908,7 +1008,7 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
     start_time = time.time()
 
     try:
-        response = gen_client.chat.completions.create(
+        response = _safe_create(gen_client,
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": _PROMPT_PHASE1_GEN},
@@ -1229,7 +1329,7 @@ def _repo_worker_call(system_prompt: str, user_prompt: str, endpoint: str) -> st
     client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY, timeout=WORKER_TIMEOUT_SECS, max_retries=0)
 
     def _consume():
-        stream = client.chat.completions.create(
+        stream = _safe_create(client,
             model=WORKER_MODEL,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user", "content": user_prompt}],
@@ -2614,11 +2714,11 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
             stream=True,
         )
         try:
-            response = client.chat.completions.create(
+            response = _safe_create(client,
                 stream_options={"include_usage": True}, **base_kwargs)
         except Exception as e:
             if _is_stream_options_rejection(str(e).lower()):
-                response = client.chat.completions.create(**base_kwargs)
+                response = _safe_create(client, **base_kwargs)
             else:
                 raise
 
@@ -4118,6 +4218,19 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
             return None
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=TEST_TIMEOUT_SECS)
+            if response.status_code == 400:
+                text = response.text
+                try:
+                    err = response.json().get("error", {})
+                    text = (err.get("message") if isinstance(err, dict) else err) or text
+                except ValueError:
+                    pass
+                _log_bad_request(endpoint, str(text))
+                fix = _fix_payload_for_400(str(text), payload)
+                if not fix:
+                    return None          # a 400 will not heal on retry
+                print(f"    [*] retrying {endpoint}: {fix}", flush=True)
+                continue
             response.raise_for_status()
             choices = response.json().get("choices")
             test_code = choices[0].get("message", {}).get("content", "") if choices else ""
