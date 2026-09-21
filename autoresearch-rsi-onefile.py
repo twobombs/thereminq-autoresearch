@@ -855,7 +855,7 @@ def verify_server_props(endpoints: List[str], label: str, expect_ctx: int, expec
 
         n_ctx, slots, src = result
         if not n_ctx:
-            note = "ctx not exposed by backend; trusting {}_SERVER_CTX".format(label.upper())
+            note = "ctx not exposed by backend; trusting {}_SERVER_CTX".format("APEX" if label.lower() == "apex" else "WORKER")
         elif n_ctx < per_slot:
             note = "UNDER-PROVISIONED: node window {} < budgeted per-slot {}".format(n_ctx, per_slot)
         elif n_ctx not in (int(expect_ctx), per_slot):
