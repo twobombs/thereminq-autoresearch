@@ -26,7 +26,7 @@ import atexit
 import ipaddress
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Tuple, List, Dict, Set, Optional, Union
+from typing import Any, Tuple, List, Dict, Set, Optional, Union
 from openai import OpenAI
 
 # ==============================================================================
@@ -366,22 +366,24 @@ SYNTHESIZE_CONTRACT = os.getenv("SYNTHESIZE_CONTRACT", "1") == "1"
 # background budget, so the total window is unchanged).
 AGENT_BRIEF_BUDGET = int(os.getenv("AGENT_BRIEF_BUDGET", str(min(12000, int(WORKER_INPUT_CHARS * 0.12)))))
 
-# Dependency gate. The candidates are probed in the evaluation interpreter; the
-# importable ones become the contract's DEPENDENCIES section, and the evaluator
-# rejects any attempt that imports a third-party module outside that list
-# (score EVAL_DEP_REJECT_SCORE, no tests run, no pip install of it).
+# The container defines the workload's abilities. Nothing about them is
+# configured: every installed distribution and importable module of the
+# evaluation interpreter is DISCOVERED (metadata + module path scan, no mass
+# imports), shown to every agent, and rescanned at the start of every round so
+# packages the container's owner installs mid-run become usable immediately
+# (and removed ones stop being allowed). The gate rejects imports of anything
+# the container does not have.
 ENFORCE_DEPENDENCIES = os.getenv("ENFORCE_DEPENDENCIES", "1") == "1"
-DEPENDENCY_CANDIDATES = [x.strip() for x in
-                         os.getenv("DEPENDENCY_CANDIDATES", "numpy,scipy,pytest,pyqrack").split(",")
-                         if x.strip()]
+ENV_RESCAN_EACH_ROUND = os.getenv("ENV_RESCAN_EACH_ROUND", "1") == "1"
+ENV_SECTION_BUDGET = int(os.getenv("ENV_SECTION_BUDGET", "6000"))
 EVAL_DEP_REJECT_SCORE = float(os.getenv("EVAL_DEP_REJECT_SCORE", "0.0"))
-# API facts: objects in the allowed libraries whose REAL public API is probed
-# (inspect, in the evaluation interpreter) and written into the contract, so
-# agents stop calling methods they remember but that do not exist.
-DEPENDENCY_API_PROBE = [x.strip() for x in
-                        os.getenv("DEPENDENCY_API_PROBE", "pyqrack.QrackSimulator,pyqrack.Pauli").split(",")
-                        if x.strip()]
-API_FACTS_BUDGET = int(os.getenv("API_FACTS_BUDGET", "4500"))
+# Packaging machinery is how abilities get installed, not an ability itself.
+_TOOLING_DISTS = {"pip", "setuptools", "wheel", "distribute", "pkg-resources", "pkg_resources"}
+# Library API facts are discovered too: modules the brief mentions and every
+# third-party name the integrated project actually uses are inspected in the
+# evaluation interpreter each round; references that do not exist are listed.
+API_FACTS_BUDGET = int(os.getenv("API_FACTS_BUDGET", "6000"))
+API_FACTS_MAX_MODULE_NAMES = int(os.getenv("API_FACTS_MAX_MODULE_NAMES", "150"))
 QRACK_LIB_PATH = os.getenv("QRACK_LIB_PATH", "/usr/local/lib/qrack/libqrack_pinvoke.so")
 
 # Interfaces. A contract without an INTERFACES section gets one chosen by the
@@ -645,7 +647,11 @@ _RUN_INTEGRATION_CMD: str = INTEGRATION_CMD
 _RUN_DELIVERABLES: List[str] = []
 _RUN_BRIEF: str = ""                              # the user's prompt, verbatim
 _RUN_CONTRACT_SYNTHESIZED: bool = False
-_RUN_ALLOWED_IMPORTS: Optional[List[str]] = None  # None = gate off
+_RUN_ALLOWED_IMPORTS: Optional[List[str]] = None  # None = gate off; else discovered imports
+_RUN_ENV: Dict[str, Any] = {}                      # latest container scan
+_RUN_ENV_TEXT: str = ""                            # rendered for agents and tests
+_RUN_API_FACTS_TEXT: str = ""                      # discovered library API facts
+_ENV_RESCAN_LOCK = threading.Lock()
 _RUN_COMMAND: str = ""                             # grounding run command
 _RUN_PROBE_COMMAND: str = ""                       # sensitivity control command
 _RUN_DIR: Optional[Path] = None                    # set in main(); for diagnostics
@@ -2854,10 +2860,13 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
                    if _RUN_BRIEF else "")
     api_block = (fit_context(_RUN_FROZEN_API_TEXT, AGENT_API_BUDGET, note="...[API LIST TRUNCATED]...")
                  if _RUN_FROZEN_API_TEXT else "")
+    env_block = _RUN_ENV_TEXT or ""
+    facts_block = _RUN_API_FACTS_TEXT or ""
     run_block = (fit_context(_RUN_LAST_RUN_TEXT, AGENT_RUN_BUDGET, note="...[RUN OUTPUT TRUNCATED]...")
                  if _RUN_LAST_RUN_TEXT else "")
     context_block = fit_context(background, max(2000, context_budget - len(contract_block)
-                                                - len(brief_block) - len(api_block) - len(run_block)))
+                                                - len(brief_block) - len(api_block) - len(run_block)
+                                                - len(env_block) - len(facts_block)))
     contract_title = ("SYNTHESIZED CONTRACT (FROM THE USER'S PROMPT - BINDING FOR EVERY AGENT)"
                       if _RUN_CONTRACT_SYNTHESIZED else
                       "PINNED CONTRACT (VERBATIM FROM THE BRIEF, PLUS PROBED DEPENDENCIES - "
@@ -2872,6 +2881,10 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
            f"{brief_block}\n\n" if brief_block else "")
         + (f"===== {contract_title} =====\n"
            f"{contract_block}\n\n" if contract_block else "")
+        + (f"===== CONTAINER ENVIRONMENT (DISCOVERED - RESCANNED EVERY ROUND) =====\n"
+           f"{env_block}\n\n" if env_block else "")
+        + (f"===== LIBRARY API FACTS (INSPECTED THIS ROUND) =====\n"
+           f"{facts_block}\n\n" if facts_block else "")
         + (f"===== CURRENT INTERFACES (WHAT YOUR SIBLINGS ACTUALLY CALL) =====\n"
            f"{api_block}\n\n" if api_block else "")
         + (f"===== LATEST REAL RUN OF THE INTEGRATED PROJECT =====\n"
@@ -4059,7 +4072,7 @@ _PROMPT_INTERFACES_SYNTH = (
     "  and every producer emits only those names while every consumer accepts all of them. Put "
     "shared vocabularies as named aliases at the top of the module that owns them.\n"
     "- If a module wraps an external library, name the library calls it must use ONLY from the "
-    "API FACTS section of the contract, if present.\n"
+    "LIBRARY API FACTS given below, and use only libraries listed in the CONTAINER ENVIRONMENT.\n"
     "- RUN is ONE command, no shell operators, that runs the project's entry point with its "
     "defaults, finishes in under a minute on a CPU, exits 0, and prints a line containing "
     "\"score\": <number> (JSON) for the summary score.\n"
@@ -4673,102 +4686,336 @@ def load_round_grounding(run_dir: Path, upto_rnd: int) -> None:
             _RUN_LAST_RUN_TEXT = read_file_content_safe(run_md) or ""
 
 
-_IMPORT_PROBE = ("import os, sys; os.environ.setdefault('QRACK_LIB_PATH', sys.argv[1]); "
-                 "__import__(sys.argv[2])")
-
-
-def probe_importable(run_dir: Path, candidates: List[str]) -> List[str]:
-    """Candidates importable by the interpreter that runs tests and integration."""
-    py, venv_bin = ensure_test_venv(run_dir)
-    home = run_dir / "tests"
-    home.mkdir(parents=True, exist_ok=True)
-    env = _test_env(home, venv_bin)
-    ok = []
-    for m in candidates:
-        if not m.isidentifier():
-            continue
-        rc, _, to = _run_limited([py, "-c", _IMPORT_PROBE, QRACK_LIB_PATH, m], 120, home, env)
-        if rc == 0 and not to:
-            ok.append(m)
-    return ok
-
-
-def dependency_section(allowed: List[str]) -> str:
-    listed = ", ".join(allowed) if allowed else "(none)"
-    lines = [
-        "DEPENDENCIES (probed from the evaluation environment - enforced)",
-        f"- Third-party modules available: {listed}. The Python standard library is fine.",
-        "- Import NO other third-party module, not even inside try/except as an optional",
-        "  backend. The evaluator rejects any attempt that imports one: it scores zero and",
-        "  is not tested. Nothing else will be installed.",
-    ]
-    if "pyqrack" in allowed:
-        lines += [
-            "- Every Python file that imports pyqrack must contain this line verbatim and export",
-            "  it to os.environ before pyqrack is imported:",
-            f'      QRACK_LIB_PATH = "{QRACK_LIB_PATH}"',
-        ]
-    return "\n".join(lines)
-
-
-_API_PROBE_SRC = r"""
-import os, sys, json, inspect, enum
-os.environ.setdefault("QRACK_LIB_PATH", sys.argv[1])
-out = {}
-for target in sys.argv[2:]:
-    mod, _, attr = target.rpartition(".")
+_ENV_SCAN_SRC = r"""
+import sys, json, platform, pkgutil
+import importlib.metadata as md
+std = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names)
+try:
+    p2d = md.packages_distributions()
+except Exception:
+    p2d = {}
+dists = {}
+for d in md.distributions():
     try:
-        obj = getattr(__import__(mod, fromlist=[attr]), attr)
-    except Exception as exc:
-        out[target] = {"error": str(exc)[:200]}
+        name = d.metadata.get("Name") or ""
+    except Exception:
         continue
-    info = {"kind": "other", "members": {}}
-    if isinstance(obj, type) and issubclass(obj, enum.Enum):
-        info["kind"] = "enum"
-        info["members"] = {m.name: repr(m.value) for m in obj}
-    elif isinstance(obj, type):
-        info["kind"] = "class"
+    key = name.lower().replace("_", "-")
+    if not name or key in dists:
+        continue
+    dists[key] = {"name": name, "version": d.version or "",
+                  "summary": (d.metadata.get("Summary") or "").strip()[:140], "imports": []}
+for mod, dl in p2d.items():
+    if not mod.isidentifier() or mod.startswith("_") or mod in std:
+        continue
+    for dn in dl:
+        k = dn.lower().replace("_", "-")
+        if k in dists and mod not in dists[k]["imports"]:
+            dists[k]["imports"].append(mod)
+seen = {m for v in dists.values() for m in v["imports"]}
+loose = sorted({m.name for m in pkgutil.iter_modules()
+                if m.name.isidentifier() and not m.name.startswith("_")
+                and m.name not in std and m.name not in seen})
+print(json.dumps({"python": platform.python_version(), "executable": sys.executable,
+                  "dists": dists, "loose": loose}))
+"""
+
+
+def scan_environment(run_dir: Path) -> Dict[str, Any]:
+    """What the evaluation interpreter can import right now: every installed
+    distribution (name, version, summary, import names) plus importable
+    top-level modules that belong to no distribution. Nothing is imported."""
+    py, venv_bin = ensure_test_venv(run_dir)
+    home = run_dir / "tests" / ".envscan"
+    home.mkdir(parents=True, exist_ok=True)
+    rc, out, to = _run_limited([py, "-c", _ENV_SCAN_SRC], 120, home, _test_env(home, venv_bin))
+    if rc != 0 or to:
+        print(f"    [!] Environment scan failed ({'timeout' if to else f'exit {rc}'}); "
+              f"previous scan kept.", flush=True)
+        return {}
+    try:
+        env = json.loads((out or "").strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {}
+    env["dists"] = {k: v for k, v in env.get("dists", {}).items()
+                    if k not in _TOOLING_DISTS and v.get("imports")}
+    env["allowed"] = sorted({m for v in env["dists"].values() for m in v["imports"]}
+                            | set(env.get("loose", [])))
+    env["scanned_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    env["_ts"] = time.time()
+    return env
+
+
+def env_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+    """(added, removed, upgraded) distributions, rendered."""
+    o, n = old.get("dists", {}), new.get("dists", {})
+    added = [f"{n[k]['name']} {n[k]['version']}" for k in sorted(set(n) - set(o))]
+    removed = [o[k]["name"] for k in sorted(set(o) - set(n))]
+    upgraded = [f"{n[k]['name']} {o[k]['version']} -> {n[k]['version']}"
+                for k in sorted(set(n) & set(o)) if n[k]["version"] != o[k]["version"]]
+    added += [f"{m} (module)" for m in sorted(set(new.get("loose", [])) - set(old.get("loose", [])))]
+    removed += [f"{m} (module)" for m in sorted(set(old.get("loose", [])) - set(new.get("loose", [])))]
+    return added, removed, upgraded
+
+
+def _mentioned_modules(env: Dict[str, Any], text: str) -> List[str]:
+    """Import names of installed distributions the text names (by import name or
+    distribution name, whole word, case-insensitive)."""
+    low = (text or "").lower()
+    out: List[str] = []
+    for v in env.get("dists", {}).values():
+        names = {v["name"].lower()} | {m.lower() for m in v["imports"]}
+        if any(len(nm) >= 3 and re.search(r'(?<![a-z0-9_])' + re.escape(nm) + r'(?![a-z0-9_])', low)
+               for nm in names):
+            out += [m for m in v["imports"] if m not in out]
+    return out
+
+
+def render_environment(env: Dict[str, Any], rnd: int, prev: Optional[Dict[str, Any]],
+                       focus: List[str], budget: int = ENV_SECTION_BUDGET) -> str:
+    """The container's abilities for agents and test generators. Distributions
+    the brief or the project touch are listed first with summaries; the rest
+    follow compactly, and if the budget runs out, by import name only - the
+    list of what is importable is never cut."""
+    dists = env.get("dists", {})
+    lines = [f"CONTAINER ENVIRONMENT (discovered in the evaluation interpreter; scan for round {rnd:02d})",
+             f"  Python {env.get('python', '?')}. {len(dists)} installed distribution(s) provide "
+             f"{len(env.get('allowed', []))} importable top-level module(s).",
+             "  This is not a fixed list: it is rescanned every round, because the container's owner",
+             "  can install more. Use only the standard library and the modules listed here; an",
+             "  import of anything else rejects the attempt, and nothing is installed on request.",
+             "  Prefer what the task needs; availability is not a reason to use a library."]
+    if prev:
+        added, removed, upgraded = env_diff(prev, env)
+        if added:
+            lines.append("  NEW since the previous scan: " + ", ".join(added[:30]))
+        if removed:
+            lines.append("  REMOVED since the previous scan (no longer importable): " + ", ".join(removed[:30]))
+        if upgraded:
+            lines.append("  CHANGED version: " + ", ".join(upgraded[:20]))
+    if "pyqrack" in env.get("allowed", []):
+        lines += ["  pyqrack is installed: every Python file that imports it must contain this line",
+                  f'  verbatim and export it to os.environ before the import: QRACK_LIB_PATH = "{QRACK_LIB_PATH}"']
+    focus_set = set(focus)
+    ordered = sorted(dists.values(), key=lambda v: (not (set(v["imports"]) & focus_set), v["name"].lower()))
+    detail, rest = [], []
+    used = sum(len(l) + 1 for l in lines)
+    for v in ordered:
+        imp = ",".join(v["imports"][:6]) + ("..." if len(v["imports"]) > 6 else "")
+        ln = f"  {v['name']} {v['version']} [import {imp}]" + (f": {v['summary']}" if v["summary"] else "")
+        if used + len(ln) + 1 <= budget * 0.7:
+            detail.append(ln[:200])
+            used += len(ln[:200]) + 1
+        else:
+            rest.extend(v["imports"])
+    lines += detail
+    loose = env.get("loose", [])
+    if rest:
+        lines.append("  more installed (import names): " + ", ".join(sorted(rest)))
+    if loose:
+        lines.append("  importable modules outside any distribution: " + ", ".join(loose))
+    return enforce_ascii("\n".join(lines))
+
+
+def dependency_section() -> str:
+    return "\n".join([
+        "DEPENDENCIES (discovered from the container, not configured)",
+        "- Use only the standard library and the modules in the CONTAINER ENVIRONMENT block, which",
+        "  the pipeline rescans every round. Importing anything else - even inside try/except as an",
+        "  optional backend - rejects the attempt. Nothing is installed on request.",
+        "- For every library you call, the LIBRARY API FACTS block lists what actually exists.",
+        "  Call nothing else, even if you remember it from another version.",
+    ])
+
+
+def refresh_environment(run_dir: Path, rnd: int, focus_text: str = "",
+                        project: Optional[Path] = None, quiet: bool = False) -> None:
+    """Rescan the container and rebuild the environment block, the import gate
+    and the library API facts. Called before the contract and before each round."""
+    global _RUN_ENV, _RUN_ENV_TEXT, _RUN_ALLOWED_IMPORTS, _RUN_API_FACTS_TEXT
+    new = scan_environment(run_dir)
+    if not new:
+        return
+    prev = _RUN_ENV or load_last_env(run_dir)
+    edir = run_dir / "env"
+    edir.mkdir(parents=True, exist_ok=True)
+    with open(edir / f"round{rnd:02d}.json", "w", encoding="ascii") as f:
+        json.dump(new, f, indent=1, ensure_ascii=True)
+    refs = project_library_refs(project, set(new["allowed"])) if project else {}
+    focus = _mentioned_modules(new, focus_text) + [m for m in refs.get("modules", []) if m not in focus_text]
+    _RUN_ENV = new
+    _RUN_ENV_TEXT = render_environment(new, rnd, prev if prev else None, focus)
+    if ENFORCE_DEPENDENCIES:
+        _RUN_ALLOWED_IMPORTS = list(new["allowed"])
+    facts = probe_library_api(run_dir, focus, refs)
+    _RUN_API_FACTS_TEXT = render_api_facts(facts)
+    with open(edir / f"round{rnd:02d}_api_facts.md", "w", encoding="ascii") as f:
+        f.write((_RUN_API_FACTS_TEXT or "(no library API facts)") + "\n")
+    if quiet:
+        return
+    added, removed, upgraded = env_diff(prev, new) if prev else ([], [], [])
+    print(f"[ENV] round {rnd:02d} scan: Python {new.get('python')}, {len(new['dists'])} distribution(s), "
+          f"{len(new['allowed'])} importable module(s)"
+          + (f" | new: {', '.join(added[:6])}" if added else "")
+          + (f" | removed: {', '.join(removed[:6])}" if removed else "")
+          + (f" | changed: {', '.join(upgraded[:4])}" if upgraded else ""), flush=True)
+    if facts:
+        bad = sum(len(v.get("missing", [])) for v in facts.values())
+        print(f"[API FACTS] inspected {', '.join(sorted(facts))}"
+              + (f" | {bad} reference(s) in the project do not exist" if bad else ""), flush=True)
+
+
+def load_last_env(run_dir: Path) -> Dict[str, Any]:
+    edir = run_dir / "env"
+    scans = sorted(p for p in edir.glob("round*.json")) if edir.exists() else []
+    if not scans:
+        return {}
+    try:
+        return json.loads(read_file_content_safe(scans[-1]) or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str, Any]:
+    """Third-party usage in a project, from its source: modules imported, names
+    imported from them, and attribute chains on module aliases."""
+    out = {"modules": [], "names": [], "chains": []}
+    if project is None or not project.exists():
+        return out
+    names, chains, mods = set(), set(), set()
+    for p in sorted(project.rglob("*.py")):
+        if "__pycache__" in p.parts or ".home" in p.parts:
+            continue
         try:
-            info["init"] = str(inspect.signature(obj.__init__)).replace("(self, ", "(").replace("(self)", "()")
-        except (TypeError, ValueError):
-            info["init"] = "(...)"
-        for name in sorted(dir(obj)):
-            if name.startswith("_"):
+            tree = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            continue
+        alias: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    root = a.name.split(".")[0]
+                    if root in allowed:
+                        mods.add(root)
+                        alias[a.asname or root] = a.name if a.asname else root
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                root = node.module.split(".")[0]
+                if root in allowed:
+                    mods.add(root)
+                    for a in node.names:
+                        if a.name != "*":
+                            names.add((node.module, a.name))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                parts, cur = [], node
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name) and cur.id in alias:
+                    chains.add(tuple(alias[cur.id].split(".") + list(reversed(parts))))
+    # keep only maximal chains (a.b.c covers a.b)
+    maximal = {c for c in chains if not any(len(o) > len(c) and o[:len(c)] == c for o in chains)}
+    out["modules"] = sorted(mods)
+    out["names"] = sorted(names)[:80]
+    out["chains"] = sorted(maximal)[:120]
+    return out
+
+
+_API_SCAN_SRC = r"""
+import os, sys, json, inspect, enum, importlib
+os.environ.setdefault("QRACK_LIB_PATH", sys.argv[1])
+req = json.loads(sys.argv[2])
+MAXN = int(sys.argv[3])
+def sig(o):
+    try:
+        return str(inspect.signature(o)).replace("(self, ", "(").replace("(self)", "()")
+    except (TypeError, ValueError):
+        return "(...)"
+def describe(o):
+    if isinstance(o, type) and issubclass(o, enum.Enum):
+        return {"kind": "enum", "members": {m.name: repr(m.value) for m in o}}
+    if isinstance(o, type):
+        mem = {}
+        for n in sorted(dir(o)):
+            if n.startswith("_"):
                 continue
-            member = getattr(obj, name, None)
-            if callable(member):
-                try:
-                    sig = str(inspect.signature(member)).replace("(self, ", "(").replace("(self)", "()")
-                except (TypeError, ValueError):
-                    sig = "(...)"
-                info["members"][name] = sig
-            else:
-                info["members"][name] = None
-    elif callable(obj):
-        info["kind"] = "function"
+            v = getattr(o, n, None)
+            mem[n] = sig(v) if callable(v) else None
+        return {"kind": "class", "init": sig(o), "members": mem}
+    if callable(o):
+        return {"kind": "function", "init": sig(o)}
+    return {"kind": type(o).__name__}
+out = {}
+mods = {}
+def mod(name):
+    if name not in mods:
         try:
-            info["init"] = str(inspect.signature(obj))
-        except (TypeError, ValueError):
-            info["init"] = "(...)"
-    out[target] = info
+            mods[name] = importlib.import_module(name)
+        except Exception as e:
+            mods[name] = e
+    return mods[name]
+for m in req["modules"]:
+    r = out.setdefault(m, {"missing": [], "objects": {}})
+    mo = mod(m)
+    if isinstance(mo, Exception):
+        r["import_error"] = f"{type(mo).__name__}: {str(mo)[:200]}"
+        continue
+    pub = [n for n in dir(mo) if not n.startswith("_")]
+    r["public_count"] = len(pub)
+    r["version"] = str(getattr(mo, "__version__", ""))
+    if len(pub) <= MAXN:
+        r["top"] = {n: (lambda o: ("class" if isinstance(o, type) else "function" if callable(o)
+                                   else "module" if inspect.ismodule(o) else type(o).__name__))(getattr(mo, n, None))
+                    for n in pub}
+for modname, name in req["names"]:
+    root = modname.split(".")[0]
+    r = out.setdefault(root, {"missing": [], "objects": {}})
+    mo = mod(modname)
+    if isinstance(mo, Exception):
+        r.setdefault("import_error", f"{type(mo).__name__}: {str(mo)[:200]}")
+        continue
+    if not hasattr(mo, name):
+        try:
+            importlib.import_module(modname + "." + name)
+        except Exception:
+            r["missing"].append(f"from {modname} import {name}")
+        continue
+    r["objects"][f"{modname}.{name}"] = describe(getattr(mo, name))
+for chain in req["chains"]:
+    root = chain[0]
+    r = out.setdefault(root, {"missing": [], "objects": {}})
+    mo = mod(root)
+    if isinstance(mo, Exception):
+        continue
+    cur, path = mo, root
+    for part in chain[1:]:
+        nxt = getattr(cur, part, None)
+        if nxt is None and inspect.ismodule(cur):
+            try:
+                nxt = importlib.import_module(path + "." + part)
+            except Exception:
+                nxt = None
+        if nxt is None:
+            r["missing"].append(f"{path}.{part}")
+            break
+        cur, path = nxt, path + "." + part
 print(json.dumps(out))
 """
 
-# Methods whose full signature is always shown (the rest may be names only).
-_API_CORE_PREFIXES = ("out_", "in_", "prob", "measure", "reset", "m_all", "num_qubits", "mtrx",
-                      "mcmtrx", "swap", "set_concurrency", "seed")
 
-
-def probe_api_facts(run_dir: Path, targets: List[str], allowed: List[str]) -> Dict[str, dict]:
-    """Real public API of the probe targets whose module is allowed."""
-    targets = [t for t in targets if t.split(".")[0] in set(allowed)]
-    if not targets:
+def probe_library_api(run_dir: Path, focus: List[str], refs: Dict[str, Any]) -> Dict[str, dict]:
+    """Inspect, in the evaluation interpreter, the libraries in play: modules the
+    brief names (top level), every name the project imports from a library
+    (full member list for classes), and every attribute chain it uses."""
+    mods = sorted(set(focus) | set(refs.get("modules", [])))
+    if not mods:
         return {}
+    req = {"modules": mods, "names": refs.get("names", []), "chains": [list(c) for c in refs.get("chains", [])]}
     py, venv_bin = ensure_test_venv(run_dir)
-    home = run_dir / "tests"
+    home = run_dir / "tests" / ".envscan"
     home.mkdir(parents=True, exist_ok=True)
-    rc, out, to = _run_limited([py, "-c", _API_PROBE_SRC, QRACK_LIB_PATH] + targets, 120, home,
-                               _test_env(home, venv_bin))
+    rc, out, to = _run_limited([py, "-c", _API_SCAN_SRC, QRACK_LIB_PATH, json.dumps(req),
+                                str(API_FACTS_MAX_MODULE_NAMES)], 180, home, _test_env(home, venv_bin))
     if rc != 0 or to:
         return {}
     try:
@@ -4777,44 +5024,70 @@ def probe_api_facts(run_dir: Path, targets: List[str], allowed: List[str]) -> Di
         return {}
 
 
-def api_facts_section(facts: Dict[str, dict], budget: int = API_FACTS_BUDGET) -> str:
-    """Render probed APIs for the contract. Short gate-like names and the core
-    I/O methods get full signatures; if the budget runs out the remaining
-    methods are still listed by name, so the list stays COMPLETE."""
+# Member names that get a full signature even when the budget is tight.
+_API_CORE_PREFIXES = ("out_", "in_", "prob", "measure", "reset", "m_all", "num_qubits", "mtrx",
+                      "mcmtrx", "swap", "seed", "run", "apply", "get", "set")
+
+
+def render_api_facts(facts: Dict[str, dict], budget: int = API_FACTS_BUDGET) -> str:
+    """Member lists are always COMPLETE (the block says unlisted names do not
+    exist). To fit the budget, detail is shed instead: first signatures beyond
+    the short/core ones, then all signatures, then the module overviews."""
     if not facts:
         return ""
-    lines = ["API FACTS (probed with inspect in the evaluation environment)",
-             "  These are the ONLY members these objects have. A name not listed here does not",
-             "  exist - do not call it, even if you remember it from another library version."]
-    for target, info in facts.items():
-        if info.get("error"):
-            lines.append(f"{target}: not inspectable ({info['error'][:80]})")
+    text = ""
+    for level in (2, 1, 0):
+        text = _render_api_facts_level(facts, level)
+        if len(text) <= budget:
+            return text
+    return text  # names only; over budget but still complete and truthful
+
+
+def _render_api_facts_level(facts: Dict[str, dict], level: int) -> str:
+    lines = ["LIBRARY API FACTS (inspected in the evaluation interpreter this round)",
+             "  What these libraries actually contain. For every object listed, the member list is",
+             "  complete: a name not listed does not exist - do not call it, even if you remember it."]
+    missing = [x for r in facts.values() for x in r.get("missing", [])]
+    if missing:
+        lines.append("  DOES NOT EXIST (used by the current project - fix these first):")
+        lines += [f"    - {x}" for x in missing[:40]]
+    for m in sorted(facts):
+        r = facts[m]
+        if r.get("import_error"):
+            lines.append(f"{m}: IMPORT FAILS here ({r['import_error'][:160]})")
             continue
-        if info.get("kind") == "enum":
-            lines.append(f"{target} (enum): " + ", ".join(f"{k}={v}" for k, v in info["members"].items()))
-            continue
-        if info.get("kind") == "function":
-            lines.append(f"{target}{info.get('init', '(...)')}")
-            continue
-        lines.append(f"{target}{info.get('init', '(...)')}")
-        members = info.get("members") or {}
-        core = [n for n, sg in members.items() if sg is not None
-                and (len(n) <= 4 or n.startswith(_API_CORE_PREFIXES))]
-        rest = [n for n in members if n not in core]
-        used = sum(len(l) + 1 for l in lines)
-        sig_lines = []
-        for n in core:
-            ln = f"  .{n}{members[n]}"
-            if used + len(ln) + 1 > budget * 0.75:
-                rest.append(n)
-                continue
-            sig_lines.append(ln)
-            used += len(ln) + 1
-        lines += sig_lines
-        if rest:
-            lines.append("  other members (names only): " + ", ".join(sorted(rest)))
-    text = "\n".join(lines)
-    return text if len(text) <= budget else text[:budget - 30].rsplit(",", 1)[0] + ", ...[cut]"
+        head = f"{m}" + (f" {r['version']}" if r.get("version") else "")
+        if "top" in r and level >= 1:
+            cls = [n for n, k in r["top"].items() if k == "class"]
+            fns = [n for n, k in r["top"].items() if k == "function"]
+            head += f": classes {', '.join(cls) or '-'}; functions {', '.join(fns) or '-'}"
+        elif r.get("public_count"):
+            head += (f": {r['public_count']} public names; the names this project uses are checked "
+                     "(see DOES NOT EXIST)")
+        lines.append(head)
+        for full, info in r.get("objects", {}).items():
+            k = info.get("kind")
+            if k == "enum":
+                lines.append(f"  {full} (enum): " + ", ".join(f"{a}={b}" for a, b in info["members"].items()))
+            elif k == "function":
+                lines.append(f"  {full}{info.get('init', '(...)')}")
+            elif k == "class":
+                mem = info.get("members") or {}
+                if level == 2:
+                    sig = [n for n, sg in mem.items() if sg is not None
+                           and (len(n) <= 4 or n.startswith(_API_CORE_PREFIXES))]
+                elif level == 1:
+                    sig = [n for n, sg in mem.items() if sg is not None and len(n) <= 3]
+                else:
+                    sig = []
+                rest = [n for n in mem if n not in sig]
+                lines.append(f"  {full}{info.get('init', '(...)')}")
+                lines += [f"      .{n}{mem[n]}" for n in sig]
+                if rest:
+                    lines.append(("      other members: " if sig else "      members: ") + ", ".join(rest))
+            else:
+                lines.append(f"  {full} ({k})")
+    return enforce_ascii("\n".join(lines))
 
 
 _STDLIB_MODULES: Set[str] = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names) \
@@ -5685,7 +5958,8 @@ def sanitize_requirements(text: str) -> Tuple[List[str], List[str]]:
             dropped.append(line)
             continue
         if _RUN_ALLOWED_IMPORTS is not None and \
-                name not in {a.lower().replace("_", "-") for a in _RUN_ALLOWED_IMPORTS}:
+                name not in ({a.lower().replace("_", "-") for a in _RUN_ALLOWED_IMPORTS}
+                             | set(_RUN_ENV.get("dists", {}))):
             dropped.append(line)
             continue
         kept.append(line)
@@ -5854,6 +6128,11 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
         prompt = (f"CONTRACT (binding; test against it):\n"
                   f"{fit_context(_RUN_CONTRACT, TEST_CONTRACT_BUDGET, note='...[CONTRACT TRUNCATED]...')}"
                   f"\n\n{prompt}")
+    if _RUN_ENV_TEXT:
+        prompt = (f"{fit_context(_RUN_ENV_TEXT, 3000)}\n\n"
+                  + (f"{fit_context(_RUN_API_FACTS_TEXT, 3000)}\n\n" if _RUN_API_FACTS_TEXT else "")
+                  + "Tests may import only the standard library, the project's modules and the libraries "
+                    "above.\n\n" + prompt)
     payload = {
         "model": WORKER_MODEL,
         "messages": [{"role": "system", "content": _PROMPT_PHASE5_UNITTEST},
@@ -6229,12 +6508,21 @@ def dependency_gate(node: dict, run_dir: Path, rnd: int) -> bool:
     DEPENDENCIES list; it is then scored EVAL_DEP_REJECT_SCORE and not tested,
     since its tests would only measure the environment."""
     bad = disallowed_imports(node, run_dir)
+    if bad and ENFORCE_DEPENDENCIES and time.time() - _RUN_ENV.get("_ts", 0) > 30:
+        # Before rejecting, look again: the container's owner may have installed
+        # the module since the last scan. A mid-round install counts at once.
+        with _ENV_RESCAN_LOCK:
+            if time.time() - _RUN_ENV.get("_ts", 0) > 30:
+                refresh_environment(run_dir, rnd, focus_text=_RUN_BRIEF + "\n" + _RUN_CONTRACT, quiet=True)
+                print(f"\n    [i] {node['id']}: imports {', '.join(bad)}; container rescanned before judging",
+                      flush=True)
+        bad = disallowed_imports(node, run_dir)
     if bad:
         # Rejected before any test or install: the attempt broke the enforced
         # DEPENDENCIES section, so its tests would measure the environment.
-        msg = ("REJECTED by the evaluator: imports third-party module(s) outside the contract's "
-               f"DEPENDENCIES list: {', '.join(bad)}. Allowed: "
-               f"{', '.join(_RUN_ALLOWED_IMPORTS or []) or '(none)'} plus the standard library.")
+        msg = ("REJECTED by the evaluator: imports module(s) the container does not have: "
+               f"{', '.join(bad)}. Only the standard library, the project's own modules and the "
+               "modules listed in CONTAINER ENVIRONMENT (rescanned every round) are importable.")
         node["dependency_violations"] = bad
         node.setdefault("violations", []).append(msg[:300])
         node["test_pass_rate"] = 0.0
@@ -6865,16 +7153,9 @@ def main():
                 print("\n[CONTRACT] Apex offline; cannot synthesize a contract.", flush=True)
         allowed = None
         if ENFORCE_DEPENDENCIES:
-            allowed = probe_importable(target_directory, DEPENDENCY_CANDIDATES)
-            contract = (contract + "\n\n" if contract else "") + dependency_section(allowed)
-        facts = probe_api_facts(target_directory, DEPENDENCY_API_PROBE,
-                                allowed if allowed is not None
-                                else probe_importable(target_directory, DEPENDENCY_CANDIDATES))
-        facts_text = api_facts_section(facts)
-        if facts_text:
-            contract = (contract + "\n\n" if contract else "") + facts_text
-            print(f"[API FACTS] probed {', '.join(k for k, v in facts.items() if not v.get('error'))} "
-                  f"-> real members written into the contract ({len(facts_text):,} chars)", flush=True)
+            refresh_environment(target_directory, 0, focus_text=target_prompt + "\n" + contract)
+            allowed = list(_RUN_ENV.get("allowed", [])) or None
+            contract = (contract + "\n\n" if contract else "") + dependency_section()
         run_cmd, probe_cmd = "", ""
         interfaces_synth = False
         has_interfaces = any(h.startswith("INTERFACES") for h, _ in split_brief_sections(contract) if h)
@@ -6883,7 +7164,9 @@ def main():
             if apex_ok:
                 print("[CONTRACT] No INTERFACES section; the planner chooses one shared API "
                       "(labelled as planner-chosen)...", flush=True)
-                section, run_cmd, probe_cmd = synthesize_interfaces(target_prompt, contract, deliverables)
+                section, run_cmd, probe_cmd = synthesize_interfaces(
+                    target_prompt, contract + "\n\n" + _RUN_API_FACTS_TEXT + "\n\n"
+                    + fit_context(_RUN_ENV_TEXT, 4000), deliverables)
                 if section:
                     contract = contract + "\n\n" + section
                     interfaces_synth = True
@@ -6908,7 +7191,13 @@ def main():
     required_deliverables: Dict[str, str] = meta.get("deliverables") or {}
     _RUN_DELIVERABLES = list(required_deliverables)
     _RUN_CONTRACT_SYNTHESIZED = bool(meta.get("synthesized"))
-    _RUN_ALLOWED_IMPORTS = meta.get("allowed_imports") if ENFORCE_DEPENDENCIES else None
+    if ENFORCE_DEPENDENCIES and not _RUN_ENV:
+        # Resume, or the contract was built earlier: discover the container now.
+        refresh_environment(target_directory, max(0, len(completed_rounds(target_directory))),
+                            focus_text=(meta.get("brief") or "") + "\n" + (meta.get("contract") or ""),
+                            project=integration_dir_for(target_directory) / "latest")
+    if not ENFORCE_DEPENDENCIES:
+        _RUN_ALLOWED_IMPORTS = None
     _RUN_BRIEF = enforce_ascii(meta.get("brief") or target_prompt or "")
     _RUN_COMMAND = (validate_run_command(RUN_COMMAND, None) or meta.get("run_cmd")
                     or default_run_command(meta.get("deliverables") or {}))
@@ -6926,12 +7215,9 @@ def main():
         print(f"[DELIVERABLES] {len(required_deliverables)} required: "
               f"{', '.join(required_deliverables)}", flush=True)
     if _RUN_ALLOWED_IMPORTS is not None:
-        missing = [c for c in DEPENDENCY_CANDIDATES if c not in _RUN_ALLOWED_IMPORTS]
-        print(f"[DEPENDENCIES] allowed third-party imports: {', '.join(_RUN_ALLOWED_IMPORTS) or '(none)'}"
-              + (f" | not importable here: {', '.join(missing)}" if missing else "")
-              + " | any other third-party import rejects the attempt", flush=True)
-    elif ENFORCE_DEPENDENCIES:
-        print("[DEPENDENCIES] gate off: this run's brief meta predates the dependency probe.", flush=True)
+        print(f"[DEPENDENCIES] discovered, not configured: {len(_RUN_ALLOWED_IMPORTS)} importable module(s) "
+              f"in the container; rescanned {'every round' if ENV_RESCAN_EACH_ROUND else 'once'}; "
+              f"anything not installed rejects the attempt", flush=True)
     if meta.get("interfaces_synthesized"):
         print("[INTERFACES] planner-chosen API added to the contract (not from the prompt).", flush=True)
     if _RUN_COMMAND:
@@ -7043,6 +7329,11 @@ def main():
                 print(f"\n[!] Shutdown requested; stopping before round {rnd:02d}. "
                       "Re-run with -r to continue.", flush=True)
                 break
+            if ENFORCE_DEPENDENCIES and ENV_RESCAN_EACH_ROUND and \
+                    time.time() - _RUN_ENV.get("_ts", 0) > 60:
+                prev_proj = integration_dir_for(target_directory) / f"round{rnd - 1:02d}"
+                refresh_environment(target_directory, rnd, focus_text=_RUN_BRIEF + "\n" + _RUN_CONTRACT,
+                                    project=prev_proj if prev_proj.exists() else None)
 
             policy_source = (DEFAULT_POLICY_SOURCE if args.no_dream
                              else load_or_init_policy(target_directory, rnd))
