@@ -107,10 +107,10 @@ _TESTABLE_EXT_LANG = {
 #     going past it is rope extrapolation, not free context.
 #
 # TIER POLICY (post-stitcher-removal):
-#   * APEX (9931) runs non-worker, non-agent tasks only: Phase 1 generation,
+#   * APEX (9933) runs non-worker, non-agent tasks only: Phase 1 generation,
 #     Phase 2 distillation, Phase 3 decomposition (planning), Phase 6
 #     distillation. It is -np 1 and therefore strictly serial.
-#   * WORKERS (8030-8035) run every agent assignment, Phase 0 repo map-reduce
+#   * WORKERS (9931, 9932, ... - at least MIN_WORKER_ENDPOINTS) run every agent assignment, Phase 0 repo map-reduce
 #     and the evaluator's unit-test generation. The former stitcher nodes are
 #     folded into this pool.
 #   * There is NO stitcher tier. Consolidation is mechanical (filesystem walk +
@@ -121,11 +121,11 @@ _TESTABLE_EXT_LANG = {
 # SMALLEST node's value, or the larger nodes' budgets will over-subscribe it.
 # ==============================================================================
 
-# Apex / planning / generation / distillation node (port 9931): -c 65536 -np 1
+# Apex / planning / generation / distillation node (port 9933): -c 65536 -np 1
 APEX_SERVER_CTX = int(os.getenv("APEX_SERVER_CTX", "65536"))
 APEX_SERVER_NP = int(os.getenv("APEX_SERVER_NP", "1"))
 
-# Agent worker cluster (8030-8035): -np 2 --kv-unified each.
+# Agent worker cluster (9931, 9932, ...): -np 2 --kv-unified each.
 # Budget against the smallest -c in the pool.
 WORKER_SERVER_CTX = int(os.getenv("WORKER_SERVER_CTX", "196608"))
 WORKER_SERVER_NP = int(os.getenv("WORKER_SERVER_NP", "2"))
@@ -135,7 +135,7 @@ APEX_CONTEXT_TOKENS = max(4096, APEX_SERVER_CTX // max(1, APEX_SERVER_NP))
 WORKER_CONTEXT_TOKENS = max(4096, WORKER_SERVER_CTX // max(1, WORKER_SERVER_NP))
 
 # Phase 1: Raw Generation Config
-GEN_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:9931/v1")
+GEN_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:9933/v1")
 GEN_API_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.8-Flash-Next-UD-IQ4_XS")
 
@@ -167,7 +167,7 @@ MAX_CHUNK_CHARS = min(
 )
 
 # Phase 2: Distillation Config (apex tier)
-DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:9931/v1")
+DISTILLER_URL = os.getenv("DISTILLER_URL", "http://localhost:9933/v1")
 DISTILLER_MODEL = os.getenv("DISTILLER_MODEL", "Qwen3.8-Flash-Next-UD-IQ4_XS")
 DISTILLER_API_KEY = os.getenv("DISTILLER_API_KEY", "local-sk")
 
@@ -176,12 +176,15 @@ MAX_DECOMPOSE_TASKS = int(os.getenv("MAX_DECOMPOSE_TASKS", "20"))
 MAX_RETRIES = 3
 
 # Phase 3: Agent worker cluster
-WORKER_ENDPOINTS = [
-    ep.strip() for ep in os.getenv(
+WORKER_ENDPOINTS = list(dict.fromkeys(
+    ep.strip().rstrip("/") for ep in os.getenv(
         "WORKER_ENDPOINTS",
-        "http://localhost:9931/v1"
+        "http://localhost:9931/v1,http://localhost:9932/v1"
     ).split(",") if ep.strip()
-]
+))
+# The agent pool must have at least this many distinct endpoints (ports); the
+# pipeline refuses to start with fewer, configured or reachable.
+MIN_WORKER_ENDPOINTS = int(os.getenv("MIN_WORKER_ENDPOINTS", "2"))
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.8-9B-Q4_K_M.gguf")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "local-sk")
 
@@ -380,6 +383,10 @@ EVAL_DEP_REJECT_SCORE = float(os.getenv("EVAL_DEP_REJECT_SCORE", "0.0"))
 # An attempt whose own code branches on the negative-control flag to set a
 # metric (the HARDCODED pattern) is capped at this score when it is created.
 EVAL_SHORTCUT_CAP = float(os.getenv("EVAL_SHORTCUT_CAP", "0.2"))
+# An attempt that calls library members that do not exist is capped too.
+EVAL_MISUSE_CAP = float(os.getenv("EVAL_MISUSE_CAP", "0.3"))
+# Unit-test generation streams; no data for this long counts as a stall and is retried.
+TEST_STALL_SECS = int(os.getenv("TEST_STALL_SECS", "45"))
 # Packaging machinery is how abilities get installed, not an ability itself.
 _TOOLING_DISTS = {"pip", "setuptools", "wheel", "distribute", "pkg-resources", "pkg_resources"}
 # Library API facts are discovered too: modules the brief mentions and every
@@ -400,6 +407,10 @@ FREEZE_INTERFACES = os.getenv("FREEZE_INTERFACES", "1") == "1"
 # and the recorded trees) lets the write-up owner rewrite the .md deliverables
 # against that final output; the result replaces them in integration/latest/.
 FINAL_WRITEUP_REFRESH = os.getenv("FINAL_WRITEUP_REFRESH", "1") == "1"
+# Every attempt's integration also runs the RUN command (and the negative
+# control), so "does the experiment actually run and measure" is part of q and
+# credit, not only a once-per-round check.
+ENFORCE_RUN_IN_INTEGRATION = os.getenv("ENFORCE_RUN_IN_INTEGRATION", "1") == "1"
 # Sensitivity probe: a control command (planner-chosen, or PROBE_COMMAND) whose
 # change MUST move the reported metrics. Run after every successful grounding
 # run; identical numbers mean the metrics do not measure anything.
@@ -3554,6 +3565,9 @@ _POLICY_SAFE_BUILTIN_NAMES = [
     "sorted", "str", "sum", "tuple", "zip", "True", "False", "None", "Exception",
     "ValueError", "KeyError", "IndexError", "TypeError", "ZeroDivisionError",
     "ArithmeticError", "StopIteration", "isinstance", "frozenset",
+    # Pure, side-effect-free helpers that revisions keep reaching for.
+    "next", "iter", "slice", "hash", "ord", "chr", "repr", "format", "callable",
+    "NotImplementedError", "AttributeError", "RuntimeError", "LookupError",
 ]
 
 
@@ -4990,13 +5004,13 @@ def free_text_fields(out: str) -> List[str]:
 
 
 def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
-                      run_out: str) -> Optional[dict]:
+                      run_out: str, work: Optional[Path] = None) -> Optional[dict]:
     """Run the negative-control command and compare its numbers with the main
     run's. RESPONSIVE: something moved. INSENSITIVE: every reported number is
     identical under a change that must affect them."""
     if not _RUN_PROBE_COMMAND:
         return None
-    work = run_dir / "tests" / f"round{rnd:02d}" / "grounding_probe"
+    work = work or (run_dir / "tests" / f"round{rnd:02d}" / "grounding_probe")
     shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
     env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
@@ -5165,15 +5179,24 @@ if _path and _root != os.sep and hasattr(sys, "monitoring"):
             break
         except ValueError:
             pass
+    _ran = set()
+    def _start(code, offset):
+        fn = code.co_filename
+        if not fn.startswith("<"):
+            rp = os.path.realpath(fn)
+            if rp.startswith(_root):
+                _ran.add(os.path.relpath(rp, _root))
+        return _M.DISABLE   # one event per code object is enough
     if _tid is not None:
         _M.register_callback(_tid, _M.events.RAISE, lambda c, o, e: _rec("raise", c, e))
         _M.register_callback(_tid, _M.events.PY_UNWIND, lambda c, o, e: _rec("unwind", c, e))
-        _M.set_events(_tid, _M.events.RAISE | _M.events.PY_UNWIND)
+        _M.register_callback(_tid, _M.events.PY_START, _start)
+        _M.set_events(_tid, _M.events.RAISE | _M.events.PY_UNWIND | _M.events.PY_START)
         import atexit
         def _dump():
             try:
                 with open(_path, "w") as fh:
-                    json.dump(_ev, fh)
+                    json.dump({"raises": _ev, "executed": sorted(_ran)}, fh)
             except Exception:
                 pass
         atexit.register(_dump)
@@ -5201,9 +5224,10 @@ def exception_origins(log: Path) -> List[str]:
     (SystemExit excluded): 'ValueError: axes don't match array at simulator.py:37 in
     apply_gate; passed through experiment.py:88 -> runner.py:21'."""
     try:
-        ev = json.loads(read_file_content_safe(log) or "[]")
+        data = json.loads(read_file_content_safe(log) or "[]")
     except json.JSONDecodeError:
         return []
+    ev = data.get("raises", []) if isinstance(data, dict) else data
     order, by_exc = [], {}
     for kind, eid, fn, ln, func, etype, msg in ev:
         if etype in ("SystemExit", "StopIteration", "GeneratorExit", "KeyboardInterrupt"):
@@ -5223,6 +5247,25 @@ def exception_origins(log: Path) -> List[str]:
             line += "; passed through " + " -> ".join(f[0] for f in frames[1:6])
         out.append(line)
     return out
+
+
+def executed_files(log: Path) -> Optional[List[str]]:
+    """Project files whose code ran during the run (module top level counts),
+    or None if nothing was recorded (older Python, crash before exit)."""
+    try:
+        data = json.loads(read_file_content_safe(log) or "null")
+    except json.JSONDecodeError:
+        return None
+    return sorted(data.get("executed", [])) if isinstance(data, dict) else None
+
+
+def unexecuted_deliverables(executed: Optional[List[str]]) -> List[str]:
+    """Required non-test Python deliverables that never ran."""
+    if executed is None:
+        return []
+    ran = set(executed)
+    return [d for d in _RUN_DELIVERABLES
+            if d.endswith(".py") and not _is_test_file(PurePosixPath(d).name) and d not in ran]
 
 
 def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Optional[dict]:
@@ -5292,6 +5335,12 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         lines.append(f"files written: {', '.join(produced)}")
     lines += ["output (stdout - the only place results may come from):", tail or "(no output)", ""]
     origins = exception_origins(raise_log) if not ok or reported_errors else []
+    ran = executed_files(raise_log)
+    dead = unexecuted_deliverables(ran)
+    if dead:
+        lines += [f"NOT EXECUTED: required module(s) {', '.join(dead)} never ran during this run. They are "
+                  "part of the deliverables but play no part in the result; a write-up must not describe "
+                  "their output as if they contributed.", ""]
     if origins:
         lines += ["EXCEPTION ORIGIN (recorded by the pipeline inside the run, even if the code caught it):"]
         lines += [f"  {o}" for o in origins]
@@ -5334,7 +5383,7 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         f.write(text + "\n")
     res = {"round": rnd, "command": _RUN_COMMAND, "ok": ok, "rc": rc, "timed_out": to,
            "score": score, "reported_errors": reported_errors, "status": status,
-           "exception_origins": origins,
+           "exception_origins": origins, "not_executed": dead,
            "elapsed": round(elapsed, 2), "produced": produced, "probe": probe}
     with open(idir / f"round{rnd:02d}_run.json", "w", encoding="ascii") as f:
         json.dump(res, f, indent=2)
@@ -5349,6 +5398,8 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
             print(f"    [-] reported error: {m_err.group(1)}", flush=True)
     if origins:
         print(f"    [-] origin: {origins[-1][:200]}", flush=True)
+    if dead:
+        print(f"    [-] not executed by the run: {', '.join(dead)}", flush=True)
     if not ok and not reported_errors and rc != 0:
         err = _extract_error_line((err_text + "\n" + (out or "")).strip(), "python")
         if err:
@@ -5643,6 +5694,7 @@ def refresh_environment(run_dir: Path, rnd: int, focus_text: str = "",
     refs = project_library_refs(project, set(new["allowed"])) if project else {}
     focus = _mentioned_modules(new, focus_text) + [m for m in refs.get("modules", []) if m not in focus_text]
     _RUN_ENV = new
+    _SUBMODULE_CACHE.clear()
     _RUN_ENV_TEXT = render_environment(new, rnd, prev if prev else None, focus)
     if ENFORCE_DEPENDENCIES:
         _RUN_ALLOWED_IMPORTS = list(new["allowed"])
@@ -5814,6 +5866,20 @@ def describe(o):
     if callable(o):
         return {"kind": "function", "init": sig(o)}
     return {"kind": type(o).__name__}
+def doc_head(o):
+    # summary line plus the Args section: argument types are what callers get wrong
+    d = inspect.getdoc(o) or ""
+    lines = [l.strip() for l in d.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    head = [lines[0]]
+    if "Args:" in lines:
+        i = lines.index("Args:")
+        for l in lines[i:i + 8]:
+            if l.startswith(("Returns", "Raises", "Yields", "Example")):
+                break
+            head.append(l)
+    return " ".join(head)[:300]
 out = {}
 mods = {}
 def mod(name):
@@ -5852,6 +5918,9 @@ for modname, name in req["names"]:
             r["missing"].append(f"from {modname} import {name}")
         continue
     r["objects"][f"{modname}.{name}"] = describe(getattr(mo, name))
+    obj = getattr(mo, name)
+    if callable(obj) and not isinstance(obj, type):
+        r.setdefault("used", {})[f"{modname}.{name}"] = {"sig": sig(obj), "doc": doc_head(obj)}
 for modname, cls, attr, where in req.get("instances", []):
     root = modname.split(".")[0]
     r = out.setdefault(root, {"missing": [], "objects": {}})
@@ -5868,6 +5937,10 @@ for modname, cls, attr, where in req.get("instances", []):
         msg = f"{cls}.{attr} (instance of {modname}.{cls}; used at {where})"
         if msg not in r["missing"]:
             r["missing"].append(msg)
+    else:
+        m = getattr(C, attr)
+        r.setdefault("used", {})[f"{cls}.{attr}"] = {"sig": sig(m) if callable(m) else "",
+                                                     "doc": doc_head(m)}
 for chain in req["chains"]:
     root = chain[0]
     r = out.setdefault(root, {"missing": [], "objects": {}})
@@ -5939,6 +6012,11 @@ def _render_api_facts_level(facts: Dict[str, dict], level: int) -> str:
     if missing:
         lines.append("  DOES NOT EXIST (used by the current project - fix these first):")
         lines += [f"    - {x}" for x in missing[:40]]
+    used = [(k, v) for r in facts.values() for k, v in (r.get("used") or {}).items() if v.get("doc")]
+    if used and level >= 1:
+        lines.append("  MEMBERS THIS PROJECT CALLS (signature and what the library's docstring says):")
+        for k, v in sorted(used)[:30]:
+            lines.append(f"    {k}{v.get('sig', '')}: {v['doc'][:300 if level == 2 else 160]}")
     for m in sorted(facts):
         r = facts[m]
         if r.get("import_error"):
@@ -6034,13 +6112,73 @@ def disallowed_imports(node: dict, run_dir: Path) -> List[str]:
             local.add(p.name)
     allowed = set(_RUN_ALLOWED_IMPORTS) | _STDLIB_MODULES | local
     bad: Dict[str, str] = {}
+    dotted: Dict[str, str] = {}
     for p in sorted(ndir.rglob("*.py")):
         if not p.is_file() or p.is_symlink():
             continue
-        for mod in sorted(_imported_roots(read_file_content_safe(p) or "")):
+        src = read_file_content_safe(p) or ""
+        for mod in sorted(_imported_roots(src)):
             if mod not in allowed and mod not in bad:
                 bad[mod] = str(p.relative_to(ndir))
-    return [f"{m} ({f})" for m, f in bad.items()]
+        for full in _imported_dotted(src):
+            root = full.split(".")[0]
+            if root in set(_RUN_ALLOWED_IMPORTS) and root not in local and full not in dotted:
+                dotted[full] = str(p.relative_to(ndir))
+    out = [f"{m} ({f})" for m, f in bad.items()]
+    # An installed package does not mean every submodule path exists:
+    # qiskit is installed, qiskit.providers.aer is not (it moved to qiskit_aer).
+    for full in missing_submodules(run_dir, list(dotted)):
+        out.append(f"{full} (no such module in the installed {full.split('.')[0]}; {dotted[full]})")
+    return out
+
+
+_SUBMODULE_CACHE: Dict[str, bool] = {}
+_SUBMODULE_LOCK = threading.Lock()
+_FIND_SPEC_SRC = (
+    "import os, sys, json, importlib.util; os.environ.setdefault('QRACK_LIB_PATH', sys.argv[1]); out = {}\n"
+    "for n in json.loads(sys.argv[2]):\n"
+    "    try:\n"
+    "        out[n] = importlib.util.find_spec(n) is not None\n"
+    "    except Exception:\n"
+    "        out[n] = False\n"
+    "print(json.dumps(out))")
+
+
+def _imported_dotted(source: str) -> Set[str]:
+    """Dotted module paths a source imports (import a.b.c / from a.b import x)."""
+    try:
+        tree = _quiet_parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    out: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(a.name for a in node.names if "." in a.name)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module and "." in node.module:
+            out.add(node.module)
+    return out
+
+
+def missing_submodules(run_dir: Path, names: List[str]) -> List[str]:
+    """Dotted module paths that do not resolve in the evaluation interpreter.
+    Results are cached until the next environment scan."""
+    todo = [n for n in names if n not in _SUBMODULE_CACHE]
+    if todo:
+        with _SUBMODULE_LOCK:
+            todo = [n for n in todo if n not in _SUBMODULE_CACHE]
+            if todo:
+                py, venv_bin = ensure_test_venv(run_dir)
+                home = run_dir / "tests" / ".envscan"
+                home.mkdir(parents=True, exist_ok=True)
+                rc, out, to = _run_limited([py, "-c", _FIND_SPEC_SRC, QRACK_LIB_PATH, json.dumps(todo)],
+                                           120, home, _test_env(home, venv_bin))
+                try:
+                    res = json.loads((out or "").strip().splitlines()[-1]) if rc == 0 and not to else {}
+                except (json.JSONDecodeError, IndexError):
+                    res = {}
+                for n in todo:
+                    _SUBMODULE_CACHE[n] = bool(res.get(n, True))   # unknown -> do not reject
+    return [n for n in names if not _SUBMODULE_CACHE.get(n, True)]
 
 
 def _mentions(text: str, deliverable: str) -> Optional[int]:
@@ -7009,6 +7147,50 @@ def collect_node_artifacts(run_dir: Path, node: dict) -> List[dict]:
     return artifacts
 
 
+class _StreamStalled(Exception):
+    pass
+
+
+def _read_stream(response, t0: float) -> Tuple[str, dict, Optional[str], Optional[float]]:
+    """Read an OpenAI-style SSE stream: (text, usage, finish_reason, ttft).
+    Raises _StreamStalled when the stream exceeds TEST_TIMEOUT_SECS overall;
+    a gap longer than TEST_STALL_SECS surfaces as requests' ReadTimeout. A
+    server that ignores stream=True and answers with plain JSON is handled."""
+    ctype = response.headers.get("content-type", "")
+    if "text/event-stream" not in ctype:
+        body = response.json()
+        ch = body.get("choices") or []
+        return ((ch[0].get("message", {}).get("content", "") if ch else ""), body.get("usage") or {},
+                (ch[0].get("finish_reason") if ch else None), None)
+    text, usage, finish, ttft = [], {}, None, None
+    try:
+        for raw in response.iter_lines(decode_unicode=True):
+            if time.time() - t0 > TEST_TIMEOUT_SECS:
+                raise _StreamStalled(f"over {TEST_TIMEOUT_SECS}s in total")
+            if not raw or not raw.startswith("data:"):
+                continue
+            data = raw[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for ch in chunk.get("choices") or []:
+                piece = (ch.get("delta") or {}).get("content")
+                if piece:
+                    if ttft is None:
+                        ttft = time.time() - t0
+                    text.append(piece)
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+    finally:
+        response.close()
+    return "".join(text), usage, finish, ttft
+
+
 def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
     """One evaluator call on the worker slot the attempt already holds. Returns
     test SOURCE, or None."""
@@ -7037,6 +7219,9 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
         "temperature": LLM_TEMPERATURE, "top_p": LLM_TOP_P,
         "frequency_penalty": LLM_FREQUENCY_PENALTY, "presence_penalty": LLM_PRESENCE_PENALTY,
         "max_tokens": MAX_OUTPUT_TOKENS,
+        # Streamed so a stalled upstream is noticed within TEST_STALL_SECS
+        # instead of holding a slot for the whole request timeout.
+        "stream": True, "stream_options": {"include_usage": True},
     }
     headers = {"Authorization": f"Bearer {WORKER_API_KEY}"}
     for attempt in range(1, MAX_RETRIES + 1):
@@ -7045,7 +7230,8 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
         try:
             _strip_known_rejects(endpoint.rstrip("/"), payload)
             _t_call = time.time()
-            response = requests.post(url, json=payload, headers=headers, timeout=TEST_TIMEOUT_SECS)
+            response = requests.post(url, json=payload, headers=headers, stream=True,
+                                     timeout=(15, TEST_STALL_SECS))
             if response.status_code == 400:
                 text = response.text
                 try:
@@ -7060,19 +7246,29 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
                 print(f"    [*] retrying {endpoint}: {fix}", flush=True)
                 continue
             response.raise_for_status()
-            body = response.json()
-            choices = body.get("choices")
-            test_code = choices[0].get("message", {}).get("content", "") if choices else ""
-            usage = body.get("usage") or {}
+            test_code, usage, finish, ttft = _read_stream(response, _t_call)
             _LEDGER.add("unit-test generation", "agent",
                         usage.get("prompt_tokens") or estimate_tokens(_PROMPT_PHASE5_UNITTEST + prompt),
                         usage.get("completion_tokens") or estimate_tokens(test_code or ""),
-                        time.time() - _t_call, None, not usage, rnd=getattr(_TOKEN_CTX, "rnd", None),
-                        truncated=bool(choices and choices[0].get("finish_reason") == "length"))
+                        time.time() - _t_call, ttft, not usage, rnd=getattr(_TOKEN_CTX, "rnd", None),
+                        truncated=(finish == "length"))
             if test_code:
                 return enforce_ascii(_strip_markdown_fences(test_code))
-        except (requests.exceptions.RequestException, ValueError):
-            pass
+        except _StreamStalled as exc:
+            print(f"\n    [*] unit-test generation on {endpoint} stalled ({exc}); "
+                  f"retry {attempt}/{MAX_RETRIES}", flush=True)
+            _LEDGER.add("unit-test generation (stalled)", "agent", 0, 0, time.time() - _t_call,
+                        None, True, rnd=getattr(_TOKEN_CTX, "rnd", None), truncated=True)
+            continue
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            # A gap mid-stream surfaces as ConnectionError('Read timed out'), before
+            # the first byte as ReadTimeout: both are stalls, retried at once.
+            if isinstance(exc, requests.exceptions.ReadTimeout) or "timed out" in str(exc).lower():
+                print(f"\n    [*] unit-test generation on {endpoint}: no data for {TEST_STALL_SECS}s; "
+                      f"retry {attempt}/{MAX_RETRIES}", flush=True)
+                _LEDGER.add("unit-test generation (stalled)", "agent", 0, 0, time.time() - _t_call,
+                            None, True, rnd=getattr(_TOKEN_CTX, "rnd", None), truncated=True)
+                continue
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
     return None
@@ -7085,7 +7281,12 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
 # together. Integration assembles one flat project (agent directory prefixes
 # removed) and checks it as a whole. Weights apply to the groups that exist.
 _INTEGRATION_WEIGHTS = {"coverage": 0.20, "compile": 0.10, "import": 0.15, "pytest": 0.35,
-                        "command": 0.20}
+                        "command": 0.20, "run": 0.40}
+# Inside the 'run' group: does the project run, does its control respond, and
+# did every required module take part.
+RUN_GROUP_WEIGHTS = {"ok": 0.5, "control": 0.3, "executed": 0.2}
+_CONTROL_VALUE = {"RESPONSIVE": 1.0, "PROBE FAILED": 0.5, "UNCOMPARABLE": 0.5,
+                  "INSENSITIVE": 0.0, "SCORE-ONLY": 0.0, "HARDCODED": 0.0}
 _PYTEST_COUNT_RE = re.compile(r'(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed)\b')
 _CMD_SCORE_RE = re.compile(r'"score"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)')
 _COMPILE_SNIPPET = ("import sys\n"
@@ -7255,11 +7456,68 @@ def run_integration_checks(proj: Path, own: Optional[Set[str]], test_ctx: dict,
         else:
             details["command"] = []
 
+    if _RUN_COMMAND and not _RUN_INTEGRATION_CMD and ENFORCE_RUN_IN_INTEGRATION:
+        try:
+            rv = run_verdict(proj, test_ctx)
+        except Exception as exc:
+            rv = {"value": 0.0, "detail": [f"run check raised {str(exc)[:120]}"]}
+        groups["run"] = rv["value"]
+        details["run"] = rv["detail"]
+
     wsum = sum(_INTEGRATION_WEIGHTS[k] for k in groups)
     q = (sum(_INTEGRATION_WEIGHTS[k] * v for k, v in groups.items()) / wsum) if wsum else None
     return {"q": round(q, 4) if q is not None else None,
             "groups": {k: round(v, 4) for k, v in groups.items()},
             "details": details, "command_score": command_score}
+
+
+def run_verdict(proj: Path, test_ctx: dict) -> dict:
+    """The grounding criteria applied to one assembled project: RUN succeeds
+    (exit 0, score line, no reported error), the negative control responds by
+    measurement (static shortcut scan + SCORE-ONLY + INSENSITIVE), and every
+    required module executes. Run in private copies so parallel attempts and the
+    content-digest cache stay clean. value in [0, 1]."""
+    work = Path(tempfile.mkdtemp(prefix="runv_", dir=str(proj.parent)))
+    try:
+        shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home",
+                                                                              ".pytest_cache"))
+        env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
+        log = _raise_capture_env(env, work, work / "project")
+        errs: List[str] = []
+        rc, out, to = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
+                                   cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=errs)
+        err = errs[0] if errs else ""
+        m = _CMD_SCORE_RE.findall(out or "")
+        reported = run_output_errors(out or "") + (["a Python traceback"]
+                                                  if "a Python traceback" in run_output_errors(err) else [])
+        ok = rc == 0 and not to and bool(m) and not reported
+        dead = unexecuted_deliverables(executed_files(log))
+        n_req = len([d for d in _RUN_DELIVERABLES
+                     if d.endswith(".py") and not _is_test_file(PurePosixPath(d).name)])
+        executed = 1.0 - (len(dead) / n_req) if n_req else 1.0
+        detail = []
+        if not ok:
+            origins = exception_origins(log)
+            why = ("timed out" if to else f"exit {rc}" if rc != 0 else
+                   f"reported {reported[0]}" if reported else "no score line")
+            detail.append(f"RUN failed ({why})" + (f": {origins[-1][:160]}" if origins else ""))
+        control = 0.0
+        if ok and _RUN_PROBE_COMMAND:
+            probe = sensitivity_probe(proj, 0, test_ctx, work, out or "", work=work / "probe_work")
+            verdict = (probe or {}).get("verdict", "UNCOMPARABLE")
+            control = _CONTROL_VALUE.get(verdict, 0.5)
+            if verdict != "RESPONSIVE":
+                detail.append(f"control {verdict}: {(probe or {}).get('detail', '')[:160]}")
+        elif ok:
+            control = 1.0
+        if dead:
+            detail.append(f"not executed by RUN: {', '.join(dead)}")
+        value = (RUN_GROUP_WEIGHTS["ok"] * (1.0 if ok else 0.0) + RUN_GROUP_WEIGHTS["control"] * control
+                 + RUN_GROUP_WEIGHTS["executed"] * executed)
+        return {"value": round(value, 4), "ok": ok, "control": control, "executed": executed,
+                "detail": detail}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _project_digest(proj: Path, own: Set[str]) -> str:
@@ -7272,6 +7530,7 @@ def _project_digest(proj: Path, own: Set[str]) -> str:
             h.update(b"\0")
     h.update(json.dumps(sorted(own)).encode())
     h.update(_RUN_INTEGRATION_CMD.encode())
+    h.update((_RUN_COMMAND + "|" + _RUN_PROBE_COMMAND).encode())
     return h.hexdigest()
 
 
@@ -7442,17 +7701,19 @@ def library_misuse_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
                        + (f"; nearest real members: {', '.join(near)}" if near else ""))
     if not bad:
         return []
-    msg = "LIBRARY MISUSE: " + "; ".join(bad[:6])
+    msg = ("LIBRARY MISUSE: " + "; ".join(bad[:6])
+           + f". Score capped at {EVAL_MISUSE_CAP}: use only members listed in LIBRARY API FACTS.")
     node.setdefault("violations", []).append(msg[:300])
     node["library_misuse"] = bad
+    node["score"] = min(float(node.get("score", 0.0)), EVAL_MISUSE_CAP)
     lp = node.get("log_path")
     if lp and (run_dir / lp).exists():
         with open(run_dir / lp, "a", encoding="ascii") as fh:
             fh.write(f"\n## Evaluator\n\n{enforce_ascii(msg)}\n")
     append_event(run_dir, {"round": rnd, "node": node["id"], "agent": node.get("task"),
                            "event": "library_misuse", "items": bad[:10]})
-    print(f"\n    [-] {node['id']} ({node.get('task')}) calls missing library members: {bad[0][:120]}",
-          flush=True)
+    print(f"\n    [-] {node['id']} ({node.get('task')}) calls missing library members: {bad[0][:120]}"
+          f" -> score capped at {EVAL_MISUSE_CAP}", flush=True)
     return bad
 
 
@@ -8064,10 +8325,20 @@ def main():
     verify_server_props([GEN_API_BASE], "Apex", APEX_SERVER_CTX, APEX_SERVER_NP)
     verify_server_props(WORKER_ENDPOINTS, "Agent", WORKER_SERVER_CTX, WORKER_SERVER_NP)
 
+    if len(WORKER_ENDPOINTS) < MIN_WORKER_ENDPOINTS:
+        print(f"\n[!] Agent pool has {len(WORKER_ENDPOINTS)} endpoint(s) "
+              f"({', '.join(WORKER_ENDPOINTS) or 'none'}); at least {MIN_WORKER_ENDPOINTS} are required. "
+              f"Set WORKER_ENDPOINTS, e.g. http://localhost:9931/v1,http://localhost:9932/v1. Aborting.",
+              flush=True)
+        sys.exit(1)
+    if GEN_API_BASE.rstrip("/") in WORKER_ENDPOINTS:
+        print(f"    [!] WARNING: the apex endpoint {GEN_API_BASE} is also in the agent pool; apex work "
+              f"(-np {APEX_SERVER_NP}) will queue behind agent calls.", flush=True)
     apex_ok = ping_tier([GEN_API_BASE], LLM_MODEL, GEN_API_KEY, "Apex", timeout=90.0)
     worker_ok = ping_tier(WORKER_ENDPOINTS, WORKER_MODEL, WORKER_API_KEY, "Agent", timeout=90.0)
     if not worker_ok:
-        print("\n[!] Agent tier failed smoke tests. Aborting.", flush=True)
+        print(f"\n[!] Agent tier failed smoke tests: all {len(WORKER_ENDPOINTS)} agent endpoint(s) must "
+              f"answer (minimum {MIN_WORKER_ENDPOINTS}). Aborting.", flush=True)
         sys.exit(1)
 
     raw_filepath = None
@@ -8226,7 +8497,10 @@ def main():
     if EVAL_INTEGRATION:
         print(f"[INTEGRATION] ON: each attempt is checked inside a project of every sibling's best "
               f"deliverable (mix {EVAL_INTEGRATION_MIX:.2f})"
-              + (f"; command: {_RUN_INTEGRATION_CMD}" if _RUN_INTEGRATION_CMD else "; no command"),
+              + (f"; command: {_RUN_INTEGRATION_CMD}" if _RUN_INTEGRATION_CMD else
+                 (f"; run check per attempt: {_RUN_COMMAND} + control + executed modules (weight "
+                  f"{_INTEGRATION_WEIGHTS['run']})" if (_RUN_COMMAND and ENFORCE_RUN_IN_INTEGRATION)
+                  else "; no command")),
               flush=True)
 
     # ---------------- Phase 3: partition ----------------
