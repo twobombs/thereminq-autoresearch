@@ -377,6 +377,9 @@ ENFORCE_DEPENDENCIES = os.getenv("ENFORCE_DEPENDENCIES", "1") == "1"
 ENV_RESCAN_EACH_ROUND = os.getenv("ENV_RESCAN_EACH_ROUND", "1") == "1"
 ENV_SECTION_BUDGET = int(os.getenv("ENV_SECTION_BUDGET", "6000"))
 EVAL_DEP_REJECT_SCORE = float(os.getenv("EVAL_DEP_REJECT_SCORE", "0.0"))
+# An attempt whose own code branches on the negative-control flag to set a
+# metric (the HARDCODED pattern) is capped at this score when it is created.
+EVAL_SHORTCUT_CAP = float(os.getenv("EVAL_SHORTCUT_CAP", "0.2"))
 # Packaging machinery is how abilities get installed, not an ability itself.
 _TOOLING_DISTS = {"pip", "setuptools", "wheel", "distribute", "pkg-resources", "pkg_resources"}
 # Library API facts are discovered too: modules the brief mentions and every
@@ -2835,15 +2838,19 @@ class LiveExplorer(ExplorerBase):
                 if node["status"] in ("success", "partial"):
                     # Fixed evaluator, part of the same generation-evaluation
                     # request; runs on the slot this attempt already holds.
-                    if node.get("files") and dependency_gate(node, self.run_dir, self.rnd):
-                        pass
-                    elif ((EVAL_INLINE_TESTS or EVAL_INTEGRATION) and self.test_ctx is not None
-                            and node.get("files")):
+                    rejected = bool(node.get("files")) and dependency_gate(node, self.run_dir, self.rnd)
+                    if (not rejected and (EVAL_INLINE_TESTS or EVAL_INTEGRATION)
+                            and self.test_ctx is not None and node.get("files")):
                         try:
                             evaluate_node_inline(node, endpoint, self.run_dir, self.rnd,
                                                  self.test_ctx)
                         except Exception as exc:
                             print(f"\n    [!] {task} evaluation raised {str(exc)[:80]}", flush=True)
+                    if not rejected:
+                        try:
+                            shortcut_gate(node, self.run_dir, self.rnd)
+                        except Exception as exc:
+                            print(f"\n    [!] {task} shortcut scan raised {str(exc)[:80]}", flush=True)
                     break
             except Exception as exc:
                 print(f"\n    [!] {task} attempt {attempt} raised {str(exc)[:80]}", flush=True)
@@ -4441,14 +4448,46 @@ _PROMPT_INTERFACES_SYNTH = (
     "hypothesis being tested (e.g. deliberately corrupt the transmitted state, skip a required "
     "correction, use an orthogonal target). If the metrics do not move under PROBE, they measure "
     "nothing. The flag must appear in the entry module's interface. Same output format as RUN.\n"
-    "- KNOWN ANSWERS: for every metric the RUN output reports, one case with a known expected "
-    "value and one case with a DIFFERENT known expected value, stated from first principles "
-    "(e.g. ideal teleportation of |1> -> fidelity 1.0; orthogonal state -> 0.0). Never state the "
-    "outcome the experiment is meant to measure as a known answer.\n"
+    "- KNOWN ANSWERS: for every MEASURED quantity (not the summary score), one concrete input "
+    "with a known expected value and one with a DIFFERENT known expected value, stated from "
+    "first principles, as 'metric: <concrete input> -> <value>' (e.g. 'fidelity: ideal "
+    "teleportation of |1>, coupling 0 -> 1.0; orthogonal target state -> 0.0'). Never name the "
+    "score, the control flag or a run mode ('default', 'corrupted', 'control') in a known answer, "
+    "and never state the outcome the experiment is meant to measure. Lines that do are dropped.\n"
     "- Serve the user's request and the deliverables; do not add features."
 )
 
 _SHELL_META_RE = re.compile(r'[;&|`$<>\\]')
+
+_RUN_MODE_WORDS = re.compile(r'\b(control|probe|negative|default[_ ]?config|corrupted[_ ]?config|run mode|'
+                             r'mode|flag|baseline run)\b', re.I)
+
+
+def validate_known_answers(lines: List[str], probe_cmd: str) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Keep known answers that name a measured quantity on a concrete input.
+    Drop lines that prescribe the summary score, or key a value to the control
+    flag or a run mode - those turn 'known answers' into values to hardcode."""
+    idents, lits = _flag_tokens(probe_cmd)
+    # A line refers to the flag when it contains EVERY word of the flag name
+    # (corrupt-state -> 'corrupt' and 'state'); one shared word is not enough.
+    flag_sets = [[w for w in i.split("_") if w] for i in idents]
+    kept, dropped = [], []
+    for line in lines:
+        text = line.strip()
+        name = text.split(":", 1)[0].strip().strip("`").lower() if ":" in text else ""
+        low = text.lower()
+        if not name or "->" not in text and "=" not in text:
+            dropped.append((line, "no 'metric: input -> expected' form"))
+        elif name == "score" or _SUMMARY_KEY_RE.search(name):
+            dropped.append((line, "prescribes the summary score"))
+        elif any(l.lower() in low for l in lits) or any(
+                ws and all(re.search(r'(?<![a-z])' + re.escape(w), low) for w in ws) for ws in flag_sets):
+            dropped.append((line, "keyed to the control flag"))
+        elif _RUN_MODE_WORDS.search(text):
+            dropped.append((line, "keyed to a run mode, not an input"))
+        else:
+            kept.append(line)
+    return kept, dropped
 
 
 def synthesize_interfaces(prompt: str, contract: str,
@@ -4510,6 +4549,12 @@ def synthesize_interfaces(prompt: str, contract: str,
             if probe_cmd == run_cmd:
                 probe_cmd = ""
         effect = " ".join(l for l in probe_lines[1:] if l)[:300]
+        if effect:
+            effect = ("predicted effect (a DIRECTION to check, not a value to produce): "
+                      + re.sub(r'^\s*effect:\s*', '', effect, flags=re.I))
+        known, dropped = validate_known_answers(known, probe_cmd)
+        for line, why in dropped:
+            print(f"    [!] Dropped known answer ({why}): {line.strip()[:120]}", flush=True)
         section = ("INTERFACES (planner-chosen, not stated in the user's prompt)\n"
                    "  Binding so that modules written in parallel fit together.\n" + "\n".join(body))
         if run_cmd:
@@ -4526,7 +4571,14 @@ def synthesize_interfaces(prompt: str, contract: str,
                           "  a metric or score. The pipeline scans for that and for a score that moves alone.")
         if known:
             section += ("\n\nKNOWN ANSWERS (planner-chosen; the tests must check these)\n"
+                        "  Each is a measured quantity on a concrete input, computed by calling the measuring\n"
+                        "  function directly. None of them may be produced by branching on a flag or mode.\n"
                         + "\n".join(known[:20]))
+        elif dropped:
+            section += ("\n\nKNOWN ANSWERS\n"
+                        "  (none survived validation) Tests must still check each measured quantity against\n"
+                        "  cases whose answer follows from first principles, e.g. an ideal protocol on a\n"
+                        "  basis state, called directly with that input.")
         return enforce_ascii(section), run_cmd, probe_cmd
     return "", "", ""
 
@@ -4940,13 +4992,16 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
     shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
     env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
+    perrs: List[str] = []
     rc, out, to = _run_limited(_RUN_PROBE_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
-                               cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS))
+                               cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=perrs)
     ptail = (out or "").strip()
     base = {"command": _RUN_PROBE_COMMAND, "rc": rc, "timed_out": to,
             "output_tail": ptail if len(ptail) <= 2500 else "...[cut]...\n" + ptail[-2500:]}
+    perr = (perrs[0] if perrs else "")
     if to or rc != 0 or run_output_errors(out or ""):
-        tailline = (_extract_error_line(out or "", "python") or (out or "").strip()[-160:])
+        tailline = (_extract_error_line((perr + "\n" + (out or "")).strip(), "python")
+                    or (out or perr).strip()[-160:])
         return {**base, "verdict": "PROBE FAILED",
                 "detail": f"the control command did not run cleanly ({'timeout' if to else f'exit {rc}'}): "
                           f"{tailline[:200]} - the metrics' sensitivity is unverified."}
@@ -5086,8 +5141,10 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
     env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
     start = time.time()
+    errs: List[str] = []
     rc, out, to = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
-                               cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS))
+                               cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=errs)
+    err_text = (errs[0] if errs else "").strip()
     elapsed = time.time() - start
     m = _CMD_SCORE_RE.findall(out or "")
     score = None
@@ -5096,7 +5153,10 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
             score = float(m[-1])
         except ValueError:
             score = None
-    reported_errors = run_output_errors(out or "")
+    # A traceback printed to stderr counts even if the process exits 0.
+    reported_errors = run_output_errors(out or "") + [e for e in run_output_errors(err_text)
+                                                       if e == "a Python traceback"]
+    reported_errors = sorted(set(reported_errors), key=reported_errors.index)
     exited_ok = rc == 0 and not to
     # A run only counts if it exits 0, prints the contract's score line, and
     # reports no error. A runner that catches everything and exits 0 fails here.
@@ -5115,7 +5175,19 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     else:
         status = "FAILED (exit 0, but no \"score\": <number> line was printed)"
     probe = sensitivity_probe(proj, rnd, test_ctx, run_dir, out or "") if ok else None
-    tail = (out or "").strip()
+    # Libraries (PyQrack/OpenCL among them) also print to stdout; keep the JSON
+    # result lines apart from those messages.
+    so_lines = (out or "").strip().splitlines()
+    result_lines, other_lines, depth = [], [], 0
+    for l in so_lines:
+        st = l.strip()
+        if depth > 0 or st.startswith(("{", "[")):
+            result_lines.append(l)
+            depth += st.count("{") + st.count("[") - st.count("}") - st.count("]")
+            depth = max(depth, 0)
+        elif st:
+            other_lines.append(l)
+    tail = "\n".join(result_lines).strip() or (out or "").strip()
     if len(tail) > 6000:
         tail = "...[earlier output cut]...\n" + tail[-6000:]
     lines = [f"ACTUAL RUN OUTPUT (round {rnd:02d}; the pipeline ran the integrated project)",
@@ -5123,7 +5195,13 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
              f"score line found: {score if score is not None else 'none'}"]
     if produced:
         lines.append(f"files written: {', '.join(produced)}")
-    lines += ["output:", tail or "(no output)", ""]
+    lines += ["output (stdout - the only place results may come from):", tail or "(no output)", ""]
+    if other_lines and result_lines:
+        lines += ["other stdout lines (library messages, not results):",
+                  "\n".join(l.strip() for l in other_lines[-20:]), ""]
+    if err_text:
+        et = err_text if len(err_text) <= 2000 else "...[earlier stderr cut]...\n" + err_text[-2000:]
+        lines += ["stderr (library banners, warnings and logs - not results):", et, ""]
     if probe:
         lines.append(f"NEGATIVE CONTROL: {probe['command']} -> {probe['verdict']}")
         lines.append(f"  {probe['detail']}")
@@ -5169,7 +5247,7 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         if m_err:
             print(f"    [-] reported error: {m_err.group(1)}", flush=True)
     if not ok and not reported_errors and rc != 0:
-        err = _extract_error_line(out or "", "python")
+        err = _extract_error_line((err_text + "\n" + (out or "")).strip(), "python")
         if err:
             print(f"    [-] {err[:200]}", flush=True)
     return res
@@ -5227,6 +5305,108 @@ print(json.dumps({"python": platform.python_version(), "executable": sys.executa
 """
 
 
+_DEVICE_SCAN_SRC = r"""
+import os, sys, json, glob, shutil, subprocess
+out = {"dri": sorted(os.path.basename(p) for p in glob.glob("/dev/dri/*")),
+       "opencl": None, "opencl_source": None, "vulkan": None}
+try:
+    import pyopencl as cl
+    plats = []
+    for p in cl.get_platforms():
+        devs = []
+        for d in p.get_devices():
+            devs.append(f"{d.name.strip()} ({cl.device_type.to_string(d.type)}, "
+                        f"{d.global_mem_size // (1 << 20)} MiB)")
+        plats.append({"platform": p.name.strip(), "devices": devs})
+    out["opencl"], out["opencl_source"] = plats, "pyopencl"
+except ImportError:
+    pass
+except Exception as e:
+    out["opencl"], out["opencl_source"] = [], f"pyopencl: {type(e).__name__}: {str(e)[:160]}"
+def run(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+if out["opencl"] is None and shutil.which("clinfo"):
+    txt = run(["clinfo", "-l"])
+    plats, cur = [], None
+    for line in txt.splitlines():
+        s = line.strip()
+        if s.startswith("Platform #"):
+            cur = {"platform": s.split(":", 1)[-1].strip(), "devices": []}
+            plats.append(cur)
+        elif "Device #" in s and cur is not None:
+            cur["devices"].append(s.split(":", 1)[-1].strip())
+    out["opencl"], out["opencl_source"] = plats, "clinfo -l"
+if shutil.which("vulkaninfo"):
+    txt = run(["vulkaninfo", "--summary"])
+    names = [l.split("=", 1)[-1].strip() for l in txt.splitlines() if "deviceName" in l]
+    types = [l.split("=", 1)[-1].strip() for l in txt.splitlines() if "deviceType" in l]
+    out["vulkan"] = [f"{n} ({t})" for n, t in zip(names, types + [""] * len(names))] or []
+print(json.dumps(out))
+"""
+
+_PYQRACK_DEVICE_SRC = (
+    "import os, sys; os.environ.setdefault('QRACK_LIB_PATH', sys.argv[1]); "
+    "from pyqrack import QrackSimulator; s = QrackSimulator(qubit_count=1); s.h(0); print('QRACK_OK')")
+
+
+def scan_devices(run_dir: Path, py: str, venv_bin, home: Path, allowed: List[str]) -> Dict[str, Any]:
+    """Compute devices the workload can use: OpenCL platforms/devices (pyopencl
+    if installed, else clinfo), Vulkan devices (vulkaninfo), /dev/dri nodes, and
+    whether PyQrack finds an OpenCL device or falls back to CPU."""
+    env = _test_env(home, venv_bin)
+    rc, out, to = _run_limited([py, "-c", _DEVICE_SCAN_SRC], 90, home, env)
+    dev: Dict[str, Any] = {}
+    if rc == 0 and not to:
+        try:
+            dev = json.loads((out or "").strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            dev = {}
+    if "pyqrack" in allowed:
+        errs: List[str] = []
+        rc, out, to = _run_limited([py, "-c", _PYQRACK_DEVICE_SRC, QRACK_LIB_PATH], 90, home, env,
+                                   stderr_sink=errs)
+        text = ((out or "") + "\n" + (errs[0] if errs else "")).strip()
+        noise = [l.strip() for l in text.splitlines() if l.strip() and l.strip() != "QRACK_OK"][:4]
+        if to or rc != 0 or "QRACK_OK" not in (out or ""):
+            dev["pyqrack"] = "FAILS to create a simulator here" + (f" ({noise[-1][:120]})" if noise else "")
+        elif re.search(r'no devices found|check opencl', text, re.I):
+            dev["pyqrack"] = "no OpenCL device found - runs on CPU"
+        else:
+            dev["pyqrack"] = "created a simulator with no device error"
+        dev["pyqrack_messages"] = noise
+    return dev
+
+
+def render_devices(dev: Dict[str, Any]) -> List[str]:
+    if not dev:
+        return []
+    lines = ["  COMPUTE DEVICES (discovered):"]
+    ocl = dev.get("opencl")
+    if ocl is None:
+        lines.append("    OpenCL: not probed (no pyopencl and no clinfo in the container)")
+    elif not ocl or not any(p.get("devices") for p in ocl):
+        lines.append("    OpenCL: no device available" + (f" [{dev.get('opencl_source')}]"
+                                                            if dev.get("opencl_source") else ""))
+    else:
+        for p in ocl:
+            lines.append(f"    OpenCL platform {p['platform']}: " + (", ".join(p["devices"]) or "no devices"))
+    vk = dev.get("vulkan")
+    lines.append("    Vulkan: " + ("not probed (no vulkaninfo)" if vk is None else (", ".join(vk) or "no device")))
+    if dev.get("dri"):
+        lines.append("    /dev/dri: " + ", ".join(dev["dri"]))
+    if dev.get("pyqrack"):
+        lines.append(f"    PyQrack: {dev['pyqrack']}")
+        if dev.get("pyqrack_messages"):
+            lines.append("      its startup messages (stderr noise, not results): "
+                         + " | ".join(m[:80] for m in dev["pyqrack_messages"]))
+    lines.append("    Prefer OpenCL/Vulkan paths; do not target CUDA. Report the device actually used.")
+    return lines
+
+
 def scan_environment(run_dir: Path) -> Dict[str, Any]:
     """What the evaluation interpreter can import right now: every installed
     distribution (name, version, summary, import names) plus importable
@@ -5247,6 +5427,10 @@ def scan_environment(run_dir: Path) -> Dict[str, Any]:
                     if k not in _TOOLING_DISTS and v.get("imports")}
     env["allowed"] = sorted({m for v in env["dists"].values() for m in v["imports"]}
                             | set(env.get("loose", [])))
+    try:
+        env["devices"] = scan_devices(run_dir, py, venv_bin, home, env["allowed"])
+    except Exception as exc:
+        env["devices"] = {"error": str(exc)[:160]}
     env["scanned_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     env["_ts"] = time.time()
     return env
@@ -5260,6 +5444,9 @@ def env_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[str], List[
     upgraded = [f"{n[k]['name']} {o[k]['version']} -> {n[k]['version']}"
                 for k in sorted(set(n) & set(o)) if n[k]["version"] != o[k]["version"]]
     added += [f"{m} (module)" for m in sorted(set(new.get("loose", [])) - set(old.get("loose", [])))]
+    od, nd = render_devices(old.get("devices") or {}), render_devices(new.get("devices") or {})
+    if od and nd and od != nd:
+        upgraded.append("compute devices changed (see COMPUTE DEVICES)")
     removed += [f"{m} (module)" for m in sorted(set(old.get("loose", [])) - set(new.get("loose", [])))]
     return added, removed, upgraded
 
@@ -5302,6 +5489,7 @@ def render_environment(env: Dict[str, Any], rnd: int, prev: Optional[Dict[str, A
     if "pyqrack" in env.get("allowed", []):
         lines += ["  pyqrack is installed: every Python file that imports it must contain this line",
                   f'  verbatim and export it to os.environ before the import: QRACK_LIB_PATH = "{QRACK_LIB_PATH}"']
+    lines += render_devices(env.get("devices") or {})
     focus_set = set(focus)
     ordered = sorted(dists.values(), key=lambda v: (not (set(v["imports"]) & focus_set), v["name"].lower()))
     detail, rest = [], []
@@ -5360,8 +5548,14 @@ def refresh_environment(run_dir: Path, rnd: int, focus_text: str = "",
     if quiet:
         return
     added, removed, upgraded = env_diff(prev, new) if prev else ([], [], [])
+    dv = new.get("devices") or {}
+    ocl = dv.get("opencl")
+    ocl_n = sum(len(p.get("devices", [])) for p in ocl) if ocl else 0
     print(f"[ENV] round {rnd:02d} scan: Python {new.get('python')}, {len(new['dists'])} distribution(s), "
-          f"{len(new['allowed'])} importable module(s)"
+          f"{len(new['allowed'])} importable module(s) | OpenCL "
+          + ("not probed" if ocl is None else f"{ocl_n} device(s)")
+          + (f" | Vulkan {len(dv['vulkan'])} device(s)" if dv.get("vulkan") is not None else "")
+          + (f" | PyQrack: {dv['pyqrack']}" if dv.get("pyqrack") else "")
           + (f" | new: {', '.join(added[:6])}" if added else "")
           + (f" | removed: {', '.join(removed[:6])}" if removed else "")
           + (f" | changed: {', '.join(upgraded[:4])}" if upgraded else ""), flush=True)
@@ -6475,25 +6669,33 @@ def sanitize_requirements(text: str) -> Tuple[List[str], List[str]]:
 
 def _run_limited(cmd: List[str], timeout: float, cwd: Path, env: Dict[str, str],
                  cpu: int = TEST_CPU_SECS, mem_mb: int = TEST_MEM_MB,
-                 fsize_mb: int = TEST_FSIZE_MB) -> Tuple[Optional[int], str, bool]:
+                 fsize_mb: int = TEST_FSIZE_MB,
+                 stderr_sink: Optional[List[str]] = None) -> Tuple[Optional[int], str, bool]:
     """Run model-written code (or tooling acting on it) under CPU, address-space
     and file-size limits in its own process group; a timeout kills the whole
     group, not just the direct child. Returns (returncode, output, timed_out)."""
     wrapped = ["bash", "-c",
                'ulimit -t %d; ulimit -v %d; ulimit -f %d; ulimit -c 0; exec "$@"'
                % (cpu, mem_mb * 1024, fsize_mb * 1024), "limited"] + cmd
+    # With stderr_sink, stderr is kept apart (library banners, warnings, logs)
+    # and appended to the sink; otherwise it is merged into the output.
     proc = subprocess.Popen(wrapped, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE if stderr_sink is not None else subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL,
                             encoding="ascii", errors="ignore", start_new_session=True)
     try:
-        out, _ = proc.communicate(timeout=timeout)
+        out, err = proc.communicate(timeout=timeout)
+        if stderr_sink is not None:
+            stderr_sink.append(err or "")
         return proc.returncode, out or "", False
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:
             proc.kill()
-        out, _ = proc.communicate()
+        out, err = proc.communicate()
+        if stderr_sink is not None:
+            stderr_sink.append(err or "")
         return None, out or "", True
 
 
@@ -7015,6 +7217,37 @@ def integration_round_report(run_dir: Path, rnd: int, roster: List[dict],
             print(f"    [-] {group}: {line[:160]}", flush=True)
             shown += 1
     return report
+
+
+def shortcut_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
+    """Part of the fixed evaluator: scan this attempt's own files for code that
+    sets a metric from the negative-control flag. A hit is a violation and caps
+    the score, so gaming the control is a losing strategy, and the reason goes
+    into the attempt's log for whoever continues it."""
+    if not _RUN_PROBE_COMMAND or not node.get("files"):
+        return []
+    ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
+    if not ndir.exists():
+        return []
+    metric_keys = [k for k, _ in numeric_fingerprint(_RUN_LAST_RUN_TEXT)] if _RUN_LAST_RUN_TEXT else []
+    hits = hardcoded_control_branches(ndir, _RUN_PROBE_COMMAND, metric_keys)
+    if not hits:
+        return []
+    msg = ("SHORTCUT: sets a metric from the negative-control flag instead of measuring it ("
+           + "; ".join(hits[:4]) + f"). Score capped at {EVAL_SHORTCUT_CAP}. Make the flag change the "
+           "experiment's input or procedure and let the metric be measured.")
+    node.setdefault("violations", []).append(msg[:300])
+    node["shortcut_hits"] = hits
+    node["score"] = min(float(node.get("score", 0.0)), EVAL_SHORTCUT_CAP)
+    lp = node.get("log_path")
+    if lp and (run_dir / lp).exists():
+        with open(run_dir / lp, "a", encoding="ascii") as fh:
+            fh.write(f"\n## Evaluator\n\n{enforce_ascii(msg)}\n")
+    append_event(run_dir, {"round": rnd, "node": node["id"], "agent": node.get("task"),
+                           "event": "shortcut_penalty", "hits": hits})
+    print(f"\n    [-] {node['id']} ({node.get('task')}) shortcut: {hits[0]} -> score capped at "
+          f"{EVAL_SHORTCUT_CAP}", flush=True)
+    return hits
 
 
 def dependency_gate(node: dict, run_dir: Path, rnd: int) -> bool:
