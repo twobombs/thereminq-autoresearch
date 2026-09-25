@@ -2400,15 +2400,16 @@ def _node_view(n: dict) -> dict:
     return {
         "id": n.get("id"), "parent": n.get("parent"), "task": n.get("task"),
         "depth": n.get("depth", 0), "score": float(n.get("score", 0.0)),
-        "gain": n.get("gain"), "status": n.get("status"), "cost": n.get("cost", 1),
+        "gain": float(n.get("gain") or 0.0), "status": n.get("status"), "cost": int(n.get("cost") or 1),
         "files": list(n.get("files", [])),
         "diagnostics": {
             "violations": [str(v)[:160] for v in (n.get("violations") or [])[:5]],
             "truncated": bool(n.get("truncated", False)),
-            "emitted": n.get("emitted", 0), "inherited": n.get("inherited", 0),
-            "tests_passed": n.get("tests_passed"), "tests_total": n.get("test_count"),
+            "emitted": int(n.get("emitted") or 0), "inherited": int(n.get("inherited") or 0),
+            "tests_passed": int(n.get("tests_passed") or 0), "tests_total": int(n.get("test_count") or 0),
             "test_failures": [str(x)[:160] for x in (n.get("test_failures") or [])[:5]],
-            "integration_delta": n.get("integration_delta"),
+            "integration_delta": float(n.get("integration_delta") or 0.0),
+            "integration_delta_known": n.get("integration_delta") is not None,
         },
     }
 
@@ -3865,10 +3866,11 @@ def _policy_interface_doc(budget: int) -> str:
         "A node dict has: id, parent, task, depth, score (0..1, final evaluator score),\n"
         "  gain (score minus the parent attempt's score; None at depth 1), status, cost\n"
         "  (agent calls incl. retries), files, and diagnostics {violations, truncated,\n"
-        "  emitted, inherited, tests_passed, tests_total, test_failures, integration_delta}.\n"
-        "  integration_delta = project q with this attempt minus q with its task's previous best\n"
-        "  (None for a task's first attempt and for test-only attempts): > 0 means the\n"
-        "  attempt improved the whole project.\n"
+        "  emitted, inherited, tests_passed, tests_total, test_failures, integration_delta,\n"
+        "  integration_delta_known}.\n"
+        "  integration_delta (always a float) = project q with this attempt minus q with its\n"
+        "  task's previous best; > 0 means the attempt improved the whole project. It is 0.0 with\n"
+        "  integration_delta_known False for a task's first attempt and for test-only attempts.\n"
         "  A continuation starts from its parent's files and only changes what it improves.\n"
         "  A failed test or a truncated output is often repairable by continuing the leaf.\n"
         "\n"
