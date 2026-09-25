@@ -792,8 +792,28 @@ class TokenLedger:
         ttfts = [r["ttft"] for r in recs if r.get("ttft") is not None]
         p = sum(r["prompt"] for r in recs)
         c = sum(r["completion"] for r in recs)
+        secs = sum(r["secs"] for r in recs)
+        gen_secs = sum(max(0.0, r["secs"] - (r.get("ttft") or 0.0)) for r in recs)
+        # busy span: wall time during which at least one of these calls was running
+        spans = sorted((r["t"] - r["secs"], r["t"]) for r in recs)
+        busy, cur_s, cur_e = 0.0, None, None
+        for a, b in spans:
+            if cur_e is None or a > cur_e:
+                if cur_e is not None:
+                    busy += cur_e - cur_s
+                cur_s, cur_e = a, b
+            else:
+                cur_e = max(cur_e, b)
+        if cur_e is not None:
+            busy += cur_e - cur_s
         return {"calls": len(recs), "prompt": p, "completion": c, "total": p + c,
-                "secs": sum(r["secs"] for r in recs),
+                "secs": secs, "busy_secs": busy,
+                # completion tokens per second of generation, weighted by tokens
+                "avg_gen_tps": round(c / gen_secs, 2) if gen_secs > 0.05 else None,
+                # all tokens (in + out) per second of call time
+                "avg_total_tps": round((p + c) / secs, 2) if secs > 0.05 else None,
+                # completion tokens per second of wall time with calls in flight (parallelism included)
+                "throughput_tps": round(c / busy, 2) if busy > 0.05 else None,
                 "median_tps": tps[len(tps) // 2] if tps else None,
                 "mean_ttft": (sum(ttfts) / len(ttfts)) if ttfts else None,
                 "estimated": sum(1 for r in recs if r.get("estimated")),
@@ -809,6 +829,7 @@ class TokenLedger:
 
 _LEDGER = TokenLedger()
 _CURRENT_ROUND: Optional[int] = None     # set by the round loop; tags calls made during it
+_RUN_RUNTIME_SECS: Optional[float] = None  # wall-clock runtime of this invocation, set at the end
 
 
 def _fmt_tok(n: Optional[float]) -> str:
@@ -896,15 +917,34 @@ def print_round_tokens(rnd: int) -> None:
 
 def token_summary_markdown() -> str:
     allt = _LEDGER.totals()
+    rt = _RUN_RUNTIME_SECS
     lines = ["# Token usage", "",
-             f"{allt['calls']} model call(s): {allt['prompt']:,} prompt + {allt['completion']:,} completion "
-             f"= {allt['total']:,} tokens over {_fmt_secs(allt['secs'])} of call time."
-             + (f" {allt['estimated']} call(s) had no server usage and were estimated from characters "
-                f"({CHARS_PER_TOKEN} chars/token)." if allt["estimated"] else ""), "",
+             "## Totals", "",
+             "| measure | value |", "|---|---:|",
+             f"| model calls | {allt['calls']:,} |",
+             f"| prompt tokens | {allt['prompt']:,} |",
+             f"| completion tokens | {allt['completion']:,} |",
+             f"| total tokens | {allt['total']:,} |",
+             f"| pipeline runtime (wall clock, this invocation) | "
+             f"{_fmt_secs(rt) + ' (' + format(rt, ',.0f') + ' s)' if rt else '-'} |",
+             f"| time with model calls in flight | {_fmt_secs(allt['busy_secs'])} |",
+             f"| summed call time (parallel calls counted separately) | {_fmt_secs(allt['secs'])} |",
+             f"| average generation rate (completion tok / generation time, token-weighted) | "
+             f"{allt['avg_gen_tps'] or '-'} tok/s |",
+             f"| median generation rate per call | {allt['median_tps'] or '-'} tok/s |",
+             f"| average total rate (prompt + completion tok / call time) | {allt['avg_total_tps'] or '-'} tok/s |",
+             f"| throughput (completion tok / time with calls in flight) | {allt['throughput_tps'] or '-'} tok/s |",
+             f"| throughput over the whole runtime | "
+             f"{round(allt['completion'] / rt, 2) if rt else '-'} tok/s out, "
+             f"{round(allt['total'] / rt, 2) if rt else '-'} tok/s in+out |",
+             "",
+             (f"{allt['estimated']} call(s) had no server usage and were estimated from characters "
+              f"({CHARS_PER_TOKEN} chars/token)." if allt["estimated"] else "All counts are server-reported."),
+             "",
              "## By category", "",
              "| category | tier | calls | prompt | completion | total | share | per call | out/in "
-             "| median gen tok/s | mean ttft | est. | cut off |",
-             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "| avg gen tok/s | median gen tok/s | call time | mean ttft | est. | cut off |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     cats: Dict[str, List[dict]] = {}
     for r in _LEDGER.select():
         cats.setdefault(r["category"], []).append(r)
@@ -915,18 +955,26 @@ def token_summary_markdown() -> str:
         ratio = t["completion"] / max(1, t["prompt"])
         lines.append(f"| {cat} | {tiers} | {t['calls']} | {t['prompt']:,} | {t['completion']:,} | "
                      f"{t['total']:,} | {share:.1f}% | {_fmt_tok(t['total'] / max(1, t['calls']))} | "
-                     f"{ratio:.2f} | {t['median_tps'] or '-'} | "
+                     f"{ratio:.2f} | {t['avg_gen_tps'] or '-'} | {t['median_tps'] or '-'} | "
+                     f"{_fmt_secs(t['secs'])} | "
                      f"{'-' if t['mean_ttft'] is None else str(round(t['mean_ttft'], 1)) + 's'} | "
                      f"{t['estimated']} | {t['truncated']} |")
-    lines += ["", "## By tier", "", "| tier | calls | prompt | completion | median gen tok/s | mean ttft |",
-              "|---|---:|---:|---:|---:|---:|"]
+    lines += ["", "## By tier", "",
+              "| tier | calls | prompt | completion | avg gen tok/s | median gen tok/s | throughput tok/s "
+              "| in flight | mean ttft |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for tier, t in sorted(_LEDGER.by("tier").items()):
         lines.append(f"| {tier} | {t['calls']} | {t['prompt']:,} | {t['completion']:,} | "
-                     f"{t['median_tps'] or '-'} | {'-' if t['mean_ttft'] is None else round(t['mean_ttft'], 1)} |")
-    lines += ["", "## By round", "", "| round | calls | prompt | completion | total |", "|---|---:|---:|---:|---:|"]
+                     f"{t['avg_gen_tps'] or '-'} | {t['median_tps'] or '-'} | {t['throughput_tps'] or '-'} | "
+                     f"{_fmt_secs(t['busy_secs'])} | "
+                     f"{'-' if t['mean_ttft'] is None else round(t['mean_ttft'], 1)} |")
+    lines += ["", "## By round", "",
+              "| round | calls | prompt | completion | total | in flight | avg gen tok/s | throughput tok/s |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for rnd, t in sorted(_LEDGER.by("round").items(), key=lambda kv: (kv[0] == "None", kv[0])):
         lines.append(f"| {'setup / final' if rnd == 'None' else rnd} | {t['calls']} | {t['prompt']:,} | "
-                     f"{t['completion']:,} | {t['total']:,} |")
+                     f"{t['completion']:,} | {t['total']:,} | {_fmt_secs(t['busy_secs'])} | "
+                     f"{t['avg_gen_tps'] or '-'} | {t['throughput_tps'] or '-'} |")
     notes = []
     top = max(cats, key=lambda c: sum(r["prompt"] + r["completion"] for r in cats[c])) if cats else None
     if top:
@@ -940,6 +988,12 @@ def token_summary_markdown() -> str:
             notes.append(f"{ag['truncated']} agent attempt(s) hit the output cap or wall clock.")
     if allt["estimated"]:
         notes.append("Estimated rows depend on CHARS_PER_TOKEN; enable usage reporting on the server for exact counts.")
+    tt = [r["ttft"] for r in _LEDGER.select() if r.get("ttft") is not None]
+    if tt and sorted(tt)[len(tt) // 2] < 0.02:
+        notes.append("Median time to first token is under 20 ms: the endpoint (e.g. a gateway) sends its first "
+                     "chunk before generating, so ttft is not meaningful and generation rates include prefill.")
+    notes.append("avg gen tok/s is token-weighted (total completion tokens / total generation time); median is "
+                 "per call. Throughput divides by wall time with calls in flight, so parallel slots count.")
     if notes:
         lines += ["", "## Notes", ""] + [f"- {n}" for n in notes]
     return "\n".join(lines) + "\n"
@@ -947,14 +1001,26 @@ def token_summary_markdown() -> str:
 
 def print_token_summary() -> None:
     allt = _LEDGER.totals()
+    rt = _RUN_RUNTIME_SECS
     print(f"\n[TOKENS] RUN SUMMARY: {allt['calls']} call(s), {allt['total']:,} tokens "
           f"(in {allt['prompt']:,} / out {allt['completion']:,})", flush=True)
+    print(f"    runtime {_fmt_secs(rt) if rt else '-'} wall clock, model calls in flight "
+          f"{_fmt_secs(allt['busy_secs'])} ({_fmt_secs(allt['secs'])} summed over parallel calls)", flush=True)
+    print(f"    average gen {allt['avg_gen_tps'] or '-'} tok/s (token-weighted), median {allt['median_tps'] or '-'} "
+          f"tok/s per call, throughput {allt['throughput_tps'] or '-'} tok/s out while busy"
+          + (f", {allt['completion'] / rt:.1f} tok/s out / {allt['total'] / rt:.1f} tok/s in+out over the runtime"
+             if rt else ""), flush=True)
     cats = _LEDGER.by("category")
     width = max([len(c) for c in cats] + [8])
-    print(f"    {'category':<{width}}  {'calls':>5}  {'in':>8}  {'out':>8}  {'share':>6}  {'tok/s':>6}", flush=True)
+    print(f"    {'category':<{width}}  {'calls':>5}  {'in':>8}  {'out':>8}  {'share':>6}  {'avg t/s':>8}  "
+          f"{'time':>7}", flush=True)
     for cat, t in sorted(cats.items(), key=lambda kv: -kv[1]["total"]):
         print(f"    {cat:<{width}}  {t['calls']:>5}  {_fmt_tok(t['prompt']):>8}  {_fmt_tok(t['completion']):>8}  "
-              f"{100.0 * t['total'] / max(1, allt['total']):>5.1f}%  {str(t['median_tps'] or '-'):>6}", flush=True)
+              f"{100.0 * t['total'] / max(1, allt['total']):>5.1f}%  {str(t['avg_gen_tps'] or '-'):>8}  "
+              f"{_fmt_secs(t['secs']):>7}", flush=True)
+    print(f"    {'TOTAL':<{width}}  {allt['calls']:>5}  {_fmt_tok(allt['prompt']):>8}  "
+          f"{_fmt_tok(allt['completion']):>8}  {'100.0%':>6}  {str(allt['avg_gen_tps'] or '-'):>8}  "
+          f"{_fmt_secs(allt['secs']):>7}", flush=True)
 
 
 def fit_context(text: str, budget: int,
@@ -7712,13 +7778,16 @@ def main():
         run_phase6_project_distillation(target_directory, iterate=args.iterate)
 
     # ---------------- Token summary (after everything, phase 6 included) ----------------
+    global _RUN_RUNTIME_SECS
+    _RUN_RUNTIME_SECS = time.time() - master_start_time
     if _LEDGER.records:
         print_token_summary()
         summary_md = token_summary_markdown()
         with open(target_directory / "TOKENS.md", "w", encoding="ascii") as f:
             f.write(summary_md)
         with open(target_directory / "tokens_summary.json", "w", encoding="ascii") as f:
-            json.dump({"totals": _LEDGER.totals(), "by_category": _LEDGER.by("category"),
+            json.dump({"runtime_secs": round(_RUN_RUNTIME_SECS, 1), "totals": _LEDGER.totals(),
+                       "by_category": _LEDGER.by("category"),
                        "by_tier": _LEDGER.by("tier"), "by_round": _LEDGER.by("round")}, f, indent=2)
         with open(manifest_path, "a", encoding="ascii") as f:
             f.write("\n\n" + summary_md.replace("# Token usage", "## Token usage", 1))
