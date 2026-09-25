@@ -692,6 +692,271 @@ def estimate_tokens(text: str) -> int:
     return int(len(str(text)) / CHARS_PER_TOKEN)
 
 
+# ------------------------------------------------------------------
+# Token ledger: every model call is recorded (category, tier, prompt and
+# completion tokens, wall time, time to first token, generation rate).
+# Usage comes from the server when it reports it; otherwise it is estimated
+# from characters (CHARS_PER_TOKEN) and marked as such. Persisted to
+# tokens.jsonl so a resumed run's summary covers the whole run.
+# ------------------------------------------------------------------
+_TOKEN_CTX = threading.local()
+
+# Apex calls are categorised by the function that makes them.
+_CATEGORY_BY_CALLER = {
+    "generate_content": "draft (phase 1)",
+    "distill_document": "distil (phase 2)",
+    "synthesize_contract": "contract synthesis",
+    "synthesize_interfaces": "interface synthesis",
+    "decompose_to_atomic_pieces": "partition",
+    "dream_policy_improvement": "dream revisions",
+    "final_skeptic_review": "skeptic review",
+    "run_phase6_project_distillation": "project distillation (phase 6)",
+}
+
+
+class token_category:
+    """with token_category("write-up refresh"): ... - overrides the category of
+    calls made on this thread inside the block."""
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.prev = getattr(_TOKEN_CTX, "cat", None)
+        _TOKEN_CTX.cat = self.name
+        return self
+
+    def __exit__(self, *exc):
+        _TOKEN_CTX.cat = self.prev
+        return False
+
+
+def _caller_category(default: str) -> str:
+    cat = getattr(_TOKEN_CTX, "cat", None)
+    if cat:
+        return cat
+    f = sys._getframe(2)
+    for _ in range(4):
+        if f is None:
+            break
+        name = f.f_code.co_name
+        if name in _CATEGORY_BY_CALLER:
+            return _CATEGORY_BY_CALLER[name]
+        f = f.f_back
+    return default
+
+
+class TokenLedger:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.records: List[dict] = []
+        self.path: Optional[Path] = None
+        self.session = time.strftime("%Y%m%d_%H%M%S")
+
+    def bind(self, run_dir: Path) -> None:
+        self.path = run_dir / "tokens.jsonl"
+        if self.path.exists():
+            for line in (read_file_content_safe(self.path) or "").splitlines():
+                try:
+                    self.records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    def add(self, category: str, tier: str, prompt_tokens: int, completion_tokens: int,
+            secs: float, ttft: Optional[float] = None, estimated: bool = False,
+            rnd: Optional[int] = None, truncated: bool = False) -> dict:
+        if rnd is None:
+            rnd = _CURRENT_ROUND
+        gen_secs = (secs - ttft) if (ttft is not None and secs > ttft) else secs
+        rec = {"t": round(time.time(), 2), "session": self.session, "category": category, "tier": tier,
+               "round": rnd, "prompt": int(prompt_tokens or 0), "completion": int(completion_tokens or 0),
+               "secs": round(secs, 3), "ttft": None if ttft is None else round(ttft, 3),
+               "gen_tps": round((completion_tokens or 0) / gen_secs, 2) if gen_secs > 0.05 else None,
+               "estimated": bool(estimated), "truncated": bool(truncated)}
+        with self.lock:
+            self.records.append(rec)
+            if self.path is not None:
+                try:
+                    with open(self.path, "a", encoding="ascii") as f:
+                        f.write(json.dumps(rec) + "\n")
+                except OSError:
+                    pass
+        return rec
+
+    def select(self, **match) -> List[dict]:
+        with self.lock:
+            return [r for r in self.records if all(r.get(k) == v for k, v in match.items())]
+
+    def totals(self, recs: Optional[List[dict]] = None) -> dict:
+        recs = self.select() if recs is None else recs
+        tps = sorted(r["gen_tps"] for r in recs if r.get("gen_tps"))
+        ttfts = [r["ttft"] for r in recs if r.get("ttft") is not None]
+        p = sum(r["prompt"] for r in recs)
+        c = sum(r["completion"] for r in recs)
+        return {"calls": len(recs), "prompt": p, "completion": c, "total": p + c,
+                "secs": sum(r["secs"] for r in recs),
+                "median_tps": tps[len(tps) // 2] if tps else None,
+                "mean_ttft": (sum(ttfts) / len(ttfts)) if ttfts else None,
+                "estimated": sum(1 for r in recs if r.get("estimated")),
+                "truncated": sum(1 for r in recs if r.get("truncated"))}
+
+    def by(self, key: str, recs: Optional[List[dict]] = None) -> Dict[str, dict]:
+        recs = self.select() if recs is None else recs
+        groups: Dict[str, List[dict]] = {}
+        for r in recs:
+            groups.setdefault(str(r.get(key)), []).append(r)
+        return {k: self.totals(v) for k, v in groups.items()}
+
+
+_LEDGER = TokenLedger()
+_CURRENT_ROUND: Optional[int] = None     # set by the round loop; tags calls made during it
+
+
+def _fmt_tok(n: Optional[float]) -> str:
+    if n is None:
+        return "-"
+    n = float(n)
+    return f"{n / 1e6:.2f}M" if n >= 1e6 else (f"{n / 1e3:.1f}k" if n >= 1e3 else f"{n:.0f}")
+
+
+def _fmt_secs(x: float) -> str:
+    return f"{x / 3600:.1f}h" if x >= 3600 else (f"{x / 60:.1f}min" if x >= 90 else f"{x:.0f}s")
+
+
+def estimate_remaining_tokens(rounds_left: int, calls_per_round: int, n_tasks: int,
+                              include_final: bool = True) -> dict:
+    """Projection for the rest of the run: expected calls per category times the
+    mean tokens per call measured so far (a prior from the configured budgets
+    where nothing has been measured yet), and wall time at the measured rate."""
+    def per_call(cat: str, prior_p: float, prior_c: float) -> Tuple[float, float, bool]:
+        recs = _LEDGER.select(category=cat)
+        if recs:
+            return (sum(r["prompt"] for r in recs) / len(recs),
+                    sum(r["completion"] for r in recs) / len(recs), True)
+        return prior_p, prior_c, False
+    cpt = CHARS_PER_TOKEN
+    plan = [
+        ("agent attempts", rounds_left * calls_per_round,
+         0.55 * WORKER_INPUT_CHARS / cpt, 0.5 * MAX_WORKER_TOKENS),
+        ("unit-test generation", rounds_left * calls_per_round,
+         (TEST_CONTRACT_BUDGET + 9000) / cpt, 0.5 * MAX_OUTPUT_TOKENS),
+        ("dream revisions", rounds_left * DREAM_CANDIDATES,
+         0.5 * MAX_CONTEXT_CHARS / cpt, 0.6 * APEX_PLAN_TOKENS),
+    ]
+    if include_final:
+        plan += [("skeptic review", 1, (REVIEW_CODE_CHARS + 16000) / cpt, 0.4 * APEX_PLAN_TOKENS),
+                 ("write-up refresh", 1, 0.55 * WORKER_INPUT_CHARS / cpt, 0.4 * MAX_WORKER_TOKENS),
+                 ("project distillation (phase 6)", 1, 0.5 * MAX_CONTEXT_CHARS / cpt, 0.5 * APEX_PLAN_TOKENS)]
+    rows, tot_p, tot_c, measured_all = [], 0.0, 0.0, True
+    for cat, calls, pp, pc in plan:
+        mp, mc, measured = per_call(cat, pp, pc)
+        measured_all &= measured or calls == 0
+        rows.append({"category": cat, "calls": calls, "prompt": mp * calls, "completion": mc * calls,
+                     "measured": measured})
+        tot_p += mp * calls
+        tot_c += mc * calls
+    agent_tps = _LEDGER.totals(_LEDGER.select(tier="agent"))["median_tps"]
+    apex_tps = _LEDGER.totals(_LEDGER.select(tier="apex"))["median_tps"]
+    agent_par = max(1, min(MAX_PARALLELISM, len(WORKER_ENDPOINTS) * WORKER_PARALLEL_SLOTS))
+    secs = 0.0
+    for r in rows:
+        on_apex = r["category"] in ("dream revisions", "skeptic review", "project distillation (phase 6)")
+        tier_tps = apex_tps if on_apex else agent_tps
+        if tier_tps:
+            secs += r["completion"] / tier_tps / (1 if on_apex else agent_par)
+    return {"rows": rows, "prompt": tot_p, "completion": tot_c, "total": tot_p + tot_c,
+            "gen_secs": secs if (agent_tps or apex_tps) else None, "all_measured": measured_all}
+
+
+def print_token_estimate(label: str, est: dict) -> None:
+    parts = ", ".join(f"{r['category']} {r['calls']}x~{_fmt_tok((r['prompt'] + r['completion']) / max(1, r['calls']))}"
+                      for r in est["rows"] if r["calls"])
+    t = est.get("gen_secs")
+    print(f"[TOKENS] {label}: ~{_fmt_tok(est['total'])} tok (in ~{_fmt_tok(est['prompt'])}, "
+          f"out ~{_fmt_tok(est['completion'])})"
+          + (f", ~{_fmt_secs(t)} of generation at measured rates" if t else "")
+          + (" [priors from configured budgets until measured]" if not est["all_measured"] else ""),
+          flush=True)
+    if parts:
+        print(f"    {parts}", flush=True)
+
+
+def print_round_tokens(rnd: int) -> None:
+    rt = _LEDGER.totals(_LEDGER.select(round=rnd))
+    ag = _LEDGER.totals(_LEDGER.select(round=rnd, tier="agent"))
+    allt = _LEDGER.totals()
+    ar = _LEDGER.select(round=rnd, tier="agent")
+    span = (max(r["t"] for r in ar) - min(r["t"] - r["secs"] for r in ar)) if ar else 0
+    agg = (ag["completion"] / span) if span > 1 else None
+    print(f"[TOKENS] round {rnd:02d}: {rt['calls']} call(s), in {_fmt_tok(rt['prompt'])}, "
+          f"out {_fmt_tok(rt['completion'])} | agent gen {ag['median_tps'] or '-'} tok/s median per stream"
+          + (f", {agg:.1f} tok/s aggregate over {_fmt_secs(span)}" if agg else "")
+          + (f", ttft {ag['mean_ttft']:.1f}s" if ag["mean_ttft"] is not None else "")
+          + f" | run so far {_fmt_tok(allt['total'])}", flush=True)
+
+
+def token_summary_markdown() -> str:
+    allt = _LEDGER.totals()
+    lines = ["# Token usage", "",
+             f"{allt['calls']} model call(s): {allt['prompt']:,} prompt + {allt['completion']:,} completion "
+             f"= {allt['total']:,} tokens over {_fmt_secs(allt['secs'])} of call time."
+             + (f" {allt['estimated']} call(s) had no server usage and were estimated from characters "
+                f"({CHARS_PER_TOKEN} chars/token)." if allt["estimated"] else ""), "",
+             "## By category", "",
+             "| category | tier | calls | prompt | completion | total | share | per call | out/in "
+             "| median gen tok/s | mean ttft | est. | cut off |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    cats: Dict[str, List[dict]] = {}
+    for r in _LEDGER.select():
+        cats.setdefault(r["category"], []).append(r)
+    for cat, recs in sorted(cats.items(), key=lambda kv: -sum(r["prompt"] + r["completion"] for r in kv[1])):
+        t = _LEDGER.totals(recs)
+        tiers = "/".join(sorted({r["tier"] for r in recs}))
+        share = 100.0 * t["total"] / max(1, allt["total"])
+        ratio = t["completion"] / max(1, t["prompt"])
+        lines.append(f"| {cat} | {tiers} | {t['calls']} | {t['prompt']:,} | {t['completion']:,} | "
+                     f"{t['total']:,} | {share:.1f}% | {_fmt_tok(t['total'] / max(1, t['calls']))} | "
+                     f"{ratio:.2f} | {t['median_tps'] or '-'} | "
+                     f"{'-' if t['mean_ttft'] is None else str(round(t['mean_ttft'], 1)) + 's'} | "
+                     f"{t['estimated']} | {t['truncated']} |")
+    lines += ["", "## By tier", "", "| tier | calls | prompt | completion | median gen tok/s | mean ttft |",
+              "|---|---:|---:|---:|---:|---:|"]
+    for tier, t in sorted(_LEDGER.by("tier").items()):
+        lines.append(f"| {tier} | {t['calls']} | {t['prompt']:,} | {t['completion']:,} | "
+                     f"{t['median_tps'] or '-'} | {'-' if t['mean_ttft'] is None else round(t['mean_ttft'], 1)} |")
+    lines += ["", "## By round", "", "| round | calls | prompt | completion | total |", "|---|---:|---:|---:|---:|"]
+    for rnd, t in sorted(_LEDGER.by("round").items(), key=lambda kv: (kv[0] == "None", kv[0])):
+        lines.append(f"| {'setup / final' if rnd == 'None' else rnd} | {t['calls']} | {t['prompt']:,} | "
+                     f"{t['completion']:,} | {t['total']:,} |")
+    notes = []
+    top = max(cats, key=lambda c: sum(r["prompt"] + r["completion"] for r in cats[c])) if cats else None
+    if top:
+        tt = _LEDGER.totals(cats[top])
+        notes.append(f"Largest consumer: {top} ({100.0 * tt['total'] / max(1, allt['total']):.0f}% of all tokens).")
+    ag = _LEDGER.totals(_LEDGER.select(category="agent attempts"))
+    if ag["calls"]:
+        notes.append(f"Agent attempts read {ag['prompt'] / max(1, ag['completion']):.1f} prompt tokens per "
+                     f"generated token; prompt context is the lever for agent cost.")
+        if ag["truncated"]:
+            notes.append(f"{ag['truncated']} agent attempt(s) hit the output cap or wall clock.")
+    if allt["estimated"]:
+        notes.append("Estimated rows depend on CHARS_PER_TOKEN; enable usage reporting on the server for exact counts.")
+    if notes:
+        lines += ["", "## Notes", ""] + [f"- {n}" for n in notes]
+    return "\n".join(lines) + "\n"
+
+
+def print_token_summary() -> None:
+    allt = _LEDGER.totals()
+    print(f"\n[TOKENS] RUN SUMMARY: {allt['calls']} call(s), {allt['total']:,} tokens "
+          f"(in {allt['prompt']:,} / out {allt['completion']:,})", flush=True)
+    cats = _LEDGER.by("category")
+    width = max([len(c) for c in cats] + [8])
+    print(f"    {'category':<{width}}  {'calls':>5}  {'in':>8}  {'out':>8}  {'share':>6}  {'tok/s':>6}", flush=True)
+    for cat, t in sorted(cats.items(), key=lambda kv: -kv[1]["total"]):
+        print(f"    {cat:<{width}}  {t['calls']:>5}  {_fmt_tok(t['prompt']):>8}  {_fmt_tok(t['completion']):>8}  "
+              f"{100.0 * t['total'] / max(1, allt['total']):>5.1f}%  {str(t['median_tps'] or '-'):>6}", flush=True)
+
+
 def fit_context(text: str, budget: int,
                 note: str = "...[CONTENT TRUNCATED FOR CONTEXT LIMITS]...") -> str:
     if text is None:
@@ -885,6 +1150,8 @@ def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
                      model: Optional[str] = None,
                      presence_penalty: Optional[float] = None) -> Tuple[str, int, int]:
     """Streaming apex call. Returns (text, prompt_tokens, completion_tokens)."""
+    _category = _caller_category("apex (other)")
+    _call_t0 = time.time()
     kwargs = dict(
         model=model or LLM_MODEL,
         messages=[{"role": "system", "content": system_prompt},
@@ -905,10 +1172,15 @@ def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
             raise
 
     text, p_tok, c_tok = "", 0, 0
+    t0, ttft, finish = _call_t0, None, None
     try:
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content is not None:
+                if ttft is None and chunk.choices[0].delta.content:
+                    ttft = time.time() - t0
                 text += chunk.choices[0].delta.content
+            if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
+                finish = chunk.choices[0].finish_reason
             if getattr(chunk, "usage", None) is not None:
                 p_tok, c_tok = chunk.usage.prompt_tokens, chunk.usage.completion_tokens
     finally:
@@ -918,8 +1190,12 @@ def _apex_completion(client: OpenAI, system_prompt: str, user_prompt: str,
             pass
 
     text = enforce_ascii(text.strip())
+    estimated = False
     if not p_tok and not c_tok:
         p_tok, c_tok = estimate_tokens(system_prompt + user_prompt), estimate_tokens(text)
+        estimated = True
+    _LEDGER.add(_category, "apex", p_tok, c_tok, time.time() - t0, ttft, estimated,
+                rnd=getattr(_TOKEN_CTX, "rnd", None), truncated=(finish == "length"))
     return text, p_tok, c_tok
 
 
@@ -1185,9 +1461,12 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
             stream=True
         )
 
+        ttft = None
         try:
             for chunk in response:
                 if chunk.choices and chunk.choices[0].delta.content is not None:
+                    if ttft is None and chunk.choices[0].delta.content:
+                        ttft = time.time() - start_time
                     full_content += chunk.choices[0].delta.content
         finally:
             try:
@@ -1196,6 +1475,8 @@ def generate_content(prompt: str, target_dir: Path) -> Path:
                 pass
 
         elapsed = round(time.time() - start_time, 2)
+        _LEDGER.add("draft (phase 1)", "apex", estimate_tokens(_PROMPT_PHASE1_GEN + prompt),
+                    estimate_tokens(full_content), time.time() - start_time, ttft, estimated=True)
         print(f"[+] Generation complete in {elapsed} seconds.")
 
         ascii_content = enforce_ascii(full_content)
@@ -2534,9 +2815,13 @@ class LiveExplorer(ExplorerBase):
         with self._lock:
             real = [n for n in self._nodes if n.get("task")]
             spent = self._spent
-        sys.stdout.write("\r    [+] round {:02d}: {} node(s), budget {}/{}, decision round {}, best {:.3f}   ".format(
+        rt = _LEDGER.totals(_LEDGER.select(round=self.rnd))
+        ag = _LEDGER.totals(_LEDGER.select(round=self.rnd, tier="agent"))
+        sys.stdout.write("\r    [+] round {:02d}: {} node(s), budget {}/{}, decision round {}, best {:.3f} | "
+                         "tok {} in / {} out, agent {} tok/s   ".format(
             self.rnd, len(real), spent, self._budget, self._rounds,
-            max([n["score"] for n in real] or [0.0])))
+            max([n["score"] for n in real] or [0.0]),
+            _fmt_tok(rt["prompt"]), _fmt_tok(rt["completion"]), ag["median_tps"] or "-"))
         sys.stdout.flush()
         return node
 
@@ -2928,9 +3213,13 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
             else:
                 raise
 
+        call_t0, ttft = time.time(), None
         try:
             for chunk in response:
                 now = time.time()
+                if ttft is None and chunk.choices and chunk.choices[0].delta is not None \
+                        and chunk.choices[0].delta.content:
+                    ttft = now - call_t0
                 if now - start_time > WORKER_MAX_WALL_SECS:
                     truncated = True
                     finish_reason = "wall_clock"
@@ -2958,6 +3247,9 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
         if is_estimated:
             prompt_tokens = estimate_tokens(_PROMPT_PHASE3_AGENT + user_instruction)
             comp_tokens = estimate_tokens(result_text)
+        _LEDGER.add("write-up refresh" if extra_stage else "agent attempts", "agent",
+                    prompt_tokens, comp_tokens, time.time() - call_t0, ttft, is_estimated,
+                    rnd=rnd, truncated=truncated)
 
         scan = scan_agent_output(result_text)
         counts = scan["counts"]
@@ -6147,6 +6439,7 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
             return None
         try:
             _strip_known_rejects(endpoint.rstrip("/"), payload)
+            _t_call = time.time()
             response = requests.post(url, json=payload, headers=headers, timeout=TEST_TIMEOUT_SECS)
             if response.status_code == 400:
                 text = response.text
@@ -6162,8 +6455,15 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
                 print(f"    [*] retrying {endpoint}: {fix}", flush=True)
                 continue
             response.raise_for_status()
-            choices = response.json().get("choices")
+            body = response.json()
+            choices = body.get("choices")
             test_code = choices[0].get("message", {}).get("content", "") if choices else ""
+            usage = body.get("usage") or {}
+            _LEDGER.add("unit-test generation", "agent",
+                        usage.get("prompt_tokens") or estimate_tokens(_PROMPT_PHASE5_UNITTEST + prompt),
+                        usage.get("completion_tokens") or estimate_tokens(test_code or ""),
+                        time.time() - _t_call, None, not usage, rnd=getattr(_TOKEN_CTX, "rnd", None),
+                        truncated=bool(choices and choices[0].get("finish_reason") == "length"))
             if test_code:
                 return enforce_ascii(_strip_markdown_fences(test_code))
         except (requests.exceptions.RequestException, ValueError):
@@ -7047,6 +7347,10 @@ def main():
         target_directory.mkdir(parents=True, exist_ok=True)
 
     print(describe_budget_alignment(), flush=True)
+    _LEDGER.bind(target_directory)
+    if _LEDGER.records:
+        print(f"[TOKENS] resumed ledger: {len(_LEDGER.records)} earlier call(s), "
+              f"{_fmt_tok(_LEDGER.totals()['total'])} tokens so far", flush=True)
 
     manifest_path = target_directory / "RUN_MANIFEST.md"
     distilled_tasks_path = target_directory / "DISTILLED_TASKS.md"
@@ -7296,6 +7600,9 @@ def main():
                  + (" (forced)" if DREAM_FORCE_REVISIONS else f" (gated at headroom {DREAM_MIN_HEADROOM})"))
               + ".", flush=True)
 
+        print_token_estimate(f"estimate for {end_round - start_round + 1} round(s) plus final stages",
+                             estimate_remaining_tokens(end_round - start_round + 1, budget, len(roster)))
+
         # A round that never finished is re-run from a clean slate.
         if args.resume:
             archive_partial_round(target_directory, start_round)
@@ -7329,6 +7636,8 @@ def main():
                 print(f"\n[!] Shutdown requested; stopping before round {rnd:02d}. "
                       "Re-run with -r to continue.", flush=True)
                 break
+            global _CURRENT_ROUND
+            _CURRENT_ROUND = rnd
             if ENFORCE_DEPENDENCIES and ENV_RESCAN_EACH_ROUND and \
                     time.time() - _RUN_ENV.get("_ts", 0) > 60:
                 prev_proj = integration_dir_for(target_directory) / f"round{rnd - 1:02d}"
@@ -7371,6 +7680,11 @@ def main():
             _, dstats = dream_policy_improvement(target_directory, rnd, policy_source,
                                                  pool, tasks, budget)
             dream_stats.append(dstats)
+            print_round_tokens(rnd)
+            if rnd < end_round:
+                print_token_estimate(f"remaining ({end_round - rnd} round(s) plus final stages)",
+                                     estimate_remaining_tokens(end_round - rnd, budget, len(roster)))
+        _CURRENT_ROUND = None
 
     if last_online_round and not _shutdown_event.is_set():
         try:
@@ -7395,6 +7709,20 @@ def main():
     else:
         run_phase6_project_distillation(target_directory, iterate=args.iterate)
 
+    # ---------------- Token summary (after everything, phase 6 included) ----------------
+    if _LEDGER.records:
+        print_token_summary()
+        summary_md = token_summary_markdown()
+        with open(target_directory / "TOKENS.md", "w", encoding="ascii") as f:
+            f.write(summary_md)
+        with open(target_directory / "tokens_summary.json", "w", encoding="ascii") as f:
+            json.dump({"totals": _LEDGER.totals(), "by_category": _LEDGER.by("category"),
+                       "by_tier": _LEDGER.by("tier"), "by_round": _LEDGER.by("round")}, f, indent=2)
+        with open(manifest_path, "a", encoding="ascii") as f:
+            f.write("\n\n" + summary_md.replace("# Token usage", "## Token usage", 1))
+        print(f"    -> TOKENS.md, tokens_summary.json (per call: tokens.jsonl); appended to "
+              f"{manifest_path.name}", flush=True)
+
     print("\n==============================================================================")
     print("PIPELINE COMPLETE")
     print(f"  Deliverables: {work_dir_for(target_directory)}")
@@ -7403,6 +7731,7 @@ def main():
     print(f"  Dreaming: {dream_dir_for(target_directory)}")
     print(f"  Comms log: {comms_dir_for(target_directory)}")
     print(f"  Manifest: {manifest_path.name}")
+    print(f"  Tokens: TOKENS.md")
     print("==============================================================================\n")
 
 
