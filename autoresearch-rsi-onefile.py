@@ -654,6 +654,7 @@ _RUN_ALLOWED_IMPORTS: Optional[List[str]] = None  # None = gate off; else discov
 _RUN_ENV: Dict[str, Any] = {}                      # latest container scan
 _RUN_ENV_TEXT: str = ""                            # rendered for agents and tests
 _RUN_API_FACTS_TEXT: str = ""                      # discovered library API facts
+_RUN_API_FACTS: Dict[str, dict] = {}               # the same, structured (member lists per class)
 _ENV_RESCAN_LOCK = threading.Lock()
 _RUN_COMMAND: str = ""                             # grounding run command
 _RUN_PROBE_COMMAND: str = ""                       # sensitivity control command
@@ -2851,6 +2852,10 @@ class LiveExplorer(ExplorerBase):
                             shortcut_gate(node, self.run_dir, self.rnd)
                         except Exception as exc:
                             print(f"\n    [!] {task} shortcut scan raised {str(exc)[:80]}", flush=True)
+                        try:
+                            library_misuse_gate(node, self.run_dir, self.rnd)
+                        except Exception as exc:
+                            print(f"\n    [!] {task} library scan raised {str(exc)[:80]}", flush=True)
                     break
             except Exception as exc:
                 print(f"\n    [!] {task} attempt {attempt} raised {str(exc)[:80]}", flush=True)
@@ -4857,6 +4862,9 @@ def run_rules_section(cmd: str) -> str:
         '  "score": <finite number>, and reports no error ("status": "error", an "error" field,',
         "  or a traceback in its output).",
         "- Printed prose (conclusions, notes) is not a result; only measured numbers count.",
+        "- On any failure, print the full traceback to stderr (traceback.print_exc()) before exiting",
+        "  non-zero, so the failing file and line are visible to everyone. The pipeline also records",
+        "  where exceptions originate, but a traceback is the owner's job.",
         "- Errors must reach the exit code. No catch-all except that prints an error and exits 0,",
         "  and no silent fallback that substitutes another backend or a made-up value when",
         "  something fails. A hidden failure is still scored as a failure.",
@@ -5131,6 +5139,92 @@ def final_skeptic_review(run_dir: Path, rnd: int) -> str:
     return text
 
 
+_RAISE_CAPTURE_SITE = r"""
+import sys, os, json
+_path = os.environ.get("AR_RAISE_LOG")
+_root = os.path.realpath(os.environ.get("AR_PROJECT_ROOT", "")) + os.sep
+if _path and _root != os.sep and hasattr(sys, "monitoring"):
+    _M = sys.monitoring
+    _ev = []
+    def _rec(kind, code, exc):
+        fn = code.co_filename
+        if fn.startswith("<") or not os.path.realpath(fn).startswith(_root):
+            return
+        try:
+            ln = sys._getframe(2).f_lineno
+        except Exception:
+            ln = code.co_firstlineno
+        _ev.append([kind, id(exc), os.path.relpath(os.path.realpath(fn), _root), ln, code.co_name,
+                    type(exc).__name__, str(exc)[:300]])
+        del _ev[:-300]
+    _tid = None
+    for _t in (4, 3):
+        try:
+            _M.use_tool_id(_t, "autoresearch-grounding")
+            _tid = _t
+            break
+        except ValueError:
+            pass
+    if _tid is not None:
+        _M.register_callback(_tid, _M.events.RAISE, lambda c, o, e: _rec("raise", c, e))
+        _M.register_callback(_tid, _M.events.PY_UNWIND, lambda c, o, e: _rec("unwind", c, e))
+        _M.set_events(_tid, _M.events.RAISE | _M.events.PY_UNWIND)
+        import atexit
+        def _dump():
+            try:
+                with open(_path, "w") as fh:
+                    json.dump(_ev, fh)
+            except Exception:
+                pass
+        atexit.register(_dump)
+"""
+
+
+def _raise_capture_env(env: Dict[str, str], work: Path, project: Path) -> Path:
+    """Install the exception-origin recorder for a grounding/probe run: a
+    sitecustomize (sys.monitoring, Python 3.12+) on PYTHONPATH that records where
+    exceptions are raised in project files, even ones the code catches."""
+    site = work / ".arsite"
+    site.mkdir(parents=True, exist_ok=True)
+    (site / "sitecustomize.py").write_text(_RAISE_CAPTURE_SITE)
+    log = work / "raises.json"
+    if log.exists():
+        log.unlink()
+    env["PYTHONPATH"] = f"{site}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    env["AR_RAISE_LOG"] = str(log)
+    env["AR_PROJECT_ROOT"] = str(project)
+    return log
+
+
+def exception_origins(log: Path) -> List[str]:
+    """Rendered origin + path of the last few exceptions raised in project code
+    (SystemExit excluded): 'ValueError: axes don't match array at simulator.py:37 in
+    apply_gate; passed through experiment.py:88 -> runner.py:21'."""
+    try:
+        ev = json.loads(read_file_content_safe(log) or "[]")
+    except json.JSONDecodeError:
+        return []
+    order, by_exc = [], {}
+    for kind, eid, fn, ln, func, etype, msg in ev:
+        if etype in ("SystemExit", "StopIteration", "GeneratorExit", "KeyboardInterrupt"):
+            continue
+        if eid not in by_exc:
+            by_exc[eid] = []
+            order.append(eid)
+        loc = f"{fn}:{ln}"
+        if not by_exc[eid] or by_exc[eid][-1][0] != loc:
+            by_exc[eid].append((loc, func, etype, msg))
+    out = []
+    for eid in order[-3:]:
+        frames = by_exc[eid]
+        loc, func, etype, msg = frames[0]
+        line = f"{etype}: {msg[:160]} at {loc} in {func}"
+        if len(frames) > 1:
+            line += "; passed through " + " -> ".join(f[0] for f in frames[1:6])
+        out.append(line)
+    return out
+
+
 def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Optional[dict]:
     """Run the RUN command in a throwaway copy of the integrated project and keep
     its real output. This is the only source a write-up may report from."""
@@ -5140,6 +5234,7 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
     env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
+    raise_log = _raise_capture_env(env, work, work / "project")
     start = time.time()
     errs: List[str] = []
     rc, out, to = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
@@ -5196,6 +5291,11 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     if produced:
         lines.append(f"files written: {', '.join(produced)}")
     lines += ["output (stdout - the only place results may come from):", tail or "(no output)", ""]
+    origins = exception_origins(raise_log) if not ok or reported_errors else []
+    if origins:
+        lines += ["EXCEPTION ORIGIN (recorded by the pipeline inside the run, even if the code caught it):"]
+        lines += [f"  {o}" for o in origins]
+        lines.append("")
     if other_lines and result_lines:
         lines += ["other stdout lines (library messages, not results):",
                   "\n".join(l.strip() for l in other_lines[-20:]), ""]
@@ -5234,6 +5334,7 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         f.write(text + "\n")
     res = {"round": rnd, "command": _RUN_COMMAND, "ok": ok, "rc": rc, "timed_out": to,
            "score": score, "reported_errors": reported_errors, "status": status,
+           "exception_origins": origins,
            "elapsed": round(elapsed, 2), "produced": produced, "probe": probe}
     with open(idir / f"round{rnd:02d}_run.json", "w", encoding="ascii") as f:
         json.dump(res, f, indent=2)
@@ -5246,6 +5347,8 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         m_err = re.search(r'"(?:error|exception)"\s*:\s*"([^"]{1,200})', out or "", re.I)
         if m_err:
             print(f"    [-] reported error: {m_err.group(1)}", flush=True)
+    if origins:
+        print(f"    [-] origin: {origins[-1][:200]}", flush=True)
     if not ok and not reported_errors and rc != 0:
         err = _extract_error_line((err_text + "\n" + (out or "")).strip(), "python")
         if err:
@@ -5453,7 +5556,9 @@ def env_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[str], List[
 
 def _mentioned_modules(env: Dict[str, Any], text: str) -> List[str]:
     """Import names of installed distributions the text names (by import name or
-    distribution name, whole word, case-insensitive)."""
+    distribution name, whole word, case-insensitive). Only the USER'S prompt is
+    passed in: pipeline-written text (the contract) is full of ordinary words
+    that are also package names ('executing', 'click', 'rich')."""
     low = (text or "").lower()
     out: List[str] = []
     for v in env.get("dists", {}).values():
@@ -5542,6 +5647,8 @@ def refresh_environment(run_dir: Path, rnd: int, focus_text: str = "",
     if ENFORCE_DEPENDENCIES:
         _RUN_ALLOWED_IMPORTS = list(new["allowed"])
     facts = probe_library_api(run_dir, focus, refs)
+    _RUN_API_FACTS.clear()
+    _RUN_API_FACTS.update(facts)
     _RUN_API_FACTS_TEXT = render_api_facts(facts)
     with open(edir / f"round{rnd:02d}_api_facts.md", "w", encoding="ascii") as f:
         f.write((_RUN_API_FACTS_TEXT or "(no library API facts)") + "\n")
@@ -5579,10 +5686,11 @@ def load_last_env(run_dir: Path) -> Dict[str, Any]:
 def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str, Any]:
     """Third-party usage in a project, from its source: modules imported, names
     imported from them, and attribute chains on module aliases."""
-    out = {"modules": [], "names": [], "chains": []}
+    out = {"modules": [], "names": [], "chains": [], "instances": []}
     if project is None or not project.exists():
         return out
     names, chains, mods = set(), set(), set()
+    instances: Set[Tuple[str, str, str, str]] = set()
     for p in sorted(project.rglob("*.py")):
         if "__pycache__" in p.parts or ".home" in p.parts:
             continue
@@ -5613,11 +5721,72 @@ def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str
                     cur = cur.value
                 if isinstance(cur, ast.Name) and cur.id in alias:
                     chains.add(tuple(alias[cur.id].split(".") + list(reversed(parts))))
+        rel = p.name if p.parent == project else str(p.relative_to(project))
+        instances |= _instance_method_calls(tree, alias, names, rel)
     # keep only maximal chains (a.b.c covers a.b)
     maximal = {c for c in chains if not any(len(o) > len(c) and o[:len(c)] == c for o in chains)}
     out["modules"] = sorted(mods)
     out["names"] = sorted(names)[:80]
     out["chains"] = sorted(maximal)[:120]
+    out["instances"] = sorted(instances)[:200]
+    return out
+
+
+def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str, str]],
+                           rel: str) -> Set[Tuple[str, str, str, str]]:
+    """(module, Class, attribute, 'file:line') for attributes used on variables
+    holding a library class instance: `sim = QrackSimulator(...)` or
+    `self.sim = pyqrack.QrackSimulator(...)`, then `sim.rz(...)` / `self.sim.rz`.
+    Tracking is by name within one file - enough for the common patterns."""
+    cls_by_local = {n: (m, n) for (m, n) in imported}
+
+    def class_of(call) -> Optional[Tuple[str, str]]:
+        if not isinstance(call, ast.Call):
+            return None
+        f = call.func
+        if isinstance(f, ast.Name) and f.id in cls_by_local:
+            return cls_by_local[f.id]
+        if isinstance(f, ast.Attribute):
+            parts, cur = [f.attr], f.value
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name) and cur.id in alias:
+                mod = ".".join([alias[cur.id]] + list(reversed(parts[1:])))
+                return (mod, parts[0])
+        return None
+
+    def key_of(t) -> Optional[str]:
+        if isinstance(t, ast.Name):
+            return t.id
+        if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name):
+            return f"{t.value.id}.{t.attr}"
+        return None
+
+    holders: Dict[str, Tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            c = class_of(node.value)
+            if c and c[1][:1].isupper():
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    k = key_of(t)
+                    if k:
+                        holders[k] = c
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                c = class_of(item.context_expr)
+                if c and item.optional_vars is not None and key_of(item.optional_vars):
+                    holders[key_of(item.optional_vars)] = c
+    out: Set[Tuple[str, str, str, str]] = set()
+    if not holders:
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            k = key_of(node.value)
+            if k in holders and not node.attr.startswith("__"):
+                m, c = holders[k]
+                out.add((m, c, node.attr, f"{rel}:{node.lineno}"))
     return out
 
 
@@ -5664,6 +5833,8 @@ for m in req["modules"]:
     r["public_count"] = len(pub)
     r["version"] = str(getattr(mo, "__version__", ""))
     if len(pub) <= MAXN:
+        r["class_members"] = {n: sorted(a for a in dir(getattr(mo, n)) if not a.startswith("__"))
+                              for n in pub if isinstance(getattr(mo, n, None), type)}
         r["top"] = {n: (lambda o: ("class" if isinstance(o, type) else "function" if callable(o)
                                    else "module" if inspect.ismodule(o) else type(o).__name__))(getattr(mo, n, None))
                     for n in pub}
@@ -5681,6 +5852,22 @@ for modname, name in req["names"]:
             r["missing"].append(f"from {modname} import {name}")
         continue
     r["objects"][f"{modname}.{name}"] = describe(getattr(mo, name))
+for modname, cls, attr, where in req.get("instances", []):
+    root = modname.split(".")[0]
+    r = out.setdefault(root, {"missing": [], "objects": {}})
+    mo = mod(modname)
+    if isinstance(mo, Exception):
+        continue
+    C = getattr(mo, cls, None)
+    if C is None or not isinstance(C, type):
+        continue
+    key = f"{modname}.{cls}"
+    if key not in r["objects"]:
+        r["objects"][key] = describe(C)
+    if not hasattr(C, attr):
+        msg = f"{cls}.{attr} (instance of {modname}.{cls}; used at {where})"
+        if msg not in r["missing"]:
+            r["missing"].append(msg)
 for chain in req["chains"]:
     root = chain[0]
     r = out.setdefault(root, {"missing": [], "objects": {}})
@@ -5710,7 +5897,8 @@ def probe_library_api(run_dir: Path, focus: List[str], refs: Dict[str, Any]) -> 
     mods = sorted(set(focus) | set(refs.get("modules", [])))
     if not mods:
         return {}
-    req = {"modules": mods, "names": refs.get("names", []), "chains": [list(c) for c in refs.get("chains", [])]}
+    req = {"modules": mods, "names": refs.get("names", []), "chains": [list(c) for c in refs.get("chains", [])],
+           "instances": [list(i) for i in refs.get("instances", [])]}
     py, venv_bin = ensure_test_venv(run_dir)
     home = run_dir / "tests" / ".envscan"
     home.mkdir(parents=True, exist_ok=True)
@@ -7219,6 +7407,55 @@ def integration_round_report(run_dir: Path, rnd: int, roster: List[dict],
     return report
 
 
+def _known_class_members() -> Dict[Tuple[str, str], Set[str]]:
+    """(module, Class) -> member names, from the latest library inspection."""
+    known: Dict[Tuple[str, str], Set[str]] = {}
+    for root, r in _RUN_API_FACTS.items():
+        for cls, members in (r.get("class_members") or {}).items():
+            known[(root, cls)] = set(members)
+        for full, info in (r.get("objects") or {}).items():
+            if info.get("kind") == "class":
+                mod, _, cls = full.rpartition(".")
+                known[(mod, cls)] = set((info.get("members") or {}).keys())
+    return known
+
+
+def library_misuse_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
+    """Part of the fixed evaluator: attributes this attempt uses on library class
+    instances (sim = QrackSimulator(); sim.rz(...)) that the class does not have,
+    checked against the members inspected in this container. A violation plus a
+    log line naming the file, line and the nearest real members."""
+    known = _known_class_members()
+    if not known or not node.get("files"):
+        return []
+    ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
+    if not ndir.exists():
+        return []
+    refs = project_library_refs(ndir, set(_RUN_ALLOWED_IMPORTS or []) | {m for m, _ in known})
+    bad = []
+    for mod, cls, attr, where in refs.get("instances", []):
+        members = known.get((mod, cls)) or known.get((mod.split(".")[0], cls))
+        if members is not None and attr not in members:
+            import difflib
+            near = difflib.get_close_matches(attr, sorted(members), n=3, cutoff=0.5)
+            bad.append(f"{cls}.{attr} does not exist ({where})"
+                       + (f"; nearest real members: {', '.join(near)}" if near else ""))
+    if not bad:
+        return []
+    msg = "LIBRARY MISUSE: " + "; ".join(bad[:6])
+    node.setdefault("violations", []).append(msg[:300])
+    node["library_misuse"] = bad
+    lp = node.get("log_path")
+    if lp and (run_dir / lp).exists():
+        with open(run_dir / lp, "a", encoding="ascii") as fh:
+            fh.write(f"\n## Evaluator\n\n{enforce_ascii(msg)}\n")
+    append_event(run_dir, {"round": rnd, "node": node["id"], "agent": node.get("task"),
+                           "event": "library_misuse", "items": bad[:10]})
+    print(f"\n    [-] {node['id']} ({node.get('task')}) calls missing library members: {bad[0][:120]}",
+          flush=True)
+    return bad
+
+
 def shortcut_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
     """Part of the fixed evaluator: scan this attempt's own files for code that
     sets a metric from the negative-control flag. A hit is a violation and caps
@@ -7261,7 +7498,7 @@ def dependency_gate(node: dict, run_dir: Path, rnd: int) -> bool:
         # the module since the last scan. A mid-round install counts at once.
         with _ENV_RESCAN_LOCK:
             if time.time() - _RUN_ENV.get("_ts", 0) > 30:
-                refresh_environment(run_dir, rnd, focus_text=_RUN_BRIEF + "\n" + _RUN_CONTRACT, quiet=True)
+                refresh_environment(run_dir, rnd, focus_text=_RUN_BRIEF, quiet=True)
                 print(f"\n    [i] {node['id']}: imports {', '.join(bad)}; container rescanned before judging",
                       flush=True)
         bad = disallowed_imports(node, run_dir)
@@ -7905,7 +8142,7 @@ def main():
                 print("\n[CONTRACT] Apex offline; cannot synthesize a contract.", flush=True)
         allowed = None
         if ENFORCE_DEPENDENCIES:
-            refresh_environment(target_directory, 0, focus_text=target_prompt + "\n" + contract)
+            refresh_environment(target_directory, 0, focus_text=target_prompt)
             allowed = list(_RUN_ENV.get("allowed", [])) or None
             contract = (contract + "\n\n" if contract else "") + dependency_section()
         run_cmd, probe_cmd = "", ""
@@ -7946,7 +8183,7 @@ def main():
     if ENFORCE_DEPENDENCIES and not _RUN_ENV:
         # Resume, or the contract was built earlier: discover the container now.
         refresh_environment(target_directory, max(0, len(completed_rounds(target_directory))),
-                            focus_text=(meta.get("brief") or "") + "\n" + (meta.get("contract") or ""),
+                            focus_text=(meta.get("brief") or ""),
                             project=integration_dir_for(target_directory) / "latest")
     if not ENFORCE_DEPENDENCIES:
         _RUN_ALLOWED_IMPORTS = None
@@ -8089,7 +8326,7 @@ def main():
             if ENFORCE_DEPENDENCIES and ENV_RESCAN_EACH_ROUND and \
                     time.time() - _RUN_ENV.get("_ts", 0) > 60:
                 prev_proj = integration_dir_for(target_directory) / f"round{rnd - 1:02d}"
-                refresh_environment(target_directory, rnd, focus_text=_RUN_BRIEF + "\n" + _RUN_CONTRACT,
+                refresh_environment(target_directory, rnd, focus_text=_RUN_BRIEF,
                                     project=prev_proj if prev_proj.exists() else None)
 
             policy_source = (DEFAULT_POLICY_SOURCE if args.no_dream
