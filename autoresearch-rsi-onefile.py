@@ -4851,11 +4851,20 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
         return []
     metric_names = {k.lower() for k in metric_keys} | {"score"}
 
+    # The flag rarely keeps its name on the way down (--corrupt -> args.corrupt ->
+    # corrupt_flag -> corrupt_state), so an identifier matches when it contains
+    # every word of the flag name as one of its own underscore-separated words.
+    flag_words = [set(i.split("_")) for i in idents]
+
+    def ident_matches(name: str) -> bool:
+        words = set(name.lower().split("_"))
+        return any(fw and fw <= words for fw in flag_words)
+
     def refs_flag(expr) -> bool:
         for n in ast.walk(expr):
-            if isinstance(n, ast.Name) and n.id.lower() in idents:
+            if isinstance(n, ast.Name) and ident_matches(n.id):
                 return True
-            if isinstance(n, ast.Attribute) and n.attr.lower() in idents:
+            if isinstance(n, ast.Attribute) and ident_matches(n.attr):
                 return True
             if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in lits:
                 return True
@@ -4879,11 +4888,16 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
         except (SyntaxError, ValueError):
             continue
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.If, ast.IfExp)) or not refs_flag(node.test):
-                continue
-            if isinstance(node, ast.IfExp):
-                if const_number(node.body) or const_number(node.orelse):
-                    hits.append(f"{p.name}:{node.lineno} conditional expression on the flag yields a constant")
+            # metric = <measured> if not flag else 0.1   (a flag-keyed constant for a metric)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.IfExp) \
+                    and refs_flag(node.value.test) \
+                    and (const_number(node.value.body) or const_number(node.value.orelse)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    name = t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute) else ""
+                    if name and is_metric(name):
+                        hits.append(f"{p.name}:{node.lineno} {name} = <expr> if <flag> else constant")
+            if not isinstance(node, ast.If) or not refs_flag(node.test):
                 continue
             for stmt in list(node.body) + list(node.orelse):
                 for sub in ast.walk(stmt):
