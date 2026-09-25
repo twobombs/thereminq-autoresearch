@@ -4520,7 +4520,10 @@ def synthesize_interfaces(prompt: str, contract: str,
                         "  Must run the same experiment with that one change and print the same JSON keys.\n"
                         + (f"  {effect}\n" if effect else "")
                         + "  If the reported numbers do not change under PROBE, the metrics are flagged as\n"
-                          "  measuring nothing.")
+                          "  measuring nothing.\n"
+                          "  The effect above is a PREDICTION the pipeline tests, never a value to emit: the flag\n"
+                          "  must change the experiment's input or procedure, and no code may branch on it to set\n"
+                          "  a metric or score. The pipeline scans for that and for a score that moves alone.")
         if known:
             section += ("\n\nKNOWN ANSWERS (planner-chosen; the tests must check these)\n"
                         + "\n".join(known[:20]))
@@ -4801,6 +4804,7 @@ def run_rules_section(cmd: str) -> str:
         f"- `{cmd}` counts as a successful run only if it exits 0, prints a JSON line with",
         '  "score": <finite number>, and reports no error ("status": "error", an "error" field,',
         "  or a traceback in its output).",
+        "- Printed prose (conclusions, notes) is not a result; only measured numbers count.",
         "- Errors must reach the exit code. No catch-all except that prints an error and exits 0,",
         "  and no silent fallback that substitutes another backend or a made-up value when",
         "  something fails. A hidden failure is still scored as a failure.",
@@ -4822,6 +4826,93 @@ def numeric_fingerprint(out: str) -> List[Tuple[str, float]]:
         except ValueError:
             pass
     return fp
+
+
+_SUMMARY_KEY_RE = re.compile(r'(^|_)score$', re.I)
+
+
+def _flag_tokens(probe_cmd: str) -> Tuple[Set[str], Set[str]]:
+    """(identifier forms, literal forms) of the control flag(s) in a probe command."""
+    idents, lits = set(), set()
+    for tok in (probe_cmd or "").split()[2:]:
+        if tok.startswith("--") and len(tok) > 3:
+            name = tok[2:].split("=")[0]
+            lits.add(tok.split("=")[0])
+            idents.add(name.replace("-", "_").lower())
+    return idents, lits
+
+
+def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str]) -> List[str]:
+    """'file:line name = constant' for every branch on the control flag that
+    assigns a literal number to a reported metric (or to anything named like a
+    score). Finds the pattern wherever it lives, entry point or library."""
+    idents, lits = _flag_tokens(probe_cmd)
+    if not idents and not lits:
+        return []
+    metric_names = {k.lower() for k in metric_keys} | {"score"}
+
+    def refs_flag(expr) -> bool:
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Name) and n.id.lower() in idents:
+                return True
+            if isinstance(n, ast.Attribute) and n.attr.lower() in idents:
+                return True
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in lits:
+                return True
+        return False
+
+    def is_metric(name: str) -> bool:
+        low = name.lower()
+        return low in metric_names or bool(_SUMMARY_KEY_RE.search(low))
+
+    def const_number(v) -> bool:
+        if isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd)):
+            v = v.operand
+        return isinstance(v, ast.Constant) and isinstance(v.value, (int, float)) and not isinstance(v.value, bool)
+
+    hits: List[str] = []
+    for p in sorted(proj.rglob("*.py")):
+        if "__pycache__" in p.parts or _is_test_file(p.name):
+            continue
+        try:
+            tree = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.If, ast.IfExp)) or not refs_flag(node.test):
+                continue
+            if isinstance(node, ast.IfExp):
+                if const_number(node.body) or const_number(node.orelse):
+                    hits.append(f"{p.name}:{node.lineno} conditional expression on the flag yields a constant")
+                continue
+            for stmt in list(node.body) + list(node.orelse):
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and const_number(sub.value):
+                        targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                        for t in targets:
+                            name = (t.id if isinstance(t, ast.Name) else
+                                    t.attr if isinstance(t, ast.Attribute) else
+                                    t.slice.value if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                                    and isinstance(t.slice.value, str) else "")
+                            if name and is_metric(name):
+                                hits.append(f"{p.name}:{sub.lineno} {name} = {ast.unparse(sub.value)}")
+                    elif isinstance(sub, ast.Dict):
+                        for k, v in zip(sub.keys, sub.values):
+                            if isinstance(k, ast.Constant) and isinstance(k.value, str) and is_metric(k.value) \
+                                    and const_number(v):
+                                hits.append(f"{p.name}:{sub.lineno} {{'{k.value}': {ast.unparse(v)}}}")
+                    elif isinstance(sub, ast.Return) and sub.value is not None and const_number(sub.value):
+                        hits.append(f"{p.name}:{sub.lineno} return {ast.unparse(sub.value)}")
+    return sorted(set(hits))[:10]
+
+
+_FREE_TEXT_RE = re.compile(r'"([A-Za-z0-9_ .\-]{1,60})"\s*:\s*"((?:[^"\\]|\\.){40,})"')
+
+
+def free_text_fields(out: str) -> List[str]:
+    """Keys of long string values in a run's JSON output: prose the code wrote,
+    not something it measured."""
+    return sorted({k for k, _ in _FREE_TEXT_RE.findall(out or "")})[:10]
 
 
 def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
@@ -4849,19 +4940,36 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
     if not a or not b:
         return {**base, "verdict": "UNCOMPARABLE",
                 "detail": "no numeric JSON fields to compare between the run and the control."}
-    da, db = dict(a), dict(b)
-    changed = sorted(k for k in set(da) & set(db) if abs(da[k] - db[k]) > 1e-12 * max(1.0, abs(da[k])))
-    if len(a) == len(b) and all(x[0] == y[0] and abs(x[1] - y[1]) <= 1e-12 * max(1.0, abs(x[1]))
-                                for x, y in zip(a, b)):
+    def moved(x: float, y: float) -> bool:
+        return abs(x - y) > 1e-12 * max(1.0, abs(x))
+    if [k for k, _ in a] == [k for k, _ in b]:
+        pairs = [(k, x, y) for (k, x), (_, y) in zip(a, b)]
+    else:
+        da, db = dict(a), dict(b)
+        pairs = [(k, da[k], db[k]) for k in da if k in db]
+    changed = [(k, x, y) for k, x, y in pairs if moved(x, y)]
+    measured = [k for k, _, _ in pairs if not _SUMMARY_KEY_RE.search(k)]
+    hard = hardcoded_control_branches(proj, _RUN_PROBE_COMMAND, [k for k, _ in a])
+    if hard:
+        return {**base, "verdict": "HARDCODED", "hardcoded": hard,
+                "detail": "the code assigns a fixed value to a reported metric when the control flag is set ("
+                          + "; ".join(hard[:4]) + "). A control that is written in, not measured, proves "
+                          "nothing about the metrics."}
+    if not changed:
         return {**base, "verdict": "INSENSITIVE",
                 "detail": f"all {len(a)} reported number(s) are identical under the control "
                           f"(e.g. {', '.join(f'{k}={v:g}' for k, v in a[:4])}). Either the metrics are "
                           f"constant by construction or the entry point ignores the control flag - "
                           f"both break the contract."}
+    if measured and all(_SUMMARY_KEY_RE.search(k) for k, _, _ in changed):
+        return {**base, "verdict": "SCORE-ONLY",
+                "detail": "only the summary score moved (" + ", ".join(f"{k} {x:g} -> {y:g}" for k, x, y in changed[:4])
+                          + "); the measured quantities did not ("
+                          + ", ".join(sorted(set(measured))[:6]) + " unchanged). The score does not come from "
+                          "the measurement."}
     return {**base, "verdict": "RESPONSIVE",
             "detail": "changed under the control: "
-                      + (", ".join(f"{k} {da[k]:g} -> {db[k]:g}" for k in changed[:6]) or
-                         "the set or order of reported numbers differs")}
+                      + ", ".join(f"{k} {x:g} -> {y:g}" for k, x, y in changed[:6])}
 
 
 _PROMPT_SKEPTIC_REVIEW = (
@@ -4871,12 +4979,21 @@ _PROMPT_SKEPTIC_REVIEW = (
     "says. Look for: values that are constant by construction, conditions that are always true, "
     "comparisons against the wrong reference, parameters that never reach the computation, "
     "operations that cannot affect the measured quantity, silent fallbacks, and circuits or models "
-    "missing the steps their names imply. Quote the exact code line that decides your verdict.\n\n"
+    "missing the steps their names imply. Quote the exact code line that decides your verdict.\n"
+    "Also trace the negative-control flag from the entry point: what does it actually change? It must "
+    "alter the experiment's input or procedure so the metric changes BY MEASUREMENT. If any code "
+    "branches on the flag to set a score or metric directly, or the flag never reaches the "
+    "computation, say so. Trace each printed key back to the line that computes it, starting from "
+    "the RUN entry file.\n\n"
     "Output plain text only, one block per metric:\n"
     "METRIC: <name as printed>\n"
     "VERDICT: valid | suspect | invalid\n"
     "EVIDENCE: <file>:<the exact line>\n"
     "REASON: <one or two sentences>\n\n"
+    "Then:\n"
+    "CONTROL: genuine | hardcoded | not wired\n"
+    "EVIDENCE: <file>:<the exact line>\n"
+    "REASON: <one sentence>\n"
     "Then one final line:\n"
     "OVERALL: <one sentence on whether the run's score can be reported as a finding>\n"
     "Judge only what the code does. Do not suggest fixes. Do not praise."
@@ -4901,7 +5018,8 @@ def final_skeptic_review(run_dir: Path, rnd: int) -> str:
     proj = idir / "latest"
     code_parts, used = [], 0
     files = sorted((p for p in proj.rglob("*.py") if p.is_file() and "__pycache__" not in p.parts),
-                   key=lambda p: (_is_test_file(p.name), str(p)))
+                   key=lambda p: (p.name != (_RUN_COMMAND.split()[1] if len(_RUN_COMMAND.split()) > 1 else ""),
+                                  _is_test_file(p.name), str(p)))
     for p in files:
         body = read_file_content_safe(p) or ""
         chunk = f"===== {p.relative_to(proj)} =====\n{body}\n"
@@ -4912,6 +5030,7 @@ def final_skeptic_review(run_dir: Path, rnd: int) -> str:
         if used >= REVIEW_CODE_CHARS:
             break
     user = (f"USER REQUEST:\n{fit_context(_RUN_BRIEF, 6000)}\n\n"
+            f"RUN command: {_RUN_COMMAND} | negative-control command: {_RUN_PROBE_COMMAND or '(none)'}\n\n"
             f"FINAL RUN (and negative control):\n{fit_context(_RUN_LAST_RUN_TEXT, 10000)}\n\n"
             f"CODE:\n{''.join(code_parts)}")
     print(f"\n[REVIEW] Skeptic review of the final run's metrics on apex "
@@ -4934,7 +5053,12 @@ def final_skeptic_review(run_dir: Path, rnd: int) -> str:
           f"{counts['invalid']} invalid -> {INTEGRATION_DIRNAME}/final_review.md", flush=True)
     for m in re.finditer(r'METRIC:\s*(.+)\n\s*VERDICT:\s*(suspect|invalid)', text, re.I):
         print(f"    [-] {m.group(1).strip()[:60]}: {m.group(2).lower()}", flush=True)
-    append_event(run_dir, {"round": rnd, "event": "skeptic_review", **counts})
+    ctrl = re.search(r'^\s*CONTROL:\s*(genuine|hardcoded|not wired)', text, re.I | re.M)
+    if ctrl:
+        print(f"    [{'+' if ctrl.group(1).lower() == 'genuine' else '-'}] negative control: "
+              f"{ctrl.group(1).lower()}", flush=True)
+    append_event(run_dir, {"round": rnd, "event": "skeptic_review", **counts,
+                           "control": ctrl.group(1).lower() if ctrl else None})
     return text
 
 
@@ -4992,11 +5116,19 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         lines.append("control output:")
         lines.append(probe.get("output_tail") or "(no output)")
         lines.append("")
-    if probe and probe["verdict"] == "INSENSITIVE":
-        lines.append("RULE: the reported metrics did NOT change under a control that must change them, so "
-                     "they do not measure what their names say. A write-up must state this plainly and must "
-                     "not present the score as a finding - neither as an effect nor as a null result. The "
-                     "owners of the metric code: fix the measurement.")
+    prose = free_text_fields(out or "")
+    if prose:
+        lines.append(f"UNTRUSTED FREE TEXT: the output field(s) {', '.join(prose)} are prose the code prints, "
+                     "not measurements. A write-up must not quote or rely on them as findings.")
+        lines.append("")
+    if probe and probe["verdict"] in ("INSENSITIVE", "SCORE-ONLY", "HARDCODED"):
+        why = {"INSENSITIVE": "the reported metrics did NOT change under a control that must change them",
+               "SCORE-ONLY": "only the summary score changed under the control; the measured quantities did not",
+               "HARDCODED": "the code writes a fixed value for the control instead of measuring it"}[probe["verdict"]]
+        lines.append(f"RULE: {why}, so the metrics do not measure what their names say. A write-up must state "
+                     "this plainly and must not present the score as a finding - neither as an effect nor as "
+                     "a null result. The owners of the metric code: fix the measurement, and never branch on "
+                     "the control flag to set a metric.")
     elif ok:
         lines.append("RULE: any number, table or claim about results in a write-up must appear in this "
                      "output (or in the files it wrote). A score near zero is a valid result: report it as "
@@ -5928,7 +6060,8 @@ def final_writeup_refresh(run_dir: Path, roster: List[dict], rnd: int, backgroun
             "FAILED, say so plainly and report no results. Keep the prompt's honesty rules: hardware "
             f"figures marked unverified, a null result reported as-is. Emit ONLY {d}."
             + (" If the run output shows a NEGATIVE CONTROL verdict, report it; if it is INSENSITIVE, "
-               "say the metrics do not measure what their names claim and present no finding."
+               "SCORE-ONLY or HARDCODED, say the metrics do not measure what their names claim and present "
+               "no finding. Never quote the output's UNTRUSTED FREE TEXT fields as results."
                if _RUN_PROBE_COMMAND else "")
             + ("\n\nSKEPTIC REVIEW OF THE METRICS (an apex model read the final code and output; its "
                "judgment, not proof). Every metric marked 'suspect' or 'invalid' below MUST appear in the "
