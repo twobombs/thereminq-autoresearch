@@ -179,9 +179,7 @@ MAX_RETRIES = 3
 WORKER_ENDPOINTS = [
     ep.strip() for ep in os.getenv(
         "WORKER_ENDPOINTS",
-        "http://localhost:8030/v1,http://localhost:8031/v1,"
-        "http://localhost:8032/v1,http://localhost:8033/v1,"
-        "http://localhost:8034/v1,http://localhost:8035/v1"
+        "http://localhost:9931/v1"
     ).split(",") if ep.strip()
 ]
 WORKER_MODEL = os.getenv("WORKER_MODEL", "Qwen3.8-9B-Q4_K_M.gguf")
@@ -257,7 +255,9 @@ ABORTED_DIRNAME = "aborted"
 # charged). It is identical online and in replay, matching the paper's equal
 # per-round budgets for Dream-RSI and Recursive Fixed Exploration.
 # ------------------------------------------------------------------------------
-DEFAULT_ROUNDS = int(os.getenv("RSI_ROUNDS", "1"))
+# Default 2: dreaming after round 1 needs a round 2 to deploy into, and the
+# pool needs more than one recorded tree before replay scores mean much.
+DEFAULT_ROUNDS = int(os.getenv("RSI_ROUNDS", "2"))
 MAX_ROUNDS = int(os.getenv("RSI_MAX_ROUNDS", "12"))
 ROUND_BUDGET_PER_TASK = float(os.getenv("ROUND_BUDGET_PER_TASK", "2.0"))
 ROUND_BUDGET_MIN = int(os.getenv("ROUND_BUDGET_MIN", "3"))
@@ -286,6 +286,19 @@ DREAM_BETA1 = float(os.getenv("DREAM_BETA1", "0.002"))
 DREAM_BETA2 = float(os.getenv("DREAM_BETA2", "0.004"))
 # Characters of per-round replay trace shown to the policy-development agent.
 DREAM_TRACE_CHARS = int(os.getenv("DREAM_TRACE_CHARS", "6000"))
+# Headroom gate. Before any apex revision, the replay oracle bound (the best V
+# ANY policy could reach on the recorded pool, with hindsight) is compared with
+# the deployed policy's replay V. If the gap is below this, no revision can win
+# by a meaningful margin, so the M-1 apex calls are skipped and the deployed
+# policy carries forward. The bound is non-causal, so it overstates what a real
+# policy can reach: a gap just above epsilon is still usually unwinnable.
+DREAM_MIN_HEADROOM = float(os.getenv("DREAM_MIN_HEADROOM", "0.01"))
+# Set by --force-dream: run the revisions even when the gate says no headroom.
+DREAM_FORCE_REVISIONS = False
+# pi_0 branching: share of assignments (weakest first-attempt scores) that get a
+# second independent root, so recorded trees hold real alternatives (sibling vs
+# continuation) instead of pure chains that only teach stop/continue.
+PI0_BRANCH_FRACTION = min(1.0, max(0.0, float(os.getenv("PI0_BRANCH_FRACTION", "0.34"))))
 
 # Policy sandbox limits.
 POLICY_MAX_CHARS = int(os.getenv("POLICY_MAX_CHARS", "20000"))
@@ -313,6 +326,95 @@ EVAL_PARTIAL_STATUS_FRAC = float(os.getenv("EVAL_PARTIAL_STATUS_FRAC", "0.5"))
 # Generate and run unit tests for every attempt as part of its evaluation.
 EVAL_INLINE_TESTS = os.getenv("EVAL_INLINE_TESTS", "1") == "1"
 EVAL_MAX_TEST_FILES = max(1, int(os.getenv("EVAL_MAX_TEST_FILES", "6")))
+
+# Evaluator part 3: project-level integration. Each attempt is dropped into a
+# flat project made of the best known deliverable of every OTHER task, and the
+# assembled project is checked as a whole (compile, import, pytest over every
+# test file, optional integration command). This is still applied once, at
+# creation, so the evaluator stays fixed and replay reveals exactly what the
+# live policy saw.
+EVAL_INTEGRATION = os.getenv("EVAL_INTEGRATION", "1") == "1"
+EVAL_INTEGRATION_MIX = min(1.0, max(0.0, float(os.getenv("EVAL_INTEGRATION_MIX", "0.5"))))
+# Credit assignment. The integration part of a node's score also reflects what
+# THIS attempt changed: q(project with it) - q(project with its task's previous
+# best), both over the whole project. First and test-only attempts: neutral.
+# One shared bug otherwise gives every node the same q and the tree is flat.
+EVAL_CREDIT = os.getenv("EVAL_CREDIT", "1") == "1"
+EVAL_CREDIT_MIX = min(1.0, max(0.0, float(os.getenv("EVAL_CREDIT_MIX", "0.5"))))
+EVAL_CREDIT_GAIN = float(os.getenv("EVAL_CREDIT_GAIN", "2.0"))
+INTEGRATION_IMPORT_SECS = int(os.getenv("INTEGRATION_IMPORT_SECS", "30"))
+INTEGRATION_PYTEST_SECS = int(os.getenv("INTEGRATION_PYTEST_SECS", "180"))
+INTEGRATION_CMD = os.getenv("INTEGRATION_CMD", "")
+INTEGRATION_CMD_SECS = int(os.getenv("INTEGRATION_CMD_SECS", "300"))
+INTEGRATION_DIRNAME = "integration"
+
+# Sections of the ORIGINAL brief passed verbatim to every agent and to the test
+# generator. They bypass Phase 1/2 rewriting, which is where interfaces drift.
+PINNED_SECTIONS = [x.strip().upper() for x in
+                   os.getenv("PINNED_SECTIONS", "INTERFACES,CONSTRAINTS,ACCEPTANCE CRITERIA").split(",")
+                   if x.strip()]
+AGENT_CONTRACT_BUDGET = int(os.getenv("AGENT_CONTRACT_BUDGET",
+                                      str(min(16000, int(WORKER_INPUT_CHARS * 0.18)))))
+TEST_CONTRACT_BUDGET = int(os.getenv("TEST_CONTRACT_BUDGET", "8000"))
+
+# Contract synthesis. A brief with no pinned section (a short prose prompt) gets
+# a contract written by the apex from the USER'S TEXT ONLY - never from the
+# Phase-1 draft, which otherwise becomes the de-facto spec. Saved to CONTRACT.md
+# and marked synthesized.
+SYNTHESIZE_CONTRACT = os.getenv("SYNTHESIZE_CONTRACT", "1") == "1"
+# The original prompt, verbatim, in every agent's input (carved out of the
+# background budget, so the total window is unchanged).
+AGENT_BRIEF_BUDGET = int(os.getenv("AGENT_BRIEF_BUDGET", str(min(12000, int(WORKER_INPUT_CHARS * 0.12)))))
+
+# Dependency gate. The candidates are probed in the evaluation interpreter; the
+# importable ones become the contract's DEPENDENCIES section, and the evaluator
+# rejects any attempt that imports a third-party module outside that list
+# (score EVAL_DEP_REJECT_SCORE, no tests run, no pip install of it).
+ENFORCE_DEPENDENCIES = os.getenv("ENFORCE_DEPENDENCIES", "1") == "1"
+DEPENDENCY_CANDIDATES = [x.strip() for x in
+                         os.getenv("DEPENDENCY_CANDIDATES", "numpy,scipy,pytest,pyqrack").split(",")
+                         if x.strip()]
+EVAL_DEP_REJECT_SCORE = float(os.getenv("EVAL_DEP_REJECT_SCORE", "0.0"))
+# API facts: objects in the allowed libraries whose REAL public API is probed
+# (inspect, in the evaluation interpreter) and written into the contract, so
+# agents stop calling methods they remember but that do not exist.
+DEPENDENCY_API_PROBE = [x.strip() for x in
+                        os.getenv("DEPENDENCY_API_PROBE", "pyqrack.QrackSimulator,pyqrack.Pauli").split(",")
+                        if x.strip()]
+API_FACTS_BUDGET = int(os.getenv("API_FACTS_BUDGET", "4500"))
+QRACK_LIB_PATH = os.getenv("QRACK_LIB_PATH", "/usr/local/lib/qrack/libqrack_pinvoke.so")
+
+# Interfaces. A contract without an INTERFACES section gets one chosen by the
+# planner (labelled as such), plus a RUN command for the project's entry point.
+SYNTHESIZE_INTERFACES = os.getenv("SYNTHESIZE_INTERFACES", "1") == "1"
+# After every round the integrated project's public API is extracted (AST) and
+# shown to the next round as CURRENT INTERFACES; removing or breaking a name a
+# sibling uses is recorded as a violation.
+FREEZE_INTERFACES = os.getenv("FREEZE_INTERFACES", "1") == "1"
+# After the final round's grounding run, one extra call (outside the RSI budget
+# and the recorded trees) lets the write-up owner rewrite the .md deliverables
+# against that final output; the result replaces them in integration/latest/.
+FINAL_WRITEUP_REFRESH = os.getenv("FINAL_WRITEUP_REFRESH", "1") == "1"
+# Sensitivity probe: a control command (planner-chosen, or PROBE_COMMAND) whose
+# change MUST move the reported metrics. Run after every successful grounding
+# run; identical numbers mean the metrics do not measure anything.
+PROBE_COMMAND = os.getenv("PROBE_COMMAND", "")
+# Numeric keys ignored when comparing run and probe output (timing, seeds...).
+PROBE_IGNORE_KEYS = re.compile(os.getenv("PROBE_IGNORE_KEYS",
+                                         r"(time|elapsed|runtime|seconds|duration|timestamp|seed|pid)"),
+                               re.I)
+# Skeptic review: one apex call after the final run that reads the code and the
+# output and judges whether each reported metric measures what its name says.
+FINAL_SKEPTIC_REVIEW = os.getenv("FINAL_SKEPTIC_REVIEW", "1") == "1"
+REVIEW_CODE_CHARS = int(os.getenv("REVIEW_CODE_CHARS", "36000"))
+AGENT_API_BUDGET = int(os.getenv("AGENT_API_BUDGET", "8000"))
+# Grounding run. After every round the RUN command executes in a copy of the
+# integrated project; its real output (or traceback) goes to every agent, and a
+# write-up may only report what it shows.
+RUN_COMMAND = os.getenv("RUN_COMMAND", "")          # overrides the contract's RUN
+RUN_COMMAND_SECS = int(os.getenv("RUN_COMMAND_SECS", "300"))
+AGENT_RUN_BUDGET = int(os.getenv("AGENT_RUN_BUDGET", "5000"))
+_ENTRYPOINT_NAMES = ("run_experiment.py", "runner.py", "run.py", "main.py", "cli.py")
 
 # Off-policy support probes. EXTENSION, not part of Dream-RSI: a fraction of
 # each live round is held back from the deployed policy and spent on
@@ -424,11 +526,20 @@ _PROMPT_PHASE3_AGENT = (
     "\n"
     "SCOPE DISCIPLINE (most important rule):\n"
     "1. Do ONLY your own objective. Never produce a file that the roster assigns to another agent.\n"
-    "2. If your work depends on a teammate's deliverable, DO NOT rebuild it. Reference it by path "
-    "and state the dependency in your log.\n"
+    "2. If your work depends on a teammate's deliverable, DO NOT rebuild it. Import it by the module "
+    "name the PINNED CONTRACT gives and state the dependency in your log.\n"
     "3. If you believe a teammate's deliverable is wrong or missing, do not fix it yourself. "
     "Raise it with a note to that agent.\n"
     "4. Broader context is given for orientation only. It is not a licence to widen your scope.\n"
+    "\n"
+    "INTEGRATION (how your files are used):\n"
+    "1. After every attempt, the best file of each agent is copied into ONE shared project root with "
+    "the agent directory prefix removed: a file you emit as `pkg/mod.py` lands at `<project>/pkg/mod.py`.\n"
+    "2. Import teammates' modules by bare module name (Python: `from module_name import name`). Never "
+    "import through work/ or agent directory names and never modify sys.path.\n"
+    "3. The PINNED CONTRACT, when shown, is binding: file names, function names, signatures, return "
+    "types and data formats must match it exactly. It overrides anything else you are shown.\n"
+    "4. Code files contain only code and comments. Never leave reasoning, drafts or self-corrections in a file.\n"
     "\n"
     "OUTPUT CONTRACT - you MUST use these tags:\n"
     '<file path="relative/name.ext">\n[FULL FILE CONTENT]\n</file>\n'
@@ -511,7 +622,11 @@ _PROMPT_PHASE5_UNITTEST = (
     "2. Keep the code as short as possible while ensuring it runs and passes.\n"
     "3. Group assertions and use parametrization where possible to save space.\n"
     "4. Output ONLY valid test code inside a single markdown code block. No explanations.\n"
-    "5. If C/C++, #include the provided filename directly and write your own main()."
+    "5. If C/C++, #include the provided filename directly and write your own main().\n"
+    "6. Import the module under test and any teammate module by bare module name; they are all on the path.\n"
+    "7. When a CONTRACT is given, assert what the contract specifies. Do not assert conventions, "
+    "formats or edge cases that neither the contract nor the file's docstrings define.\n"
+    "8. Tests must be deterministic and finish within 30 seconds."
 )
 
 # ==============================================================================
@@ -523,6 +638,20 @@ _clone_dirs_lock = threading.Lock()
 _events_lock = threading.Lock()
 _tree_lock = threading.Lock()
 _shutdown_event = threading.Event()
+
+# Run-scoped, set once in main() before any agent runs; read-only afterwards.
+_RUN_CONTRACT: str = ""
+_RUN_INTEGRATION_CMD: str = INTEGRATION_CMD
+_RUN_DELIVERABLES: List[str] = []
+_RUN_BRIEF: str = ""                              # the user's prompt, verbatim
+_RUN_CONTRACT_SYNTHESIZED: bool = False
+_RUN_ALLOWED_IMPORTS: Optional[List[str]] = None  # None = gate off
+_RUN_COMMAND: str = ""                             # grounding run command
+_RUN_PROBE_COMMAND: str = ""                       # sensitivity control command
+_RUN_DIR: Optional[Path] = None                    # set in main(); for diagnostics
+_RUN_FROZEN_API: Dict[str, dict] = {}              # module -> name -> {kind, sig, params, used_by}
+_RUN_FROZEN_API_TEXT: str = ""
+_RUN_LAST_RUN_TEXT: str = ""
 
 
 def cleanup_clones():
@@ -984,6 +1113,10 @@ def describe_budget_alignment() -> str:
         f" (clamped {ROUND_BUDGET_MIN}-{ROUND_BUDGET_MAX})"
         f" | M={DREAM_CANDIDATES + 1} chained policy version(s) per dream on apex"
         f" | V = quality - {DREAM_BETA1}*N + {DREAM_BETA2}*N/k | replay costs 0 agent calls"
+        f" | revise only if oracle headroom >= {DREAM_MIN_HEADROOM}"
+        f" | pi_0 second roots for weakest {PI0_BRANCH_FRACTION:.0%} of assignments"
+        + (f" | credit: integration q blended {EVAL_CREDIT_MIX:.2f} with own delta (gain {EVAL_CREDIT_GAIN:g})"
+           if EVAL_CREDIT else "")
         + (f" | support probes {SUPPORT_PROBE_FRAC:.0%} (extension)" if SUPPORT_PROBE_FRAC > 0 else "")
     )
     return "\n".join(lines)
@@ -1708,7 +1841,7 @@ def read_events(run_dir: Path) -> List[dict]:
 
 def _slugify(text: str, max_words: int = 4) -> str:
     words = re.findall(r'[a-zA-Z0-9]+', text)[:max_words]
-    slug = "-".join(w.lower() for w in words)
+    slug = "_".join(w.lower() for w in words)
     return slug[:48] or "task"
 
 
@@ -1751,7 +1884,9 @@ def render_roster(roster: List[dict], self_id: str, budget: int) -> str:
     self_entry = next((r for r in roster if r["id"] == self_id), None)
     lines = ["TEAM ROSTER", ""]
     if self_entry:
-        lines.append(f"YOU ARE {self_entry['id']}. Your output directory is {WORK_DIRNAME}/{self_entry['dir']}/")
+        lines.append(f"YOU ARE {self_entry['id']}. Emit paths relative to the PROJECT ROOT (e.g. `mod.py`, "
+                     f"`tests/test_mod.py`); the pipeline files them under {WORK_DIRNAME}/{self_entry['dir']}/ "
+                     "for bookkeeping only. Never put that directory in a path or an import.")
         lines.append("")
     lines.append("ASSIGNMENTS OWNED BY OTHER AGENTS - DO NOT PRODUCE THESE:")
     others = [r for r in roster if r["id"] != self_id]
@@ -1762,7 +1897,7 @@ def render_roster(roster: List[dict], self_id: str, budget: int) -> str:
         obj = r["objective"].replace("\n", " ")
         if len(obj) > per_entry:
             obj = obj[:per_entry] + "..."
-        lines.append(f"  [{r['id']}] owns {WORK_DIRNAME}/{r['dir']}/ :: {obj}")
+        lines.append(f"  [{r['id']}] owns :: {obj}")
     lines.append("")
     lines.append("If your objective seems to overlap one of the above, the overlap belongs to THEM. "
                  "State the dependency in your <log> and move on.")
@@ -1986,6 +2121,7 @@ def _node_view(n: dict) -> dict:
             "emitted": n.get("emitted", 0), "inherited": n.get("inherited", 0),
             "tests_passed": n.get("tests_passed"), "tests_total": n.get("test_count"),
             "test_failures": [str(x)[:160] for x in (n.get("test_failures") or [])[:5]],
+            "integration_delta": n.get("integration_delta"),
         },
     }
 
@@ -2345,7 +2481,10 @@ class LiveExplorer(ExplorerBase):
                 if node["status"] in ("success", "partial"):
                     # Fixed evaluator, part of the same generation-evaluation
                     # request; runs on the slot this attempt already holds.
-                    if EVAL_INLINE_TESTS and self.test_ctx is not None and node.get("files"):
+                    if node.get("files") and dependency_gate(node, self.run_dir, self.rnd):
+                        pass
+                    elif ((EVAL_INLINE_TESTS or EVAL_INTEGRATION) and self.test_ctx is not None
+                            and node.get("files")):
                         try:
                             evaluate_node_inline(node, endpoint, self.run_dir, self.rnd,
                                                  self.test_ctx)
@@ -2506,11 +2645,15 @@ def _agent_output_path(declared: str, agent_dir: Path, other_dirs: Set[str],
     if not parts:
         parts = ["artifact.txt"]
 
+    # Agents often prefix their own location ("work/t01_x/mod.py"); that is not
+    # a claim on anyone else's directory, so strip it before judging ownership.
+    if len(parts) > 1 and parts[0] == WORK_DIRNAME:
+        parts = parts[1:]
+    if len(parts) > 1 and parts[0] == agent_dir.parent.name:
+        parts = parts[1:]
     if parts[0] in other_dirs or re.match(r'^t\d{2}(_|$)', parts[0]):
         violation = f"declared path '{declared}' addresses another agent's directory"
         parts = ["claimed"] + parts
-    elif parts[0] == WORK_DIRNAME:
-        parts = parts[1:] or ["artifact.txt"]
 
     parts = parts[-3:]
     candidate = agent_dir.joinpath(*parts)
@@ -2658,7 +2801,7 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
               background: str, run_dir: Path, live_nodes: List[dict],
               lock: threading.Lock, parent_task_node: Optional[dict] = None,
               reference_hashes: Optional[Set[str]] = None, attempt: int = 1,
-              semantic_guidance: bool = False) -> dict:
+              semantic_guidance: bool = False, extra_stage: str = "") -> dict:
     """One agent, one assignment, one tree node. Writes its own deliverables and
     log, and returns the recorded outcome that becomes replayable history.
 
@@ -2688,6 +2831,8 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     comms_block = build_comms_digest(run_dir, task, rnd, snapshot, parent_id,
                                      AGENT_COMMS_BUDGET, semantic_guidance)
     objective_block = fit_context(agent["objective"], AGENT_OBJECTIVE_BUDGET)
+    contract_block = (fit_context(_RUN_CONTRACT, AGENT_CONTRACT_BUDGET,
+                                  note="...[CONTRACT TRUNCATED]...") if _RUN_CONTRACT else "")
 
     if parent_task_node is not None:
         parent_block = render_parent_deliverables(parent_files, AGENT_PARENT_BUDGET)
@@ -2703,14 +2848,35 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     else:
         context_budget = AGENT_CONTEXT_BUDGET
         stage_note = "This is a fresh attempt at your objective. Produce your deliverables from scratch."
-    context_block = fit_context(background, context_budget)
+    if extra_stage:
+        stage_note = f"{extra_stage}\n\n{stage_note}"
+    brief_block = (fit_context(_RUN_BRIEF, AGENT_BRIEF_BUDGET, note="...[PROMPT TRUNCATED]...")
+                   if _RUN_BRIEF else "")
+    api_block = (fit_context(_RUN_FROZEN_API_TEXT, AGENT_API_BUDGET, note="...[API LIST TRUNCATED]...")
+                 if _RUN_FROZEN_API_TEXT else "")
+    run_block = (fit_context(_RUN_LAST_RUN_TEXT, AGENT_RUN_BUDGET, note="...[RUN OUTPUT TRUNCATED]...")
+                 if _RUN_LAST_RUN_TEXT else "")
+    context_block = fit_context(background, max(2000, context_budget - len(contract_block)
+                                                - len(brief_block) - len(api_block) - len(run_block)))
+    contract_title = ("SYNTHESIZED CONTRACT (FROM THE USER'S PROMPT - BINDING FOR EVERY AGENT)"
+                      if _RUN_CONTRACT_SYNTHESIZED else
+                      "PINNED CONTRACT (VERBATIM FROM THE BRIEF, PLUS PROBED DEPENDENCIES - "
+                      "BINDING FOR EVERY AGENT)")
 
     user_instruction = (
         f"{roster_block}\n\n"
         f"===== BROADER CONTEXT (ORIENTATION ONLY - NOT YOUR SCOPE) =====\n{context_block}\n\n"
         f"===== TEAM COMMUNICATION LOG =====\n{comms_block}\n\n"
         f"===== STAGE =====\n{stage_note}\n\n"
-        f"===== YOUR OBJECTIVE ({task}) =====\n{objective_block}\n"
+        + (f"===== ORIGINAL USER PROMPT (VERBATIM - THE INTENT EVERYTHING ELSE SERVES) =====\n"
+           f"{brief_block}\n\n" if brief_block else "")
+        + (f"===== {contract_title} =====\n"
+           f"{contract_block}\n\n" if contract_block else "")
+        + (f"===== CURRENT INTERFACES (WHAT YOUR SIBLINGS ACTUALLY CALL) =====\n"
+           f"{api_block}\n\n" if api_block else "")
+        + (f"===== LATEST REAL RUN OF THE INTEGRATED PROJECT =====\n"
+           f"{run_block}\n\n" if run_block else "")
+        + f"===== YOUR OBJECTIVE ({task}) =====\n{objective_block}\n"
     )
     user_instruction = fit_context(user_instruction, WORKER_INPUT_CHARS)
 
@@ -2843,6 +3009,9 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
                     saved_files.append(str(p.relative_to(wroot)))
                     file_hashes.append(content_hash(read_file_content_safe(p) or ""))
 
+        if accepted and node_out.exists():
+            violations.extend(frozen_api_violations({"dir": agent["dir"], "id": node_id}, run_dir))
+
         rdir = round_dir_for(run_dir, rnd)
         rdir.mkdir(parents=True, exist_ok=True)
         log_rel = f"{COMMS_DIRNAME}/round{rnd:02d}/{node_id}_{task}.md"
@@ -2914,12 +3083,19 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
 # ------------------------------------------------------------------
 
 DEFAULT_POLICY_SOURCE = '''\
-# Exploration policy pi_0: hand-written parallel refine (the initial policy of
-# Dream-RSI Sec. 4). One independent workspace (branch) per assignment is opened
-# from the root; every following decision round refines the current leaf of every
-# open branch, in batches of at most W. Each branch keeps its own local trajectory.
-# Both Dream-RSI and the fixed-exploration control start from this policy, so
-# round 1 is identical by construction and later divergence is due to dreaming.
+# Exploration policy pi_0: branching parallel refine (the initial policy of
+# Dream-RSI Sec. 4, widened so round-1 trees are not pure chains).
+#   1. One root branch per assignment, in batches of at most W.
+#   2. The weakest BRANCH_FRACTION of assignments (by first-attempt score) get a
+#      second independent root: a sibling, recorded as an alternative to
+#      continuing the first branch.
+#   3. Every remaining decision round continues the current leaf of every open
+#      branch, lowest-scoring leaves first (most evaluator headroom), W per batch.
+# The recorded tree therefore contains sibling-vs-continuation choices that
+# replay can re-decide. Both Dream-RSI and the fixed-exploration control start
+# from this policy, so round 1 is identical by construction.
+
+BRANCH_FRACTION = %%BRANCH_FRACTION%%
 
 
 def chunks(items, size):
@@ -2929,24 +3105,46 @@ def chunks(items, size):
     return out
 
 
+def can_act(ctx):
+    return ctx.budget_left() > 0 and ctx.rounds_left() > 0
+
+
+def run_batches(ctx, actions, w):
+    got = []
+    for group in chunks(actions, w):
+        if not can_act(ctx):
+            break
+        got.extend([n for n in ctx.expand_parallel(group) if n])
+    return got
+
+
 def explore(ctx):
     w = ctx.max_parallelism()
     root = ctx.root()
-    leaves = []
-    for group in chunks([(root, t) for t in ctx.tasks()], w):
-        if ctx.budget_left() <= 0 or ctx.rounds_left() <= 0:
-            return
-        leaves.extend([n for n in ctx.expand_parallel(group) if n])
-    while leaves and ctx.budget_left() > 0 and ctx.rounds_left() > 0:
-        nxt = []
-        for group in chunks([(n["id"], n["task"]) for n in leaves], w):
-            if ctx.budget_left() <= 0 or ctx.rounds_left() <= 0:
-                break
-            nxt.extend([n for n in ctx.expand_parallel(group) if n])
-        if not nxt:
+    tasks = ctx.tasks()
+
+    first = {}
+    for n in run_batches(ctx, [(root, t) for t in tasks], w):
+        first[n["task"]] = n
+    if not first or not can_act(ctx):
+        return
+
+    n_branch = 0
+    if BRANCH_FRACTION > 0:
+        n_branch = min(len(first), max(1, int(round(BRANCH_FRACTION * len(first)))))
+    weakest = sorted(first, key=lambda t: (first[t]["score"], t))[:n_branch]
+    ctx.note("pi_0 second roots: " + ",".join(weakest))
+
+    # Siblings go first in the queue, then continuations of the first branches,
+    # lowest score first. They share batches, so no W-slot is left idle.
+    queue = [(root, t) for t in weakest]
+    queue += [(n["id"], n["task"]) for n in sorted(first.values(), key=lambda n: (n["score"], n["id"]))]
+    while queue and can_act(ctx):
+        revealed = run_batches(ctx, queue, w)
+        if not revealed:
             break
-        leaves = nxt
-'''
+        queue = [(n["id"], n["task"]) for n in sorted(revealed, key=lambda n: (n["score"], n["id"]))]
+'''.replace("%%BRANCH_FRACTION%%", repr(PI0_BRANCH_FRACTION))
 
 _POLICY_BLOCKED_NAMES = {
     "open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
@@ -2982,7 +3180,7 @@ def validate_policy_source(source: str) -> Tuple[bool, str]:
     if len(source) > POLICY_MAX_CHARS:
         return False, f"policy source exceeds {POLICY_MAX_CHARS} chars"
     try:
-        tree = ast.parse(source)
+        tree = _quiet_parse(source)
     except SyntaxError as exc:
         return False, f"syntax error: {exc}"
 
@@ -3362,7 +3560,10 @@ def _policy_interface_doc(budget: int) -> str:
         "A node dict has: id, parent, task, depth, score (0..1, final evaluator score),\n"
         "  gain (score minus the parent attempt's score; None at depth 1), status, cost\n"
         "  (agent calls incl. retries), files, and diagnostics {violations, truncated,\n"
-        "  emitted, inherited, tests_passed, tests_total, test_failures}.\n"
+        "  emitted, inherited, tests_passed, tests_total, test_failures, integration_delta}.\n"
+        "  integration_delta = project q with this attempt minus q with its task's previous best\n"
+        "  (None for a task's first attempt and for test-only attempts): > 0 means the\n"
+        "  attempt improved the whole project.\n"
         "  A continuation starts from its parent's files and only changes what it improves.\n"
         "  A failed test or a truncated output is often repairable by continuing the leaf.\n"
         "\n"
@@ -3453,6 +3654,88 @@ def _select_winner(results: List[dict]) -> dict:
     return max(valid, key=lambda r: (r["score"], -r["index"]))
 
 
+def replay_oracle_bound(nodes: List[dict], tasks: List[str], budget: int) -> dict:
+    """Upper bound on Eq. (1) for ONE recorded tree: the best V any policy could
+    reach in replay if it knew every recorded score in advance.
+
+    Replay semantics it mirrors: continuing (parent, task) reveals the recorded
+    children of that pair in seq order, so reaching a node also reveals (and
+    pays for) its ancestors and every earlier-seq sibling under the same
+    (parent, task). For each assignment the cheapest way to hold a given best
+    score is to target one node, so the optimum is a multiple-choice knapsack
+    over assignments on (agent-call cost <= budget, revealed-node count N).
+    The parallelism term uses N/k <= min(W, N) since k >= ceil(N / W).
+    Continuations stay within their assignment (legality enforces this)."""
+    tset = set(tasks)
+    T = max(1, len(tasks))
+    by_id = {n["id"]: n for n in nodes if n.get("id")}
+    groups: Dict[Tuple[str, str], List[dict]] = {}
+    for n in nodes:
+        if n.get("task"):
+            groups.setdefault((n.get("parent") or "", n["task"]), []).append(n)
+    for g in groups.values():
+        g.sort(key=lambda n: n.get("seq", 0))
+
+    memo: Dict[str, Tuple[int, int, float]] = {}
+
+    def reach(nid: str, depth: int = 0) -> Tuple[int, int, float]:
+        """(cost, N, best same-task score) of the minimal reveal set for nid."""
+        if nid in memo:
+            return memo[nid]
+        n = by_id.get(nid)
+        if n is None or not n.get("task") or depth > 10000:
+            return (0, 0, 0.0)
+        parent = n.get("parent") or ""
+        pc, pn, ps = reach(parent, depth + 1) if parent in by_id and by_id[parent].get("task") else (0, 0, 0.0)
+        cost, cnt, best = pc, pn, ps
+        for sib in groups.get((parent, n["task"]), []):
+            if sib.get("seq", 0) > n.get("seq", 0):
+                break
+            cost += int(sib.get("cost", 1))
+            cnt += 1
+            best = max(best, float(sib.get("score", 0.0)))
+        memo[nid] = (cost, cnt, best)
+        return memo[nid]
+
+    options: Dict[str, List[Tuple[int, int, float]]] = {t: [(0, 0, 0.0)] for t in tasks}
+    for n in nodes:
+        if n.get("task") in tset:
+            c, k, q = reach(n["id"])
+            if c <= budget:
+                options[n["task"]].append((c, k, q))
+
+    # dp[(cost, N)] = best sum of per-assignment best scores
+    dp: Dict[Tuple[int, int], float] = {(0, 0): 0.0}
+    for t in tasks:
+        nxt: Dict[Tuple[int, int], float] = {}
+        for (c0, n0), q0 in dp.items():
+            for c, k, q in options[t]:
+                key = (c0 + c, n0 + k)
+                if key[0] > budget:
+                    continue
+                if q0 + q > nxt.get(key, -1.0):
+                    nxt[key] = q0 + q
+        dp = nxt
+
+    best_v, best_state = float("-inf"), (0, 0, 0.0)
+    for (c, N), qsum in dp.items():
+        par = min(MAX_PARALLELISM, N) if N > 0 else 0
+        v = qsum / T - DREAM_BETA1 * N + DREAM_BETA2 * par
+        if v > best_v:
+            best_v, best_state = v, (c, N, qsum / T)
+    return {"V": round(best_v, 6), "cost": best_state[0], "N": best_state[1],
+            "quality": round(best_state[2], 6)}
+
+
+def replay_oracle_pool(pool: List[Tuple[int, List[dict]]], tasks: List[str],
+                       budget: int) -> Optional[float]:
+    """Mean oracle bound over the pool (same averaging as replay_score)."""
+    if not pool:
+        return None
+    vals = [replay_oracle_bound(nodes, tasks, budget)["V"] for _, nodes in pool]
+    return round(sum(vals) / len(vals), 6)
+
+
 def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
                              pool: List[Tuple[int, List[dict]]],
                              tasks: List[str], budget: int) -> Tuple[str, dict]:
@@ -3484,10 +3767,26 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
             print(f"    [!] {name}: invalid in replay ({str(res['detail'])[:80]})", flush=True)
         return res
 
-    _evaluate("pi_0 (deployed)", 0, current_source)
-    client = apex_client(timeout=WORKER_TIMEOUT_SECS)
+    base0 = _evaluate("pi_0 (deployed)", 0, current_source)
 
-    for m in range(1, DREAM_CANDIDATES + 1):
+    # Headroom gate: the oracle bound caps what ANY revision could score here.
+    oracle = replay_oracle_pool(pool, tasks, budget)
+    headroom = (oracle - float(base0["score"])) if (oracle is not None and base0.get("valid")) else None
+    skipped = False
+    if headroom is not None:
+        print(f"    [i] Replay oracle bound V* {oracle:.4f} | headroom {headroom:+.4f} "
+              f"(epsilon {DREAM_MIN_HEADROOM})", flush=True)
+        if headroom < DREAM_MIN_HEADROOM:
+            if DREAM_FORCE_REVISIONS:
+                print("    [i] Below epsilon, but --force-dream set; revising anyway.", flush=True)
+            else:
+                skipped = True
+                print(f"    [i] Skipping {DREAM_CANDIDATES} apex revision(s): no revision can beat the "
+                      f"deployed policy by >= {DREAM_MIN_HEADROOM} on this pool.", flush=True)
+
+    client = None if skipped else apex_client(timeout=WORKER_TIMEOUT_SECS)
+
+    for m in range(1, 0 if skipped else DREAM_CANDIDATES + 1):
         if _shutdown_event.is_set():
             break
         prev = versions[-1]
@@ -3531,7 +3830,10 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
                 f.write(json.dumps({"version": v["index"], "name": v["name"], **tr},
                                    ensure_ascii=True) + "\n")
     with open(ddir / "scores.json", "w", encoding="ascii") as f:
-        json.dump([{k: val for k, val in r.items() if k != "traces"} for r in results],
+        json.dump({"oracle_bound": oracle,
+                   "headroom": None if headroom is None else round(headroom, 6),
+                   "min_headroom": DREAM_MIN_HEADROOM, "revisions_skipped": skipped,
+                   "versions": [{k: val for k, val in r.items() if k != "traces"} for r in results]},
                   f, indent=2)
 
     def _fmt(r: dict) -> float:
@@ -3550,10 +3852,13 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     improved = winner["index"] != 0
     print(f"    [+] Selected: {winner['name']} (V {_fmt(winner):.4f} vs deployed "
           f"{_fmt(base):.4f}) -> {next_path.name}"
-          + ("" if improved else "  [no version beat the deployed policy; unchanged]"), flush=True)
+          + ("" if improved else ("  [revisions skipped: headroom below epsilon; unchanged]" if skipped
+                                  else "  [no version beat the deployed policy; unchanged]")), flush=True)
 
     append_event(run_dir, {
         "round": rnd, "event": "dream", "candidates": len(results),
+        "oracle_bound": oracle, "headroom": None if headroom is None else round(headroom, 6),
+        "revisions_skipped": skipped,
         "valid": len([r for r in results if r["valid"]]), "winner": winner["name"],
         "winner_score": _fmt(winner), "baseline_score": _fmt(base), "improved": improved,
     })
@@ -3562,6 +3867,8 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
         "round": rnd, "winner": winner["name"], "winner_score": _fmt(winner),
         "baseline_score": _fmt(base), "candidates": len(results),
         "valid": len([r for r in results if r["valid"]]), "improved": improved,
+        "oracle_bound": oracle, "headroom": None if headroom is None else round(headroom, 6),
+        "revisions_skipped": skipped,
     }
 
 
@@ -3603,17 +3910,1117 @@ def extract_json_array(raw_text: str) -> str:
     return ""
 
 
-def decompose_to_atomic_pieces(large_query: str) -> tuple:
+# ------------------------------------------------------------------
+# The original brief: pinned contract + required deliverables
+# ------------------------------------------------------------------
+# Phase 1/2 rewrite the brief and Phase 3 re-partitions it; both are lossy.
+# Two things are therefore taken from the ORIGINAL brief and never rewritten:
+# the pinned sections (shown verbatim to every agent and test generator) and
+# the list of deliverables (every one must be owned by some assignment).
+_BRIEF_HEADING_RE = re.compile(r'^([A-Z][A-Z0-9 &/_-]{2,}?)\s*(\([^)]*\))?\s*:?\s*$')
+_BRIEF_ITEM_RE = re.compile(r'^\s*(?:\d+[.)]|[-*])\s+`?([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6})`?(?=[\s:,;(]|$)')
+
+
+def split_brief_sections(text: str) -> List[Tuple[str, str]]:
+    """(HEADING, section text including its heading line). A heading is an
+    unindented, all-caps line, optionally followed by a parenthesised note."""
+    sections: List[Tuple[str, List[str]]] = [("", [])]
+    for line in (text or "").splitlines():
+        m = _BRIEF_HEADING_RE.match(line) if line[:1].isalpha() and len(line) <= 100 else None
+        if m and any(ch.isalpha() for ch in m.group(1)):
+            sections.append((m.group(1).strip().upper(), [line]))
+        else:
+            sections[-1][1].append(line)
+    return [(h, "\n".join(body).strip()) for h, body in sections if "\n".join(body).strip()]
+
+
+def extract_pinned_contract(text: str) -> str:
+    parts = [body for head, body in split_brief_sections(text)
+             if head and any(head.startswith(name) for name in PINNED_SECTIONS)]
+    return enforce_ascii("\n\n".join(parts).strip())
+
+
+def extract_deliverables(text: str) -> Dict[str, str]:
+    """Deliverable path -> its verbatim item text, taken from every section whose
+    heading starts with DELIVERABLES. Items are numbered or bulleted lines whose
+    first token is a file path; runtime outputs named inside an item are not
+    deliverables."""
+    out: Dict[str, str] = {}
+    for head, body in split_brief_sections(text):
+        if not head.startswith("DELIVERABLES"):
+            continue
+        current, buf = None, []
+        for line in body.splitlines()[1:]:
+            m = _BRIEF_ITEM_RE.match(line)
+            if m:
+                if current:
+                    out.setdefault(current, "\n".join(buf).rstrip())
+                current, buf = m.group(1), [line]
+            elif current:
+                buf.append(line)
+        if current:
+            out.setdefault(current, "\n".join(buf).rstrip())
+    return {k: enforce_ascii(v) for k, v in out.items()}
+
+
+_PROMPT_CONTRACT_SYNTH = (
+    "You turn a user's request into a short project contract. Use ONLY what the user's text "
+    "states. Do not add libraries, frameworks, algorithms, file formats, parameters or numbers "
+    "the user did not state.\n\n"
+    "Output plain text with exactly these two sections and nothing else - no preamble, no "
+    "markdown fences:\n\n"
+    "DELIVERABLES\n"
+    "1. relative/path.ext - one line: what the user asked this file to do, in the user's terms\n"
+    "2. ...\n\n"
+    "CONSTRAINTS\n"
+    "- one line per constraint the user stated\n\n"
+    "DELIVERABLES rules: one numbered item per distinct thing the user asked to be delivered; "
+    "the first token of every item is a relative file path. Python modules live in ONE flat "
+    "project directory and import each other by bare module name; tests are tests/test_<name>.py; "
+    "a written report or write-up is a .md file. Use short, plain file names. Do not merge "
+    "separately requested things into one file, and do not add deliverables the user did not "
+    "ask for (no setup, packaging, dependency-check or config files unless requested). Do not "
+    "name third-party libraries unless the user named them - the list of available libraries "
+    "is appended separately.\n"
+    "CONSTRAINTS rules: restate every constraint the user gave - scope, simplicity, "
+    "reproducibility, honesty and reporting rules included - in plain words. Invent none."
+)
+
+
+def synthesize_contract(prompt: str) -> Tuple[str, Dict[str, str]]:
+    """Contract for a brief with no pinned sections, written by the apex from the
+    user's prompt alone. Returns (DELIVERABLES + CONSTRAINTS text, deliverables);
+    ("", {}) if the apex output does not parse into at least one deliverable."""
+    client = apex_client(timeout=WORKER_TIMEOUT_SECS)
+    user = f"USER REQUEST (verbatim):\n\n{fit_context(prompt, MAX_CONTEXT_CHARS)}"
+    for attempt in range(1, 3):
+        try:
+            raw, _, _ = _apex_completion(client, _PROMPT_CONTRACT_SYNTH, user, APEX_PLAN_TOKENS, 0.2)
+        except Exception as exc:
+            print(f"    [!] Contract synthesis failed (attempt {attempt}/2): {str(exc)[:120]}", flush=True)
+            continue
+        text = re.sub(r'^```[a-zA-Z]*\s*$', '', enforce_ascii(raw or ""), flags=re.MULTILINE).strip()
+        deliverables = {k: v for k, v in extract_deliverables(text).items()
+                        if not k.startswith(("/", "~")) and ".." not in PurePosixPath(k).parts}
+        sections = {h: body for h, body in split_brief_sections(text) if h}
+        constraints = next((b for h, b in sections.items() if h.startswith("CONSTRAINTS")), "")
+        if not deliverables:
+            print(f"    [!] Contract synthesis produced no parseable deliverables "
+                  f"(attempt {attempt}/2).", flush=True)
+            continue
+        items = "\n".join(v for v in deliverables.values())
+        body = "DELIVERABLES\n" + items + (("\n\n" + constraints) if constraints else "")
+        return enforce_ascii(body.strip()), deliverables
+    return "", {}
+
+
+def synthesized_contract_header() -> str:
+    return ("# SYNTHESIZED CONTRACT - written by the planner from the user's prompt only (the prompt\n"
+            "# had no pinned INTERFACES / CONSTRAINTS / ACCEPTANCE CRITERIA). Binding for every agent;\n"
+            "# where it and the user's original prompt disagree, the prompt wins.")
+
+
+_PROMPT_INTERFACES_SYNTH = (
+    "You are the planner of a small Python project that several agents build in parallel, one "
+    "file each. They cannot see each other's code while writing, so they need ONE shared API. "
+    "Write it.\n\n"
+    "Output plain text with exactly these two sections and nothing else - no preamble, no "
+    "markdown fences:\n\n"
+    "INTERFACES\n"
+    "module.py\n"
+    "  def function_name(arg: type, arg2: type = default) -> return_type   # one-line purpose\n"
+    "  class ClassName(init_arg: type, ...)   # one-line purpose\n"
+    "      .method(arg: type) -> return_type   # one-line purpose\n"
+    "  @dataclass ClassName(field: type = default, ...)\n"
+    "  CONSTANT_NAME: type\n"
+    "other_module.py\n"
+    "  ...\n\n"
+    "RUN\n"
+    "python3 entry_module.py\n\n"
+    "PROBE\n"
+    "python3 entry_module.py --some-flag value\n"
+    "  effect: which reported metric must change, and in which direction\n\n"
+    "KNOWN ANSWERS\n"
+    "  metric_name: known-good case -> expected value; known-bad case -> different expected value\n\n"
+    "Rules:\n"
+    "- One block per NON-TEST .py deliverable, in dependency order (a module only uses names "
+    "from blocks above it). List only the public names other modules or the tests need. Keep "
+    "it minimal: this is a small prototype.\n"
+    "- Module names are the deliverables' file names; modules import each other by bare name "
+    "from one flat directory.\n"
+    "- Types use only the standard library and the available third-party modules listed below.\n"
+    "- Every signature must be complete (all parameters, defaults, return type) so two agents "
+    "who never talk can still call each other correctly.\n"
+    "- Pin every VALUE vocabulary, not just types: a str that selects between options is written "
+    "as Literal[\"a\", \"b\"]; a dict return lists its exact keys and value types; an instruction "
+    "or gate list gets its exact tuple layout AND the complete set of op names, e.g.\n"
+    "    Gate = tuple[Literal[\"h\", \"x\", \"cx\", \"rz\"], list[int], list[float]]  "
+    "# (op, qubits, params); rz params=[theta]\n"
+    "  and every producer emits only those names while every consumer accepts all of them. Put "
+    "shared vocabularies as named aliases at the top of the module that owns them.\n"
+    "- If a module wraps an external library, name the library calls it must use ONLY from the "
+    "API FACTS section of the contract, if present.\n"
+    "- RUN is ONE command, no shell operators, that runs the project's entry point with its "
+    "defaults, finishes in under a minute on a CPU, exits 0, and prints a line containing "
+    "\"score\": <number> (JSON) for the summary score.\n"
+    "- PROBE is a NEGATIVE CONTROL: the same entry point with one flag that introduces a change "
+    "whose effect on the reported metrics is known in advance and does NOT depend on the "
+    "hypothesis being tested (e.g. deliberately corrupt the transmitted state, skip a required "
+    "correction, use an orthogonal target). If the metrics do not move under PROBE, they measure "
+    "nothing. The flag must appear in the entry module's interface. Same output format as RUN.\n"
+    "- KNOWN ANSWERS: for every metric the RUN output reports, one case with a known expected "
+    "value and one case with a DIFFERENT known expected value, stated from first principles "
+    "(e.g. ideal teleportation of |1> -> fidelity 1.0; orthogonal state -> 0.0). Never state the "
+    "outcome the experiment is meant to measure as a known answer.\n"
+    "- Serve the user's request and the deliverables; do not add features."
+)
+
+_SHELL_META_RE = re.compile(r'[;&|`$<>\\]')
+
+
+def synthesize_interfaces(prompt: str, contract: str,
+                          deliverables: Dict[str, str]) -> Tuple[str, str, str]:
+    """(INTERFACES section incl. RUN/PROBE/KNOWN ANSWERS, RUN command, PROBE
+    command). Planner-chosen design, labelled as such. Empty strings if the apex
+    output does not parse."""
+    modules = [d for d in deliverables if d.endswith(".py") and not _is_test_file(d)]
+    if not modules:
+        return "", "", ""
+    client = apex_client(timeout=WORKER_TIMEOUT_SECS)
+    user = (f"USER REQUEST (verbatim):\n{fit_context(prompt, 12000)}\n\n"
+            f"CONTRACT SO FAR:\n{fit_context(contract, 12000)}\n\n"
+            f"NON-TEST PYTHON DELIVERABLES: {', '.join(modules)}")
+    for attempt in range(1, 3):
+        try:
+            raw, _, _ = _apex_completion(client, _PROMPT_INTERFACES_SYNTH, user, APEX_PLAN_TOKENS, 0.2)
+        except Exception as exc:
+            print(f"    [!] Interface synthesis failed (attempt {attempt}/2): {str(exc)[:120]}", flush=True)
+            continue
+        text = re.sub(r'^```[a-zA-Z]*\s*$', '', enforce_ascii(raw or ""), flags=re.MULTILINE)
+        body, run_lines, probe_lines, known, cur = [], [], [], [], None
+        for line in text.splitlines():
+            st = line.strip()
+            if re.match(r'^INTERFACES\b', st):
+                cur = "i"
+                continue
+            if re.match(r'^RUN\b\s*:?\s*$', st):
+                cur = "r"
+                continue
+            if re.match(r'^PROBE\b\s*:?\s*$', st):
+                cur = "p"
+                continue
+            if re.match(r'^KNOWN ANSWERS\b\s*:?\s*$', st):
+                cur = "k"
+                continue
+            if cur == "p" and st:
+                probe_lines.append(st.strip("`"))
+                continue
+            if cur == "k" and st:
+                known.append("  " + st.lstrip("-* ").strip())
+                continue
+            if cur == "i" and st:
+                # Module headers stay flush left; everything else is indented so
+                # an all-caps constant can never be read as a section heading.
+                is_mod = re.match(r'^`?[A-Za-z_][A-Za-z0-9_]*\.py`?:?$', st) is not None
+                body.append(st.strip("`").rstrip(":") if is_mod
+                            else ("  " + line.rstrip() if line[:1].isspace() else "  " + st))
+            elif cur == "r" and st:
+                run_lines.append(st.strip("`"))
+        named = {l for l in body if not l.startswith(" ")}
+        if not named & set(modules):
+            print(f"    [!] Interface synthesis produced no module blocks (attempt {attempt}/2).", flush=True)
+            continue
+        run_cmd = validate_run_command(run_lines[0] if run_lines else "", deliverables)
+        probe_cmd = ""
+        if run_cmd and probe_lines:
+            probe_cmd = validate_run_command(probe_lines[0], deliverables)
+            if probe_cmd == run_cmd:
+                probe_cmd = ""
+        effect = " ".join(l for l in probe_lines[1:] if l)[:300]
+        section = ("INTERFACES (planner-chosen, not stated in the user's prompt)\n"
+                   "  Binding so that modules written in parallel fit together.\n" + "\n".join(body))
+        if run_cmd:
+            section += f"\n\nRUN (executed by the pipeline after each round)\n  {run_cmd}"
+        if probe_cmd:
+            section += ("\n\nPROBE (negative control, executed by the pipeline after every successful run)\n"
+                        f"  {probe_cmd}\n"
+                        "  Must run the same experiment with that one change and print the same JSON keys.\n"
+                        + (f"  {effect}\n" if effect else "")
+                        + "  If the reported numbers do not change under PROBE, the metrics are flagged as\n"
+                          "  measuring nothing.")
+        if known:
+            section += ("\n\nKNOWN ANSWERS (planner-chosen; the tests must check these)\n"
+                        + "\n".join(known[:20]))
+        return enforce_ascii(section), run_cmd, probe_cmd
+    return "", "", ""
+
+
+def validate_run_command(cmd: str, deliverables) -> str:
+    cmd = (cmd or "").strip()
+    parts = cmd.split()
+    if len(parts) < 2 or parts[0] not in ("python3", "python") or _SHELL_META_RE.search(cmd):
+        return ""
+    if not parts[1].endswith(".py") or ".." in parts[1] or parts[1].startswith("/"):
+        return ""
+    if deliverables and parts[1] not in set(deliverables):
+        return ""
+    return "python3 " + " ".join(parts[1:])
+
+
+def default_run_command(deliverables) -> str:
+    names = set(deliverables or [])
+    for n in _ENTRYPOINT_NAMES:
+        if n in names:
+            return f"python3 {n}"
+    return ""
+
+
+def _sig_of(fn) -> Tuple[str, List[Tuple[str, bool]]]:
+    """Rendered signature and [(param, has_default)] of an ast function."""
+    a = fn.args
+    params: List[Tuple[str, bool]] = []
+    rendered: List[str] = []
+    pos = list(a.posonlyargs) + list(a.args)
+    defaults = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
+    for arg, d in zip(pos, defaults):
+        ann = f": {ast.unparse(arg.annotation)}" if arg.annotation is not None else ""
+        dv = f" = {ast.unparse(d)}" if d is not None else ""
+        rendered.append(f"{arg.arg}{ann}{dv}")
+        params.append((arg.arg, d is not None))
+    if a.vararg:
+        rendered.append(f"*{a.vararg.arg}")
+    elif a.kwonlyargs:
+        rendered.append("*")
+    for arg, d in zip(a.kwonlyargs, a.kw_defaults):
+        ann = f": {ast.unparse(arg.annotation)}" if arg.annotation is not None else ""
+        dv = f" = {ast.unparse(d)}" if d is not None else ""
+        rendered.append(f"{arg.arg}{ann}{dv}")
+        params.append((arg.arg, d is not None))
+    if a.kwarg:
+        rendered.append(f"**{a.kwarg.arg}")
+    ret = f" -> {ast.unparse(fn.returns)}" if fn.returns is not None else ""
+    return f"({', '.join(rendered)}){ret}", params
+
+
+def _is_dataclass(cls) -> bool:
+    for d in cls.decorator_list:
+        name = ast.unparse(d.func if isinstance(d, ast.Call) else d)
+        if name.split(".")[-1] == "dataclass":
+            return True
+    return False
+
+
+def extract_module_api(source: str) -> Dict[str, dict]:
+    """Public names of one module: functions, classes (constructor + public
+    methods, dataclass fields), UPPER_CASE constants."""
+    try:
+        tree = _quiet_parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    api: Dict[str, dict] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+            sig, params = _sig_of(node)
+            api[node.name] = {"kind": "def", "sig": sig, "params": params,
+                              "varkw": node.args.kwarg is not None}
+        elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+            methods, init_sig, init_params, varkw = [], "()", [], False
+            if _is_dataclass(node):
+                fields = []
+                for st in node.body:
+                    if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                        dv = f" = {ast.unparse(st.value)}" if st.value is not None else ""
+                        fields.append(f"{st.target.id}: {ast.unparse(st.annotation)}{dv}")
+                        init_params.append((st.target.id, st.value is not None))
+                init_sig = f"({', '.join(fields)})"
+            for st in node.body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    sig, params = _sig_of(st)
+                    if params and params[0][0] in ("self", "cls"):
+                        params = params[1:]
+                        sig = re.sub(r'^\((self|cls)(, )?', '(', sig)
+                    if st.name == "__init__":
+                        init_sig, init_params = re.sub(r' -> None$', '', sig), params
+                        varkw = st.args.kwarg is not None
+                    elif not st.name.startswith("_"):
+                        methods.append(f".{st.name}{sig}")
+            api[node.name] = {"kind": "dataclass" if _is_dataclass(node) else "class",
+                              "sig": init_sig, "params": init_params, "methods": methods,
+                              "varkw": varkw}
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id.isupper() and not t.id.startswith("_"):
+                    api[t.id] = {"kind": "const", "sig": "", "params": []}
+    return api
+
+
+def _local_uses(source: str, local: Set[str]) -> List[Tuple[str, str]]:
+    """(module, name) pairs this source takes from local modules:
+    `from m import a` and `import m` ... `m.a`."""
+    try:
+        tree = _quiet_parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    uses: List[Tuple[str, str]] = []
+    aliases: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in local:
+            uses += [(node.module, a.name) for a in node.names if a.name != "*"]
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in local:
+                    aliases[a.asname or a.name] = a.name
+    if aliases:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+                    and node.value.id in aliases:
+                uses.append((aliases[node.value.id], node.attr))
+    return sorted(set(uses))
+
+
+def _bad_keyword_calls(rel: str, source: str, api: Dict[str, dict]) -> List[str]:
+    """Calls into sibling modules that pass a keyword the callee does not take."""
+    try:
+        tree = _quiet_parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    names: Dict[str, Tuple[str, str]] = {}
+    mods: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in api:
+            for a in node.names:
+                names[a.asname or a.name] = (node.module, a.name)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in api:
+                    mods[a.asname or a.name] = a.name
+    out: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.keywords:
+            continue
+        f, target = node.func, None
+        if isinstance(f, ast.Name) and f.id in names:
+            target = names[f.id]
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in mods:
+            target = (mods[f.value.id], f.attr)
+        if not target:
+            continue
+        info = api.get(target[0], {}).get(target[1])
+        if not info or info.get("varkw") or info.get("kind") == "const":
+            continue
+        accepted = {p for p, _ in info.get("params") or []}
+        for kw in node.keywords:
+            if kw.arg is not None and kw.arg not in accepted:
+                out.append(f"{rel} calls {target[0]}.{target[1]}({kw.arg}=...), but it takes no "
+                           f"parameter '{kw.arg}' (accepts: {', '.join(sorted(accepted)) or 'none'})")
+    return out
+
+
+def freeze_project_api(proj: Path, rnd: int) -> Tuple[Dict[str, dict], str]:
+    """Structured API of the integrated project plus its rendering for agents:
+    every public name, who uses it, and every import that does not resolve."""
+    files = {str(p.relative_to(proj)).replace("\\", "/"): read_file_content_safe(p) or ""
+             for p in sorted(proj.rglob("*.py")) if p.is_file() and "__pycache__" not in p.parts
+             and ".home" not in p.parts}
+    top = {r: src for r, src in files.items() if "/" not in r}
+    local = {r[:-3] for r in top}
+    api = {r[:-3]: extract_module_api(src) for r, src in top.items() if not _is_test_file(r)}
+    unresolved: List[str] = []
+    for rel, src in files.items():
+        for mod, name in _local_uses(src, local):
+            if mod not in api:
+                continue
+            if name in api[mod]:
+                api[mod][name].setdefault("used_by", [])
+                if rel not in api[mod][name]["used_by"]:
+                    api[mod][name]["used_by"].append(rel)
+            else:
+                unresolved.append(f"{rel} uses {mod}.{name}, but {mod}.py defines no such name")
+    for rel, src in files.items():
+        unresolved += _bad_keyword_calls(rel, src, api)
+    lines = [f"CURRENT INTERFACES (extracted from the integrated project after round {rnd:02d} - "
+             "what the other modules are actually built against)"]
+    for mod in sorted(api):
+        lines.append(f"{mod}.py")
+        if not api[mod]:
+            lines.append("  (no public names)")
+        for name, info in api[mod].items():
+            head = {"def": "def ", "class": "class ", "dataclass": "@dataclass ", "const": ""}[info["kind"]]
+            used = info.get("used_by") or []
+            lines.append(f"  {head}{name}{info['sig']}" + (f"   <- used by {', '.join(used)}" if used else ""))
+            for m in info.get("methods", [])[:12]:
+                lines.append(f"      {m}")
+    if unresolved:
+        lines.append("")
+        lines.append("UNRESOLVED (a module uses a name its owner does not define - one side must change):")
+        lines += [f"  - {u}" for u in sorted(set(unresolved))[:20]]
+    lines += ["",
+              "RULES: keep every name marked 'used by' with a compatible signature. Adding names is "
+              "free. If you must rename or change one, keep the old form working (alias or wrapper) "
+              "and send a <note> to each agent that uses it. Where this list and the contract's "
+              "INTERFACES disagree, the contract wins: move toward it and tell the users."]
+    return api, enforce_ascii("\n".join(lines))
+
+
+def frozen_api_violations(node: dict, run_dir: Path) -> List[str]:
+    """Names other modules use that this attempt removed or made incompatible:
+    a used name that disappeared, a parameter that disappeared, or a new
+    required parameter."""
+    if not _RUN_FROZEN_API:
+        return []
+    ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
+    out: List[str] = []
+    for p in sorted(ndir.glob("*.py")):
+        mod = p.stem
+        frozen = _RUN_FROZEN_API.get(mod)
+        if not frozen or _is_test_file(p.name):
+            continue
+        now = extract_module_api(read_file_content_safe(p) or "")
+        if not now:
+            continue
+        for name, info in frozen.items():
+            used = info.get("used_by") or []
+            if not used:
+                continue
+            if name not in now:
+                out.append(f"breaks frozen interface: {mod}.{name} removed (used by {', '.join(used)})")
+                continue
+            old = dict(info.get("params") or [])
+            new = dict(now[name].get("params") or [])
+            gone = [k for k in old if k not in new]
+            added_req = [k for k, has_d in new.items() if k not in old and not has_d]
+            if gone or added_req:
+                what = ", ".join([f"-{k}" for k in gone] + [f"+{k} (required)" for k in added_req])
+                out.append(f"breaks frozen interface: {mod}.{name} signature changed ({what}; "
+                           f"used by {', '.join(used)})")
+    return out[:5]
+
+
+_RUN_ERROR_PATTERNS = [
+    (re.compile(r'"status"\s*:\s*"(error|fail|failed|failure|exception)"', re.I), '"status": "error"'),
+    (re.compile(r'"(error|exception|traceback)"\s*:\s*"[^"]', re.I), 'an "error" field'),
+    (re.compile(r'^Traceback \(most recent call last\):', re.M), "a Python traceback"),
+    (re.compile(r'"score"\s*:\s*(NaN|Infinity|-Infinity|null)', re.I), "a non-numeric score"),
+]
+
+
+def run_output_errors(out: str) -> List[str]:
+    """Error reports inside a run's output, whatever its exit code."""
+    return [label for rx, label in _RUN_ERROR_PATTERNS if rx.search(out or "")]
+
+
+def test_rules_section() -> str:
+    return "\n".join([
+        "TEST RULES (pipeline standard)",
+        "- Every metric the run reports gets a known-answer test: one known-good case and one",
+        "  known-bad case whose expected values DIFFER (use the KNOWN ANSWERS section if present).",
+        "  A metric that cannot fail such a test measures nothing.",
+        "- Tests check correctness against cases whose answer is known from first principles.",
+        "  They never assert the outcome the experiment is meant to measure (no 'the effect",
+        "  exists', no 'the difference is non-zero'): a null result must pass the test suite.",
+    ])
+
+
+def run_rules_section(cmd: str) -> str:
+    return "\n".join([
+        "RUN RULES (enforced by the pipeline's grounding run after every round)",
+        f"- `{cmd}` counts as a successful run only if it exits 0, prints a JSON line with",
+        '  "score": <finite number>, and reports no error ("status": "error", an "error" field,',
+        "  or a traceback in its output).",
+        "- Errors must reach the exit code. No catch-all except that prints an error and exits 0,",
+        "  and no silent fallback that substitutes another backend or a made-up value when",
+        "  something fails. A hidden failure is still scored as a failure.",
+    ])
+
+
+_NUM_KV_RE = re.compile(r'"([A-Za-z0-9_ .\-]{1,60})"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)')
+
+
+def numeric_fingerprint(out: str) -> List[Tuple[str, float]]:
+    """(key, value) for every numeric JSON field in an output, in order, minus
+    keys that legitimately vary between runs (timing, seeds)."""
+    fp = []
+    for k, v in _NUM_KV_RE.findall(out or ""):
+        if PROBE_IGNORE_KEYS.search(k):
+            continue
+        try:
+            fp.append((k, float(v)))
+        except ValueError:
+            pass
+    return fp
+
+
+def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
+                      run_out: str) -> Optional[dict]:
+    """Run the negative-control command and compare its numbers with the main
+    run's. RESPONSIVE: something moved. INSENSITIVE: every reported number is
+    identical under a change that must affect them."""
+    if not _RUN_PROBE_COMMAND:
+        return None
+    work = run_dir / "tests" / f"round{rnd:02d}" / "grounding_probe"
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
+    env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
+    rc, out, to = _run_limited(_RUN_PROBE_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
+                               cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS))
+    ptail = (out or "").strip()
+    base = {"command": _RUN_PROBE_COMMAND, "rc": rc, "timed_out": to,
+            "output_tail": ptail if len(ptail) <= 2500 else "...[cut]...\n" + ptail[-2500:]}
+    if to or rc != 0 or run_output_errors(out or ""):
+        tailline = (_extract_error_line(out or "", "python") or (out or "").strip()[-160:])
+        return {**base, "verdict": "PROBE FAILED",
+                "detail": f"the control command did not run cleanly ({'timeout' if to else f'exit {rc}'}): "
+                          f"{tailline[:200]} - the metrics' sensitivity is unverified."}
+    a, b = numeric_fingerprint(run_out), numeric_fingerprint(out or "")
+    if not a or not b:
+        return {**base, "verdict": "UNCOMPARABLE",
+                "detail": "no numeric JSON fields to compare between the run and the control."}
+    da, db = dict(a), dict(b)
+    changed = sorted(k for k in set(da) & set(db) if abs(da[k] - db[k]) > 1e-12 * max(1.0, abs(da[k])))
+    if len(a) == len(b) and all(x[0] == y[0] and abs(x[1] - y[1]) <= 1e-12 * max(1.0, abs(x[1]))
+                                for x, y in zip(a, b)):
+        return {**base, "verdict": "INSENSITIVE",
+                "detail": f"all {len(a)} reported number(s) are identical under the control "
+                          f"(e.g. {', '.join(f'{k}={v:g}' for k, v in a[:4])}). Either the metrics are "
+                          f"constant by construction or the entry point ignores the control flag - "
+                          f"both break the contract."}
+    return {**base, "verdict": "RESPONSIVE",
+            "detail": "changed under the control: "
+                      + (", ".join(f"{k} {da[k]:g} -> {db[k]:g}" for k in changed[:6]) or
+                         "the set or order of reported numbers differs")}
+
+
+_PROMPT_SKEPTIC_REVIEW = (
+    "You are a skeptical reviewer of a small scientific prototype. You receive the user's request, "
+    "the project's code, the final run output and the result of a negative-control run. For EACH "
+    "metric the output reports, decide from the code whether it actually measures what its name "
+    "says. Look for: values that are constant by construction, conditions that are always true, "
+    "comparisons against the wrong reference, parameters that never reach the computation, "
+    "operations that cannot affect the measured quantity, silent fallbacks, and circuits or models "
+    "missing the steps their names imply. Quote the exact code line that decides your verdict.\n\n"
+    "Output plain text only, one block per metric:\n"
+    "METRIC: <name as printed>\n"
+    "VERDICT: valid | suspect | invalid\n"
+    "EVIDENCE: <file>:<the exact line>\n"
+    "REASON: <one or two sentences>\n\n"
+    "Then one final line:\n"
+    "OVERALL: <one sentence on whether the run's score can be reported as a finding>\n"
+    "Judge only what the code does. Do not suggest fixes. Do not praise."
+)
+
+
+def final_skeptic_review(run_dir: Path, rnd: int) -> str:
+    """Apex review of the final integrated project and its run. A model's
+    judgment, not proof; saved and handed to the write-up refresh as required
+    caveats. Empty string if skipped or unparseable."""
+    if not FINAL_SKEPTIC_REVIEW or _shutdown_event.is_set():
+        return ""
+    idir = integration_dir_for(run_dir)
+    run_json = idir / f"round{rnd:02d}_run.json"
+    if not run_json.exists():
+        return ""
+    info = json.loads(read_file_content_safe(run_json) or "{}")
+    if not info.get("ok"):
+        print("\n[REVIEW] Skipped: the final run did not succeed, so there are no metrics to review.",
+              flush=True)
+        return ""
+    proj = idir / "latest"
+    code_parts, used = [], 0
+    files = sorted((p for p in proj.rglob("*.py") if p.is_file() and "__pycache__" not in p.parts),
+                   key=lambda p: (_is_test_file(p.name), str(p)))
+    for p in files:
+        body = read_file_content_safe(p) or ""
+        chunk = f"===== {p.relative_to(proj)} =====\n{body}\n"
+        if used + len(chunk) > REVIEW_CODE_CHARS:
+            chunk = chunk[:max(0, REVIEW_CODE_CHARS - used)] + "\n...[cut]\n"
+        code_parts.append(chunk)
+        used += len(chunk)
+        if used >= REVIEW_CODE_CHARS:
+            break
+    user = (f"USER REQUEST:\n{fit_context(_RUN_BRIEF, 6000)}\n\n"
+            f"FINAL RUN (and negative control):\n{fit_context(_RUN_LAST_RUN_TEXT, 10000)}\n\n"
+            f"CODE:\n{''.join(code_parts)}")
+    print(f"\n[REVIEW] Skeptic review of the final run's metrics on apex "
+          f"({len(files)} file(s), {used:,} chars of code)...", flush=True)
+    try:
+        raw, _, _ = _apex_completion(apex_client(timeout=WORKER_TIMEOUT_SECS), _PROMPT_SKEPTIC_REVIEW,
+                                     user, APEX_PLAN_TOKENS, 0.1)
+    except Exception as exc:
+        print(f"    [!] Review failed: {str(exc)[:120]}", flush=True)
+        return ""
+    text = enforce_ascii((raw or "").strip())
+    verdicts = re.findall(r'^\s*VERDICT:\s*(valid|suspect|invalid)', text, re.I | re.M)
+    if not verdicts:
+        print("    [!] Review produced no VERDICT lines; ignored.", flush=True)
+        return ""
+    with open(idir / "final_review.md", "w", encoding="ascii") as f:
+        f.write("# Skeptic review (apex model judgment, not proof)\n\n" + text + "\n")
+    counts = {v: sum(1 for x in verdicts if x.lower() == v) for v in ("valid", "suspect", "invalid")}
+    print(f"    [+] {len(verdicts)} metric(s): {counts['valid']} valid, {counts['suspect']} suspect, "
+          f"{counts['invalid']} invalid -> {INTEGRATION_DIRNAME}/final_review.md", flush=True)
+    for m in re.finditer(r'METRIC:\s*(.+)\n\s*VERDICT:\s*(suspect|invalid)', text, re.I):
+        print(f"    [-] {m.group(1).strip()[:60]}: {m.group(2).lower()}", flush=True)
+    append_event(run_dir, {"round": rnd, "event": "skeptic_review", **counts})
+    return text
+
+
+def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Optional[dict]:
+    """Run the RUN command in a throwaway copy of the integrated project and keep
+    its real output. This is the only source a write-up may report from."""
+    if not _RUN_COMMAND:
+        return None
+    work = run_dir / "tests" / f"round{rnd:02d}" / "grounding"
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
+    env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
+    start = time.time()
+    rc, out, to = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
+                               cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS))
+    elapsed = time.time() - start
+    m = _CMD_SCORE_RE.findall(out or "")
+    score = None
+    if m:
+        try:
+            score = float(m[-1])
+        except ValueError:
+            score = None
+    reported_errors = run_output_errors(out or "")
+    exited_ok = rc == 0 and not to
+    # A run only counts if it exits 0, prints the contract's score line, and
+    # reports no error. A runner that catches everything and exits 0 fails here.
+    ok = exited_ok and score is not None and not reported_errors
+    produced = sorted(str(p.relative_to(work / "project")) for p in (work / "project").rglob("*")
+                      if p.is_file() and not (proj / p.relative_to(work / "project")).exists()
+                      and "__pycache__" not in p.parts and ".home" not in p.parts)[:20]
+    if ok:
+        status = "SUCCEEDED"
+    elif to:
+        status = "TIMED OUT"
+    elif rc != 0:
+        status = f"FAILED (exit {rc})"
+    elif reported_errors:
+        status = f"FAILED (exit 0, but the output reports an error: {reported_errors[0]})"
+    else:
+        status = "FAILED (exit 0, but no \"score\": <number> line was printed)"
+    probe = sensitivity_probe(proj, rnd, test_ctx, run_dir, out or "") if ok else None
+    tail = (out or "").strip()
+    if len(tail) > 6000:
+        tail = "...[earlier output cut]...\n" + tail[-6000:]
+    lines = [f"ACTUAL RUN OUTPUT (round {rnd:02d}; the pipeline ran the integrated project)",
+             f"command: {_RUN_COMMAND}", f"status: {status} in {elapsed:.1f}s",
+             f"score line found: {score if score is not None else 'none'}"]
+    if produced:
+        lines.append(f"files written: {', '.join(produced)}")
+    lines += ["output:", tail or "(no output)", ""]
+    if probe:
+        lines.append(f"NEGATIVE CONTROL: {probe['command']} -> {probe['verdict']}")
+        lines.append(f"  {probe['detail']}")
+        lines.append("control output:")
+        lines.append(probe.get("output_tail") or "(no output)")
+        lines.append("")
+    if probe and probe["verdict"] == "INSENSITIVE":
+        lines.append("RULE: the reported metrics did NOT change under a control that must change them, so "
+                     "they do not measure what their names say. A write-up must state this plainly and must "
+                     "not present the score as a finding - neither as an effect nor as a null result. The "
+                     "owners of the metric code: fix the measurement.")
+    elif ok:
+        lines.append("RULE: any number, table or claim about results in a write-up must appear in this "
+                     "output (or in the files it wrote). A score near zero is a valid result: report it as "
+                     "such. Do not state results this run did not produce.")
+    else:
+        lines.append("RULE: no successful run exists yet. A write-up must say so plainly and must not "
+                     "state any result, number or trend. The owners of the failing code: fix it.")
+    text = enforce_ascii("\n".join(lines))
+    idir = integration_dir_for(run_dir)
+    with open(idir / f"round{rnd:02d}_run.md", "w", encoding="ascii") as f:
+        f.write(text + "\n")
+    res = {"round": rnd, "command": _RUN_COMMAND, "ok": ok, "rc": rc, "timed_out": to,
+           "score": score, "reported_errors": reported_errors, "status": status,
+           "elapsed": round(elapsed, 2), "produced": produced, "probe": probe}
+    with open(idir / f"round{rnd:02d}_run.json", "w", encoding="ascii") as f:
+        json.dump(res, f, indent=2)
+    print(f"[RUN] ROUND {rnd:02d}: {_RUN_COMMAND} -> {status} in {elapsed:.1f}s"
+          + (f", score {score:g}" if score is not None else ", no score line"), flush=True)
+    if probe:
+        print(f"[PROBE] ROUND {rnd:02d}: {probe['command']} -> {probe['verdict']}: {probe['detail'][:160]}",
+              flush=True)
+    if reported_errors:
+        m_err = re.search(r'"(?:error|exception)"\s*:\s*"([^"]{1,200})', out or "", re.I)
+        if m_err:
+            print(f"    [-] reported error: {m_err.group(1)}", flush=True)
+    if not ok and not reported_errors and rc != 0:
+        err = _extract_error_line(out or "", "python")
+        if err:
+            print(f"    [-] {err[:200]}", flush=True)
+    return res
+
+
+def load_round_grounding(run_dir: Path, upto_rnd: int) -> None:
+    """Resume: restore the latest frozen API and run output from disk."""
+    global _RUN_FROZEN_API, _RUN_FROZEN_API_TEXT, _RUN_LAST_RUN_TEXT
+    idir = integration_dir_for(run_dir)
+    for r in range(upto_rnd, 0, -1):
+        api_json = idir / f"round{r:02d}_api.json"
+        if FREEZE_INTERFACES and not _RUN_FROZEN_API and api_json.exists():
+            try:
+                _RUN_FROZEN_API = json.loads(read_file_content_safe(api_json) or "{}")
+                _RUN_FROZEN_API_TEXT = read_file_content_safe(idir / f"round{r:02d}_api.md") or ""
+            except json.JSONDecodeError:
+                pass
+        run_md = idir / f"round{r:02d}_run.md"
+        if not _RUN_LAST_RUN_TEXT and run_md.exists():
+            _RUN_LAST_RUN_TEXT = read_file_content_safe(run_md) or ""
+
+
+_IMPORT_PROBE = ("import os, sys; os.environ.setdefault('QRACK_LIB_PATH', sys.argv[1]); "
+                 "__import__(sys.argv[2])")
+
+
+def probe_importable(run_dir: Path, candidates: List[str]) -> List[str]:
+    """Candidates importable by the interpreter that runs tests and integration."""
+    py, venv_bin = ensure_test_venv(run_dir)
+    home = run_dir / "tests"
+    home.mkdir(parents=True, exist_ok=True)
+    env = _test_env(home, venv_bin)
+    ok = []
+    for m in candidates:
+        if not m.isidentifier():
+            continue
+        rc, _, to = _run_limited([py, "-c", _IMPORT_PROBE, QRACK_LIB_PATH, m], 120, home, env)
+        if rc == 0 and not to:
+            ok.append(m)
+    return ok
+
+
+def dependency_section(allowed: List[str]) -> str:
+    listed = ", ".join(allowed) if allowed else "(none)"
+    lines = [
+        "DEPENDENCIES (probed from the evaluation environment - enforced)",
+        f"- Third-party modules available: {listed}. The Python standard library is fine.",
+        "- Import NO other third-party module, not even inside try/except as an optional",
+        "  backend. The evaluator rejects any attempt that imports one: it scores zero and",
+        "  is not tested. Nothing else will be installed.",
+    ]
+    if "pyqrack" in allowed:
+        lines += [
+            "- Every Python file that imports pyqrack must contain this line verbatim and export",
+            "  it to os.environ before pyqrack is imported:",
+            f'      QRACK_LIB_PATH = "{QRACK_LIB_PATH}"',
+        ]
+    return "\n".join(lines)
+
+
+_API_PROBE_SRC = r"""
+import os, sys, json, inspect, enum
+os.environ.setdefault("QRACK_LIB_PATH", sys.argv[1])
+out = {}
+for target in sys.argv[2:]:
+    mod, _, attr = target.rpartition(".")
+    try:
+        obj = getattr(__import__(mod, fromlist=[attr]), attr)
+    except Exception as exc:
+        out[target] = {"error": str(exc)[:200]}
+        continue
+    info = {"kind": "other", "members": {}}
+    if isinstance(obj, type) and issubclass(obj, enum.Enum):
+        info["kind"] = "enum"
+        info["members"] = {m.name: repr(m.value) for m in obj}
+    elif isinstance(obj, type):
+        info["kind"] = "class"
+        try:
+            info["init"] = str(inspect.signature(obj.__init__)).replace("(self, ", "(").replace("(self)", "()")
+        except (TypeError, ValueError):
+            info["init"] = "(...)"
+        for name in sorted(dir(obj)):
+            if name.startswith("_"):
+                continue
+            member = getattr(obj, name, None)
+            if callable(member):
+                try:
+                    sig = str(inspect.signature(member)).replace("(self, ", "(").replace("(self)", "()")
+                except (TypeError, ValueError):
+                    sig = "(...)"
+                info["members"][name] = sig
+            else:
+                info["members"][name] = None
+    elif callable(obj):
+        info["kind"] = "function"
+        try:
+            info["init"] = str(inspect.signature(obj))
+        except (TypeError, ValueError):
+            info["init"] = "(...)"
+    out[target] = info
+print(json.dumps(out))
+"""
+
+# Methods whose full signature is always shown (the rest may be names only).
+_API_CORE_PREFIXES = ("out_", "in_", "prob", "measure", "reset", "m_all", "num_qubits", "mtrx",
+                      "mcmtrx", "swap", "set_concurrency", "seed")
+
+
+def probe_api_facts(run_dir: Path, targets: List[str], allowed: List[str]) -> Dict[str, dict]:
+    """Real public API of the probe targets whose module is allowed."""
+    targets = [t for t in targets if t.split(".")[0] in set(allowed)]
+    if not targets:
+        return {}
+    py, venv_bin = ensure_test_venv(run_dir)
+    home = run_dir / "tests"
+    home.mkdir(parents=True, exist_ok=True)
+    rc, out, to = _run_limited([py, "-c", _API_PROBE_SRC, QRACK_LIB_PATH] + targets, 120, home,
+                               _test_env(home, venv_bin))
+    if rc != 0 or to:
+        return {}
+    try:
+        return json.loads((out or "").strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {}
+
+
+def api_facts_section(facts: Dict[str, dict], budget: int = API_FACTS_BUDGET) -> str:
+    """Render probed APIs for the contract. Short gate-like names and the core
+    I/O methods get full signatures; if the budget runs out the remaining
+    methods are still listed by name, so the list stays COMPLETE."""
+    if not facts:
+        return ""
+    lines = ["API FACTS (probed with inspect in the evaluation environment)",
+             "  These are the ONLY members these objects have. A name not listed here does not",
+             "  exist - do not call it, even if you remember it from another library version."]
+    for target, info in facts.items():
+        if info.get("error"):
+            lines.append(f"{target}: not inspectable ({info['error'][:80]})")
+            continue
+        if info.get("kind") == "enum":
+            lines.append(f"{target} (enum): " + ", ".join(f"{k}={v}" for k, v in info["members"].items()))
+            continue
+        if info.get("kind") == "function":
+            lines.append(f"{target}{info.get('init', '(...)')}")
+            continue
+        lines.append(f"{target}{info.get('init', '(...)')}")
+        members = info.get("members") or {}
+        core = [n for n, sg in members.items() if sg is not None
+                and (len(n) <= 4 or n.startswith(_API_CORE_PREFIXES))]
+        rest = [n for n in members if n not in core]
+        used = sum(len(l) + 1 for l in lines)
+        sig_lines = []
+        for n in core:
+            ln = f"  .{n}{members[n]}"
+            if used + len(ln) + 1 > budget * 0.75:
+                rest.append(n)
+                continue
+            sig_lines.append(ln)
+            used += len(ln) + 1
+        lines += sig_lines
+        if rest:
+            lines.append("  other members (names only): " + ", ".join(sorted(rest)))
+    text = "\n".join(lines)
+    return text if len(text) <= budget else text[:budget - 30].rsplit(",", 1)[0] + ", ...[cut]"
+
+
+_STDLIB_MODULES: Set[str] = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names) \
+    | {"__future__"}
+
+
+def _quiet_parse(source: str):
+    """ast.parse without SyntaxWarnings (e.g. a LaTeX '\\_' in an agent's
+    docstring) leaking to the console as '<unknown>:N' lines."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return ast.parse(source)
+
+
+def _imported_roots(source: str) -> Set[str]:
+    """Top-level module names a Python source imports anywhere (absolute imports,
+    plus importlib.import_module / __import__ with a literal name)."""
+    try:
+        tree = _quiet_parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    out: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                out.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call) and node.args:
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+            arg = node.args[0]
+            if name in ("import_module", "__import__") and isinstance(arg, ast.Constant) \
+                    and isinstance(arg.value, str) and arg.value:
+                out.add(arg.value.split(".")[0])
+    return out
+
+
+def disallowed_imports(node: dict, run_dir: Path) -> List[str]:
+    """'module (file)' for every third-party import outside the probed list.
+    Local modules are any .py stem or package directory in the project: this
+    attempt's files, every sibling's work, and the required deliverables."""
+    if _RUN_ALLOWED_IMPORTS is None:
+        return []
+    wroot = work_dir_for(run_dir)
+    ndir = wroot / node.get("dir", "") / node["id"]
+    if not ndir.exists():
+        return []
+    local: Set[str] = {PurePosixPath(d).stem for d in _RUN_DELIVERABLES}
+    local |= {PurePosixPath(d).parts[0] for d in _RUN_DELIVERABLES if len(PurePosixPath(d).parts) > 1}
+    for p in wroot.rglob("*"):
+        if p.is_file() and p.suffix == ".py":
+            local.add(p.stem)
+        elif p.is_dir():
+            local.add(p.name)
+    allowed = set(_RUN_ALLOWED_IMPORTS) | _STDLIB_MODULES | local
+    bad: Dict[str, str] = {}
+    for p in sorted(ndir.rglob("*.py")):
+        if not p.is_file() or p.is_symlink():
+            continue
+        for mod in sorted(_imported_roots(read_file_content_safe(p) or "")):
+            if mod not in allowed and mod not in bad:
+                bad[mod] = str(p.relative_to(ndir))
+    return [f"{m} ({f})" for m, f in bad.items()]
+
+
+def _mentions(text: str, deliverable: str) -> Optional[int]:
+    """Position of the first mention of a deliverable (full path, or its basename
+    when that is what the assignment wrote), else None."""
+    best = None
+    for token in {deliverable, PurePosixPath(deliverable).name}:
+        m = re.search(r'(?<![A-Za-z0-9_.-])' + re.escape(token) + r'(?![A-Za-z0-9_-])', text)
+        if m and (best is None or m.start() < best):
+            best = m.start()
+    return best
+
+
+def deliverable_coverage(pieces: List[str], required: Dict[str, str]) -> Tuple[Dict[str, int], List[str]]:
+    """Owner piece index per deliverable, and the deliverables nobody mentions.
+    A piece owns the deliverable it mentions FIRST; a deliverable mentioned only
+    as a later dependency is owned by the piece that mentions it earliest."""
+    firsts: Dict[int, str] = {}
+    for i, piece in enumerate(pieces):
+        hits = [(pos, d) for d in required if (pos := _mentions(piece, d)) is not None]
+        if hits:
+            firsts[i] = min(hits)[1]
+    owner: Dict[str, int] = {}
+    for i, d in firsts.items():
+        owner.setdefault(d, i)
+    missing = []
+    for d in required:
+        if d in owner:
+            continue
+        cands = [(pos / max(1, len(pieces[i])), i) for i in range(len(pieces))
+                 if (pos := _mentions(pieces[i], d)) is not None]
+        if cands:
+            owner[d] = min(cands)[1]
+        else:
+            missing.append(d)
+    return owner, missing
+
+
+def attach_deliverable_specs(pieces: List[str], required: Dict[str, str]) -> List[str]:
+    """Give each owner the verbatim spec of every deliverable it owns, and add a
+    dedicated assignment for any deliverable no piece mentions."""
+    owner, missing = deliverable_coverage(pieces, required)
+    pieces = list(pieces)
+    for d in missing:
+        pieces.append(f"Produce `{d}` exactly as specified below and in the PINNED CONTRACT.")
+        owner[d] = len(pieces) - 1
+    owned: Dict[int, List[str]] = {}
+    for d, i in owner.items():
+        owned.setdefault(i, []).append(d)
+    out = []
+    for i, piece in enumerate(pieces):
+        ds = owned.get(i, [])
+        if ds:
+            specs = "\n\n".join(required[d] for d in ds if required.get(d))
+            piece = (f"{piece}\n\nYOU OWN: {', '.join(ds)}\n"
+                     f"VERBATIM SPEC FROM THE BRIEF (binding):\n{specs}")
+        out.append(piece)
+    return out
+
+
+def brief_meta_path_for(run_dir: Path) -> Path:
+    return run_dir / COMMS_DIRNAME / "brief_meta.json"
+
+
+def save_brief_meta(run_dir: Path, meta: dict) -> None:
+    path = brief_meta_path_for(run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="ascii") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=True)
+    if meta.get("contract"):
+        with open(run_dir / "CONTRACT.md", "w", encoding="ascii") as f:
+            f.write(meta["contract"].rstrip() + "\n")
+
+
+def load_brief_meta(run_dir: Path) -> Optional[dict]:
+    path = brief_meta_path_for(run_dir)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(read_file_content_safe(path) or "")
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def log_partition_failure(attempt: int, error: str, raw: Optional[str], user_content: str) -> None:
+    """Keep the planner's raw reply for a failed partition attempt, so a 'Could not
+    locate JSON array' can be diagnosed (fences, prose, truncation, refusal)."""
+    if _RUN_DIR is None:
+        return
+    fdir = _RUN_DIR / COMMS_DIRNAME / "partition_failures"
+    try:
+        fdir.mkdir(parents=True, exist_ok=True)
+        path = fdir / f"attempt_{attempt}.txt"
+        body = raw if raw is not None else "(no reply: the apex call itself failed)"
+        with open(path, "w", encoding="ascii", errors="replace") as f:
+            f.write(f"error: {error}\n")
+            f.write(f"prompt chars: {len(user_content):,} | reply chars: {len(raw or ''):,}"
+                    f" | reply tokens cap: {APEX_PLAN_TOKENS}\n")
+            if raw:
+                opens, closes = raw.count("["), raw.count("]")
+                f.write(f"brackets: [ x{opens}, ] x{closes}"
+                        + ("  (unbalanced - likely cut off at the token cap)" if opens != closes else "")
+                        + f" | code fences: {raw.count('```')}\n")
+            f.write("\n===== RAW REPLY =====\n")
+            f.write(enforce_ascii(body) + "\n")
+            f.write("\n===== PROMPT SENT =====\n")
+            f.write(enforce_ascii(user_content) + "\n")
+        head = re.sub(r"\s+", " ", (raw or "").strip())[:160]
+        print(f"        raw reply ({len(raw or ''):,} chars) -> {path.relative_to(_RUN_DIR)}"
+              + (f" | starts: {head!r}" if head else ""), flush=True)
+    except OSError:
+        pass
+
+
+def decompose_to_atomic_pieces(large_query: str, required: Optional[Dict[str, str]] = None,
+                               contract: str = "") -> tuple:
     """Planning. Runs on APEX: it is neither an agent assignment nor a merge."""
     print(f"\n[PHASE 3] [1] INGRESS: Analyzing query...\n    Length: {len(large_query)} characters", flush=True)
 
+    required = dict(required or {})
     fitted_query = fit_context(large_query, MAX_CONTEXT_CHARS)
     user_content = f"Partition this into mutually exclusive agent assignments:\n\n{fitted_query}"
+    if required:
+        user_content += (
+            "\n\nREQUIRED DELIVERABLES (from the original brief). Every one of these must be owned by "
+            "exactly one assignment, and that assignment must name it verbatim:\n"
+            + "\n".join(f"- {d}" for d in required))
+    if contract:
+        user_content += ("\n\nINTERFACE CONTRACT (for orientation; every agent receives it verbatim):\n"
+                         + fit_context(contract, 12000))
+    base_content = user_content
+    best_pieces: Optional[List[str]] = None
+    best_missing: List[str] = []
+    tokens = (0, 0)
 
     for attempt in range(1, MAX_RETRIES + 1):
         client = apex_client(timeout=WORKER_TIMEOUT_SECS)
         print(f"[2] PARTITION: Planning agent assignments via apex {GEN_API_BASE} [{LLM_MODEL}] "
               f"(Attempt {attempt}/{MAX_RETRIES})...", flush=True)
+        raw_output = None
         try:
             start_time = time.time()
             raw_output, prompt_tokens, comp_tokens = _apex_completion(
@@ -3637,11 +5044,40 @@ def decompose_to_atomic_pieces(large_query: str) -> tuple:
 
             elapsed = round(time.time() - start_time, 2)
             print(f"    [+] Success! Partitioned into {len(atomic_pieces)} agent assignment(s) in {elapsed}s.", flush=True)
-            return atomic_pieces, prompt_tokens, comp_tokens
+            if not required:
+                return atomic_pieces, prompt_tokens, comp_tokens
+            _, missing = deliverable_coverage(atomic_pieces, required)
+            if best_pieces is None or len(missing) < len(best_missing):
+                best_pieces, best_missing = atomic_pieces, missing
+                tokens = (prompt_tokens, comp_tokens)
+            if not missing:
+                break
+            print(f"    [!] Coverage: {len(missing)} required deliverable(s) unowned: "
+                  f"{', '.join(missing)}", flush=True)
+            if attempt < MAX_RETRIES:
+                user_content = (base_content + "\n\nYOUR PREVIOUS PARTITION OMITTED THESE REQUIRED "
+                                "DELIVERABLES - include an owner for each: " + ", ".join(missing))
 
         except Exception as e:
             print(f"    [!] Partition Error: {e}", flush=True)
+            log_partition_failure(attempt, str(e), raw_output, user_content)
             time.sleep(2)
+
+    if required:
+        if best_pieces is None:
+            print("    [!] Partitioning failed; falling back to one assignment per required deliverable.",
+                  flush=True)
+            best_pieces = []
+        elif best_missing:
+            print(f"    [*] Adding dedicated assignment(s) for: {', '.join(best_missing)}", flush=True)
+        pieces = attach_deliverable_specs(best_pieces, required)[:MAX_DECOMPOSE_TASKS]
+        owner, missing = deliverable_coverage(pieces, required)
+        print(f"    [+] Deliverable coverage: {len(required) - len(missing)}/{len(required)} owned "
+              f"across {len(pieces)} assignment(s).", flush=True)
+        if missing:
+            print(f"    [!] Still unowned after clamping to {MAX_DECOMPOSE_TASKS}: {', '.join(missing)}",
+                  flush=True)
+        return pieces, tokens[0], tokens[1]
 
     fallback = fit_context(large_query, AGENT_OBJECTIVE_BUDGET)
     return [fallback], estimate_tokens(fallback), 0
@@ -3789,6 +5225,148 @@ def reconcile_round(run_dir: Path, rnd: int, roster: List[dict],
     return report, stats
 
 
+_NUM_RE = re.compile(r'(?<![\d.])-?\d+\.\d{2,}(?:[eE][-+]?\d+)?(?![\d.])')
+
+
+def ungrounded_numbers(writeup: str, evidence: str) -> List[str]:
+    """Decimal numbers in a write-up that match no number in the run output or
+    the files it wrote, allowing for rounding to the write-up's precision."""
+    ev = []
+    for tok in _NUM_RE.findall(evidence or "") + re.findall(r'-?\d+\.\d+(?:[eE][-+]?\d+)?', evidence or ""):
+        try:
+            ev.append(float(tok))
+        except ValueError:
+            pass
+    out = []
+    for tok in _NUM_RE.findall(writeup or ""):
+        try:
+            v = float(tok)
+        except ValueError:
+            continue
+        decimals = len(tok.split(".")[1].split("e")[0].split("E")[0])
+        tol = 0.5 * 10 ** (-decimals) + 1e-12
+        if not any(abs(v - e) <= tol for e in ev) and tok not in out:
+            out.append(tok)
+    return out[:20]
+
+
+def final_writeup_refresh(run_dir: Path, roster: List[dict], rnd: int, background: str,
+                          review: str = "") -> None:
+    """One extra call per write-up deliverable after the last grounding run: the
+    owner rewrites it against the FINAL output, which no in-round attempt could
+    see. Not recorded in the trees (it is not exploration and costs no budget);
+    the refreshed file replaces the one in integration/latest/."""
+    if not FINAL_WRITEUP_REFRESH or _shutdown_event.is_set():
+        return
+    idir = integration_dir_for(run_dir)
+    run_json = idir / f"round{rnd:02d}_run.json"
+    if not run_json.exists() or not _RUN_LAST_RUN_TEXT:
+        return
+    writeups = [d for d in _RUN_DELIVERABLES if d.lower().endswith(".md")]
+    if not writeups:
+        return
+    owner_idx, _ = deliverable_coverage([r["objective"] for r in roster], {d: "" for d in writeups})
+    best = best_known_nodes(run_dir, rnd)
+    live = [n for _, nodes in load_pool(run_dir) for n in nodes if n.get("task")]
+    run_info = json.loads(read_file_content_safe(run_json) or "{}")
+    evidence_dir = run_dir / "tests" / f"round{rnd:02d}" / "grounding" / "project"
+    evidence = _RUN_LAST_RUN_TEXT
+    for rel in run_info.get("produced", []):
+        evidence += "\n" + (read_file_content_safe(evidence_dir / rel) or "")[:20000]
+    print(f"\n[WRITE-UP] Final refresh against round {rnd:02d}'s run "
+          f"({'succeeded' if run_info.get('ok') else 'failed'}): {', '.join(writeups)}", flush=True)
+    slot_queue, _ = build_worker_slot_queue(prefix="F-Slot")
+    summary = []
+    for d in writeups:
+        i = owner_idx.get(d)
+        if i is None:
+            print(f"    [!] No owner found for {d}; skipped.", flush=True)
+            continue
+        agent = roster[i]
+        parent = best.get(agent["id"])
+        if parent is None:
+            print(f"    [!] {agent['id']} has no successful attempt to refresh; skipped.", flush=True)
+            continue
+        extra = (
+            "FINAL WRITE-UP REFRESH. Every round is finished and the pipeline has just run the final "
+            "integrated project; its real output is in LATEST REAL RUN OF THE INTEGRATED PROJECT below. "
+            f"Rewrite {d} so that every number, table and claim about results matches that output "
+            "exactly - and states nothing it does not show. Quote numbers as printed. If the run "
+            "FAILED, say so plainly and report no results. Keep the prompt's honesty rules: hardware "
+            f"figures marked unverified, a null result reported as-is. Emit ONLY {d}."
+            + (" If the run output shows a NEGATIVE CONTROL verdict, report it; if it is INSENSITIVE, "
+               "say the metrics do not measure what their names claim and present no finding."
+               if _RUN_PROBE_COMMAND else "")
+            + ("\n\nSKEPTIC REVIEW OF THE METRICS (an apex model read the final code and output; its "
+               "judgment, not proof). Every metric marked 'suspect' or 'invalid' below MUST appear in the "
+               "write-up as an explicit caveat, with the reason, next to any number it concerns:\n"
+               + fit_context(review, 6000) if review else ""))
+        endpoint, slot_name = slot_queue.get()
+        node_id = f"r{rnd:02d}final{i + 1:02d}"
+        try:
+            node = run_agent(agent, roster, rnd, node_id, 900000 + i, parent["id"],
+                             parent.get("depth", 1) + 1, endpoint, slot_name, background, run_dir,
+                             live, threading.Lock(), parent_task_node=parent,
+                             reference_hashes=set(parent.get("file_hashes", [])), extra_stage=extra)
+        except Exception as exc:
+            print(f"    [!] Refresh of {d} raised {str(exc)[:100]}", flush=True)
+            continue
+        finally:
+            slot_queue.put((endpoint, slot_name))
+        src = work_dir_for(run_dir) / agent["dir"] / node_id / d
+        if node.get("status") not in ("success", "partial") or not src.is_file():
+            print(f"    [!] Refresh of {d} produced no file (status {node.get('status')}); "
+                  f"integration/latest keeps the previous version.", flush=True)
+            continue
+        text = read_file_content_safe(src) or ""
+        dest = idir / "latest" / d
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        missing = ungrounded_numbers(text, evidence)
+        summary.append({"deliverable": d, "agent": agent["id"], "node": node_id,
+                        "parent": parent["id"], "ungrounded_numbers": missing})
+        print(f"    [+] {d} refreshed by {agent['id']} ({node_id}) -> "
+              f"{INTEGRATION_DIRNAME}/latest/{d}", flush=True)
+        if missing:
+            print(f"    [!] {len(missing)} number(s) in {d} match nothing in the run output: "
+                  f"{', '.join(missing[:8])}", flush=True)
+        append_event(run_dir, {"round": rnd, "event": "final_writeup_refresh", "deliverable": d,
+                               "node": node_id, "ungrounded_numbers": missing})
+    with open(idir / "final_writeup_refresh.json", "w", encoding="ascii") as f:
+        json.dump({"round": rnd, "run_ok": run_info.get("ok"), "refreshed": summary}, f, indent=2)
+
+
+def after_round_grounding(run_dir: Path, rnd: int, test_ctx: dict) -> None:
+    """Freeze the integrated project's API and run it; both feed the next round."""
+    global _RUN_FROZEN_API, _RUN_FROZEN_API_TEXT, _RUN_LAST_RUN_TEXT
+    proj = integration_dir_for(run_dir) / f"round{rnd:02d}"
+    if not proj.exists():
+        return
+    idir = integration_dir_for(run_dir)
+    if FREEZE_INTERFACES:
+        try:
+            api, text = freeze_project_api(proj, rnd)
+            _RUN_FROZEN_API, _RUN_FROZEN_API_TEXT = api, text
+            with open(idir / f"round{rnd:02d}_api.json", "w", encoding="ascii") as f:
+                json.dump(api, f, indent=2, ensure_ascii=True)
+            with open(idir / f"round{rnd:02d}_api.md", "w", encoding="ascii") as f:
+                f.write(text + "\n")
+            used = sum(1 for m in api.values() for i in m.values() if i.get("used_by"))
+            unres = text.count("\n  - ")
+            print(f"[API] ROUND {rnd:02d}: {sum(len(m) for m in api.values())} public name(s) in "
+                  f"{len(api)} module(s), {used} used across modules, {unres} unresolved "
+                  f"-> frozen for round {rnd + 1:02d}", flush=True)
+        except Exception as exc:
+            print(f"    [!] Interface freeze failed: {str(exc)[:120]}", flush=True)
+    if _RUN_COMMAND:
+        try:
+            res = grounding_run(proj, rnd, test_ctx, run_dir)
+            if res is not None:
+                _RUN_LAST_RUN_TEXT = read_file_content_safe(idir / f"round{rnd:02d}_run.md") or ""
+        except Exception as exc:
+            print(f"    [!] Grounding run failed: {str(exc)[:120]}", flush=True)
+
+
 def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Path,
                      policy_source: str, budget: int,
                      semantic_guidance: bool = False) -> Tuple[List[dict], dict]:
@@ -3815,7 +5393,8 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
             if n.get("task"):
                 prior_hashes.setdefault(n["task"], set()).update(n.get("file_hashes", []))
 
-    test_ctx = new_test_context(run_dir) if EVAL_INLINE_TESTS else None
+    test_ctx = (new_test_context(run_dir, roster)
+                if (EVAL_INLINE_TESTS or EVAL_INTEGRATION) else None)
     explorer = LiveExplorer(tasks, budget - reserve, roster, rnd, background, run_dir,
                             slot_queue, MAX_PARALLELISM, ONLINE_MAX_DECISION_ROUNDS,
                             prior_hashes=prior_hashes, semantic_guidance=semantic_guidance,
@@ -3872,7 +5451,17 @@ def run_online_round(roster: List[dict], rnd: int, background: str, run_dir: Pat
     test_results = list(test_ctx["results"]) if test_ctx else []
     write_round_test_reports(run_dir, rnd, test_results)
 
+    integ = None
+    if EVAL_INTEGRATION and test_ctx is not None and not _shutdown_event.is_set():
+        try:
+            integ = integration_round_report(run_dir, rnd, roster, test_ctx)
+        except Exception as exc:
+            print(f"    [!] Round integration failed: {str(exc)[:120]}", flush=True)
+    if integ and not _shutdown_event.is_set():
+        after_round_grounding(run_dir, rnd, test_ctx)
+
     report, stats = reconcile_round(run_dir, rnd, roster, nodes)
+    stats["integration_q"] = integ["q"] if integ else None
     stats["spent"] = explorer.spent()
     stats["support_spent"] = support_spent
     stats["decision_rounds"] = policy_rounds
@@ -3953,6 +5542,31 @@ def build_run_manifest(run_dir: Path, roster: List[dict], pool: List[Tuple[int, 
                      "is already recorded. Versions are chained (each revises its predecessor) and "
                      "the deployed policy is version 0, so the selected policy is never worse than "
                      "it in mean replay score on the recorded history.")
+        lines.append("")
+
+    idir = integration_dir_for(run_dir)
+    ireports = []
+    for rp in sorted(idir.glob("round[0-9][0-9].json")) if idir.exists() else []:
+        try:
+            ireports.append(json.loads(read_file_content_safe(rp) or "{}"))
+        except json.JSONDecodeError:
+            continue
+    if ireports:
+        lines.append("## Integration (assembled project)")
+        lines.append("")
+        lines.append("| Round | q | compile | import | pytest | command | command score | missing tasks | conflicts |")
+        lines.append("|-------|---|---------|--------|--------|---------|---------------|---------------|-----------|")
+        for ir in ireports:
+            g = ir.get("groups", {})
+            fmt = lambda k: f"{g[k]:.2f}" if k in g else "-"
+            q = ir.get("q")
+            lines.append(f"| {ir.get('round', 0)} | {q:.3f} | " if q is not None else f"| {ir.get('round', 0)} | - | ")
+            lines[-1] += (f"{fmt('compile')} | {fmt('import')} | {fmt('pytest')} | {fmt('command')} | "
+                          f"{ir.get('command_score') if ir.get('command_score') is not None else '-'} | "
+                          f"{', '.join(ir.get('missing_tasks', [])) or '-'} | {len(ir.get('conflicts', []))} |")
+        lines.append("")
+        lines.append(f"Latest assembled project: `{INTEGRATION_DIRNAME}/latest/` "
+                     "(best known deliverable of every task, agent prefixes removed).")
         lines.append("")
 
     lines.append("## Discovery Tree")
@@ -4070,6 +5684,10 @@ def sanitize_requirements(text: str) -> Tuple[List[str], List[str]]:
         if TEST_PIP_ALLOWLIST and name not in TEST_PIP_ALLOWLIST:
             dropped.append(line)
             continue
+        if _RUN_ALLOWED_IMPORTS is not None and \
+                name not in {a.lower().replace("_", "-") for a in _RUN_ALLOWED_IMPORTS}:
+            dropped.append(line)
+            continue
         kept.append(line)
     return kept, dropped
 
@@ -4135,14 +5753,15 @@ def ensure_test_venv(run_dir: Path) -> Tuple[str, Optional[Path]]:
     return str(py), venv_dir / "bin"
 
 
-def new_test_context(run_dir: Path) -> dict:
+def new_test_context(run_dir: Path, roster: Optional[List[dict]] = None) -> dict:
     """Per-round evaluator state shared by the concurrent attempts: the test
     venv, a cache of generated tests keyed by (content, name, language), the set
     of already-installed requirement lines, and the collected results."""
     py, venv_bin = ensure_test_venv(run_dir)
     return {"python": py, "venv_bin": venv_bin, "cache": {}, "cache_lock": threading.Lock(),
             "install_lock": threading.Lock(), "installed": set(), "results": [],
-            "results_lock": threading.Lock()}
+            "results_lock": threading.Lock(), "roster": list(roster or []),
+            "integration_cache": {}}
 
 
 def install_node_requirements(run_dir: Path, node: dict, rnd: int, test_ctx: dict) -> None:
@@ -4231,6 +5850,10 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
                  f"If the file defines its own main(), it is renamed to "
                  f"autoresearch_artifact_main() before compiling, so write your own main().")
     prompt = f"File: {artifact['filename']}{extra}\n```{lang}\n{code_content}\n```"
+    if _RUN_CONTRACT:
+        prompt = (f"CONTRACT (binding; test against it):\n"
+                  f"{fit_context(_RUN_CONTRACT, TEST_CONTRACT_BUDGET, note='...[CONTRACT TRUNCATED]...')}"
+                  f"\n\n{prompt}")
     payload = {
         "model": WORKER_MODEL,
         "messages": [{"role": "system", "content": _PROMPT_PHASE5_UNITTEST},
@@ -4271,15 +5894,382 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
     return None
 
 
+# ------------------------------------------------------------------
+# Project-level integration (evaluator part 3)
+# ------------------------------------------------------------------
+# Per-file tests cannot see whether modules written by different agents fit
+# together. Integration assembles one flat project (agent directory prefixes
+# removed) and checks it as a whole. Weights apply to the groups that exist.
+_INTEGRATION_WEIGHTS = {"coverage": 0.20, "compile": 0.10, "import": 0.15, "pytest": 0.35,
+                        "command": 0.20}
+_PYTEST_COUNT_RE = re.compile(r'(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed)\b')
+_CMD_SCORE_RE = re.compile(r'"score"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)')
+_COMPILE_SNIPPET = ("import sys\n"
+                    "src = open(sys.argv[1], encoding='utf-8', errors='replace').read()\n"
+                    "compile(src, sys.argv[1], 'exec')\n")
+
+
+def integration_dir_for(run_dir: Path) -> Path:
+    return run_dir / INTEGRATION_DIRNAME
+
+
+def _project_rel(rel: str, dir_names: Set[str]) -> Optional[str]:
+    """Path a node file takes inside the assembled project, or None to skip it."""
+    parts = [x for x in PurePosixPath(rel.replace("\\", "/")).parts if x not in ("", ".", "/")]
+    if not parts or parts[0] == "claimed" or ".." in parts:
+        return None
+    while len(parts) > 1 and (parts[0] == WORK_DIRNAME or parts[0] in dir_names
+                              or re.match(r'^t\d{2}(_|$)', parts[0])):
+        parts = parts[1:]
+    return "/".join(parts)
+
+
+def _is_test_file(rel: str) -> bool:
+    name = PurePosixPath(rel).name
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def best_known_nodes(run_dir: Path, upto_rnd: int) -> Dict[str, dict]:
+    """Best recorded attempt per task over every round up to upto_rnd (ties go to
+    the most recent). This is the sibling set an attempt is integrated against."""
+    best: Dict[str, Tuple[tuple, dict]] = {}
+    for prnd, nodes in load_pool(run_dir):
+        if prnd > upto_rnd:
+            continue
+        for n in nodes:
+            if not n.get("task") or not n.get("files") or n.get("status") not in ("success", "partial"):
+                continue
+            key = (float(n.get("score", 0.0)), prnd, n.get("seq", 0))
+            cur = best.get(n["task"])
+            if cur is None or key > cur[0]:
+                best[n["task"]] = (key, n)
+    return {t: v[1] for t, v in best.items()}
+
+
+def assemble_project(run_dir: Path, roster: List[dict], chosen: Dict[str, dict],
+                     dest: Path) -> Tuple[Dict[str, str], List[str]]:
+    """Copy each chosen node's files into one flat project. Roster order decides
+    collisions; within a node the shallowest copy of a path wins."""
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    dir_names = {r["dir"] for r in roster}
+    placed: Dict[str, str] = {}
+    conflicts: List[str] = []
+    for r in roster:
+        node = chosen.get(r["id"])
+        if node is None:
+            continue
+        files = _node_files(run_dir, node)
+        for rel in sorted(files, key=lambda x: (x.count("/"), x)):
+            target = _project_rel(rel, dir_names)
+            if not target:
+                continue
+            if target in placed:
+                if placed[target] != r["id"]:
+                    conflicts.append(f"{target}: kept {placed[target]}, dropped {r['id']} ({node['id']})")
+                continue
+            out = dest / target
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with open(out, "w", encoding="ascii", errors="ignore") as f:
+                f.write(files[rel])
+            placed[target] = r["id"]
+    return placed, conflicts
+
+
+def _pytest_rate(rc: Optional[int], out: str, timed_out: bool) -> Optional[float]:
+    if timed_out:
+        return 0.0
+    summary = [l for l in out.splitlines() if _PYTEST_COUNT_RE.search(l)]
+    counts: Dict[str, int] = {}
+    if summary:
+        for num, kind in _PYTEST_COUNT_RE.findall(summary[-1]):
+            kind = "errors" if kind.startswith("error") else kind
+            counts[kind] = counts.get(kind, 0) + int(num)
+    denom = counts.get("passed", 0) + counts.get("failed", 0) + counts.get("errors", 0)
+    if denom:
+        return counts.get("passed", 0) / denom
+    if rc == 5:          # no tests collected: the group does not exist
+        return None
+    return 0.0 if rc != 0 else None
+
+
+def run_integration_checks(proj: Path, own: Optional[Set[str]], test_ctx: dict,
+                           home_root: Path) -> dict:
+    """Checks the assembled project. `own` limits compile/import to one attempt's
+    files (None = every file); pytest and the command always cover everything."""
+    py = test_ctx["python"]
+    venv_bin = test_ctx.get("venv_bin")
+    env = _test_env(home_root, venv_bin, str(proj))
+    all_py = sorted(str(x.relative_to(proj)).replace("\\", "/") for x in proj.rglob("*.py")
+                    if x.is_file())
+    scope = [r for r in all_py if own is None or r in own]
+    groups: Dict[str, float] = {}
+    details: Dict[str, List[str]] = {}
+
+    # Without this, a project that compiles and imports but lacks its tests and
+    # entry point would look perfect: missing deliverables are a failed check.
+    if _RUN_DELIVERABLES:
+        present = [d for d in _RUN_DELIVERABLES if (proj / d).is_file()]
+        groups["coverage"] = len(present) / len(_RUN_DELIVERABLES)
+        details["coverage"] = [f"missing {d}" for d in _RUN_DELIVERABLES if d not in present][:5]
+
+    if scope:
+        ok, fails = 0, []
+        for r in scope:
+            rc, out, to = _run_limited([py, "-c", _COMPILE_SNIPPET, r], 30, proj, env)
+            if rc == 0 and not to:
+                ok += 1
+            else:
+                fails.append(f"{r}: {_extract_error_line(out, 'python')}"[:200])
+        groups["compile"] = ok / len(scope)
+        details["compile"] = fails[:5]
+
+    modules = [r[:-3] for r in scope
+               if "/" not in r and not _is_test_file(r) and r not in ("conftest.py", "setup.py")
+               and r[:-3].isidentifier()]
+    if modules:
+        ok, fails = 0, []
+        for m in modules:
+            rc, out, to = _run_limited([py, "-c", f"import {m}"], INTEGRATION_IMPORT_SECS, proj, env)
+            if rc == 0 and not to:
+                ok += 1
+            else:
+                fails.append(f"{m}: " + ("import timed out" if to else _extract_error_line(out, "python"))[:200])
+        groups["import"] = ok / len(modules)
+        details["import"] = fails[:5]
+
+    tests = [r for r in all_py if _is_test_file(r)]
+    if tests:
+        rc, out, to = _run_limited(
+            [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--no-header", "--tb=line",
+             "--rootdir", str(proj)] + tests,
+            INTEGRATION_PYTEST_SECS, proj, env, cpu=max(TEST_CPU_SECS, INTEGRATION_PYTEST_SECS))
+        rate = _pytest_rate(rc, out, to)
+        if rate is not None:
+            groups["pytest"] = rate
+            fails = [l.strip() for l in out.splitlines()
+                     if l.startswith(("FAILED", "ERROR")) or l.strip().startswith("E ")]
+            details["pytest"] = (["pytest timed out"] if to else fails[:6]) or \
+                ([out.strip().splitlines()[-1][:200]] if out.strip() and rate < 1.0 else [])
+
+    command_score = None
+    if _RUN_INTEGRATION_CMD:
+        rc, out, to = _run_limited(["bash", "-c", _RUN_INTEGRATION_CMD], INTEGRATION_CMD_SECS,
+                                   proj, env, cpu=max(TEST_CPU_SECS, INTEGRATION_CMD_SECS))
+        groups["command"] = 1.0 if (rc == 0 and not to) else 0.0
+        m = _CMD_SCORE_RE.findall(out)
+        if m:
+            try:
+                command_score = float(m[-1])
+            except ValueError:
+                command_score = None
+        if to:
+            details["command"] = ["command timed out"]
+        elif rc != 0:
+            details["command"] = [f"exit {rc}: {_extract_error_line(out, 'python')}"[:200]]
+        else:
+            details["command"] = []
+
+    wsum = sum(_INTEGRATION_WEIGHTS[k] for k in groups)
+    q = (sum(_INTEGRATION_WEIGHTS[k] * v for k, v in groups.items()) / wsum) if wsum else None
+    return {"q": round(q, 4) if q is not None else None,
+            "groups": {k: round(v, 4) for k, v in groups.items()},
+            "details": details, "command_score": command_score}
+
+
+def _project_digest(proj: Path, own: Set[str]) -> str:
+    h = hashlib.sha256()
+    for x in sorted(proj.rglob("*")):
+        if x.is_file():
+            h.update(str(x.relative_to(proj)).encode())
+            h.update(b"\0")
+            h.update(x.read_bytes())
+            h.update(b"\0")
+    h.update(json.dumps(sorted(own)).encode())
+    h.update(_RUN_INTEGRATION_CMD.encode())
+    return h.hexdigest()
+
+
+def build_node_project(node: dict, run_dir: Path, rnd: int, test_ctx: dict) -> Tuple[Path, Set[str]]:
+    """This attempt plus the best known deliverable of every other task."""
+    roster = test_ctx["roster"]
+    chosen = {t: n for t, n in best_known_nodes(run_dir, rnd).items() if t != node["task"]}
+    chosen[node["task"]] = node
+    base = run_dir / "tests" / f"round{rnd:02d}" / "integration" / node["id"]
+    proj = base / "project"
+    placed, conflicts = assemble_project(run_dir, roster, chosen, proj)
+    node["integration_siblings"] = {t: n["id"] for t, n in chosen.items() if t != node["task"]}
+    node["integration_conflicts"] = conflicts[:5]
+    return proj, {rel for rel, t in placed.items() if t == node["task"]}
+
+
+def _cached_full_q(proj: Path, test_ctx: dict) -> Optional[float]:
+    """Whole-project q (no own-file scoping), cached by project content."""
+    key = "full:" + _project_digest(proj, set())
+    with test_ctx["cache_lock"]:
+        res = test_ctx["integration_cache"].get(key)
+    if res is None:
+        res = run_integration_checks(proj, None, test_ctx, proj.parent)
+        with test_ctx["cache_lock"]:
+            test_ctx["integration_cache"][key] = res
+    return res["q"]
+
+
+def integration_credit(node: dict, project: Path, run_dir: Path, rnd: int,
+                       test_ctx: dict) -> Optional[float]:
+    """What this attempt changed about the whole project: q_with - q_baseline,
+    where the baseline swaps in the task's previous best (or leaves the task out
+    when it has none). Both sides use the same siblings and the same unscoped
+    checks, so a bug shared by every attempt cancels out. Mapped to [0, 1]
+    around 0.5 (0.5 = no change) with EVAL_CREDIT_GAIN. First attempts and
+    test-only attempts get the neutral 0.5."""
+    chosen = {t: n for t, n in best_known_nodes(run_dir, rnd).items()}
+    prior = chosen.get(node["task"])
+    if prior is not None and prior.get("id") == node["id"]:
+        prior = None
+    own_py = [f for f in (node.get("files") or []) if f.endswith(".py")]
+    # Neutral 0.5 (same scale as everyone else) when there is nothing fair to
+    # compare against: a task's FIRST attempt (removing a module would reward
+    # merely existing), and test-only attempts (a correct test that exposes a
+    # sibling's bug lowers q - that must not count against its author).
+    reason = None
+    if prior is None:
+        reason = "first attempt of this task"
+    elif own_py and all(_is_test_file(PurePosixPath(f).name) for f in own_py):
+        reason = "test-only attempt"
+    if reason:
+        node["integration_credit"] = 0.5
+        node["integration_delta"] = None
+        node["integration_credit_note"] = reason
+        return 0.5
+    q_with = _cached_full_q(project, test_ctx)
+    base = project.parent / "baseline"
+    assemble_project(run_dir, test_ctx["roster"], chosen, base)
+    q_base = _cached_full_q(base, test_ctx)
+    if q_with is None or q_base is None:
+        return None
+    delta = q_with - q_base
+    credit = max(0.0, min(1.0, 0.5 + EVAL_CREDIT_GAIN * delta))
+    node["integration_full_q"] = round(q_with, 6)
+    node["integration_baseline_q"] = round(q_base, 6)
+    node["integration_baseline"] = prior["id"]
+    node["integration_delta"] = round(delta, 6)
+    node["integration_credit"] = round(credit, 6)
+    append_event(run_dir, {"round": rnd, "event": "credit", "agent": node["task"], "node": node["id"],
+                           "q_with": q_with, "q_base": q_base, "baseline": node["integration_baseline"],
+                           "delta": round(delta, 6)})
+    return credit
+
+
+def evaluate_node_integration(node: dict, proj: Path, own: Set[str], run_dir: Path, rnd: int,
+                              test_ctx: dict) -> Optional[float]:
+    key = _project_digest(proj, own)
+    with test_ctx["cache_lock"]:
+        res = test_ctx["integration_cache"].get(key)
+    if res is None:
+        res = run_integration_checks(proj, own, test_ctx, proj.parent)
+        with test_ctx["cache_lock"]:
+            test_ctx["integration_cache"][key] = res
+    node["integration_q"] = res["q"]
+    node["integration"] = {"groups": res["groups"], "command_score": res["command_score"],
+                           "details": {k: v[:3] for k, v in res["details"].items() if v}}
+    append_event(run_dir, {"round": rnd, "event": "integration", "agent": node["task"],
+                           "node": node["id"], "q": res["q"], "groups": res["groups"]})
+    return res["q"]
+
+
+def integration_round_report(run_dir: Path, rnd: int, roster: List[dict],
+                             test_ctx: dict) -> Optional[dict]:
+    """After a round: assemble the best known deliverable of every task into
+    integration/roundNN/ (and integration/latest/), check it, and report."""
+    chosen = best_known_nodes(run_dir, rnd)
+    idir = integration_dir_for(run_dir)
+    print(f"\n[INTEGRATION] ROUND {rnd:02d}", flush=True)
+    if not chosen:
+        print("    [!] No successful attempt with files yet; nothing to assemble.", flush=True)
+        return None
+    proj = idir / f"round{rnd:02d}"
+    placed, conflicts = assemble_project(run_dir, roster, chosen, proj)
+    res = run_integration_checks(proj, None, test_ctx, idir)
+    missing = [r["id"] for r in roster if r["id"] not in chosen]
+    report = {"round": rnd, "q": res["q"], "groups": res["groups"], "details": res["details"],
+              "command": _RUN_INTEGRATION_CMD or None, "command_score": res["command_score"],
+              "sources": {t: n["id"] for t, n in sorted(chosen.items())},
+              "missing_tasks": missing, "conflicts": conflicts, "files": sorted(placed)}
+    with open(idir / f"round{rnd:02d}.json", "w", encoding="ascii") as f:
+        json.dump(report, f, indent=2, ensure_ascii=True)
+    latest = idir / "latest"
+    shutil.rmtree(latest, ignore_errors=True)
+    shutil.copytree(proj, latest, ignore=shutil.ignore_patterns("__pycache__", ".home"))
+
+    grp = " | ".join(f"{k} {v:.2f}" for k, v in res["groups"].items()) or "no checks applied"
+    cs = f" (command score {res['command_score']:g})" if res["command_score"] is not None else ""
+    qs = f"{res['q']:.3f}" if res["q"] is not None else "n/a"
+    print(f"    [+] Assembled {len(placed)} file(s) from {len(chosen)}/{len(roster)} task(s) "
+          f"-> {INTEGRATION_DIRNAME}/round{rnd:02d}/", flush=True)
+    print(f"    [+] {grp}{cs} -> q {qs}", flush=True)
+    if missing:
+        print(f"    [!] No usable attempt yet for: {', '.join(missing)}", flush=True)
+    for c in conflicts[:3]:
+        print(f"    [!] Path conflict: {c}", flush=True)
+    shown = 0
+    for group, lines in res["details"].items():
+        for line in lines:
+            if shown >= 8:
+                break
+            print(f"    [-] {group}: {line[:160]}", flush=True)
+            shown += 1
+    return report
+
+
+def dependency_gate(node: dict, run_dir: Path, rnd: int) -> bool:
+    """Part of the fixed evaluator, applied before any test or install. Returns
+    True if the attempt imports a third-party module outside the contract's
+    DEPENDENCIES list; it is then scored EVAL_DEP_REJECT_SCORE and not tested,
+    since its tests would only measure the environment."""
+    bad = disallowed_imports(node, run_dir)
+    if bad:
+        # Rejected before any test or install: the attempt broke the enforced
+        # DEPENDENCIES section, so its tests would measure the environment.
+        msg = ("REJECTED by the evaluator: imports third-party module(s) outside the contract's "
+               f"DEPENDENCIES list: {', '.join(bad)}. Allowed: "
+               f"{', '.join(_RUN_ALLOWED_IMPORTS or []) or '(none)'} plus the standard library.")
+        node["dependency_violations"] = bad
+        node.setdefault("violations", []).append(msg[:300])
+        node["test_pass_rate"] = 0.0
+        node["test_failures"] = [msg[:200]]
+        node["score_file_level"] = EVAL_DEP_REJECT_SCORE
+        node["score"] = EVAL_DEP_REJECT_SCORE
+        lp = node.get("log_path")
+        if lp and (run_dir / lp).exists():
+            with open(run_dir / lp, "a", encoding="ascii") as fh:
+                fh.write(f"\n## Evaluator\n\n{enforce_ascii(msg)}\n")
+        append_event(run_dir, {"round": rnd, "node": node["id"], "agent": node.get("task"),
+                               "event": "dependency_reject", "modules": bad})
+        print(f"\n    [-] {node['id']} ({node.get('task')}) rejected: imports {', '.join(bad)}",
+              flush=True)
+        return True
+    return False
+
+
 def evaluate_node_inline(node: dict, endpoint: str, run_dir: Path, rnd: int,
                          test_ctx: dict) -> None:
-    """The test component of the fixed evaluator, applied once at creation.
-    Generates (or reuses) a unit test for each testable deliverable, executes it
-    in the sandboxed venv, and sets the node's final score and diagnostics."""
-    artifacts = collect_node_artifacts(run_dir, node)[:EVAL_MAX_TEST_FILES]
-    if not artifacts:
-        return
-    install_node_requirements(run_dir, node, rnd, test_ctx)
+    """The fixed evaluator, applied once at creation: per-file unit tests (with
+    every sibling's best deliverable importable), then project-level
+    integration of this attempt with those siblings. Sets the final score."""
+    project, own = None, set()
+    if EVAL_INTEGRATION and test_ctx.get("roster"):
+        try:
+            project, own = build_node_project(node, run_dir, rnd, test_ctx)
+        except Exception as exc:
+            print(f"\n    [!] {node['task']} project assembly raised {str(exc)[:80]}", flush=True)
+            project = None
+
+    artifacts = (collect_node_artifacts(run_dir, node)[:EVAL_MAX_TEST_FILES]
+                 if EVAL_INLINE_TESTS else [])
+    if artifacts or project is not None:
+        install_node_requirements(run_dir, node, rnd, test_ctx)
     test_root = run_dir / "tests" / f"round{rnd:02d}"
     node_dir = test_root / node["task"] / node["id"]
     venv_bin = test_ctx.get("venv_bin")
@@ -4306,24 +6296,44 @@ def evaluate_node_inline(node: dict, endpoint: str, run_dir: Path, rnd: int,
             "artifact_filepath": a["filepath"], "agent": a["agent"], "node": a["node"],
             "python": test_ctx["python"], "venv_bin": str(venv_bin) if venv_bin else "",
             "test_root": str(test_root),
+            "extra_pythonpath": str(project) if project is not None else "",
         }))
-    if not results:
-        return
-    passed = sum(1 for r in results if r["status"] == "PASSED")
-    rate = passed / len(results)
-    node["test_pass_rate"] = round(rate, 4)
-    node["test_count"] = len(results)
-    node["tests_passed"] = passed
-    node["test_failures"] = [f"{r['filename']}: {r['status']} {r['message']}"[:200]
-                             for r in results if r["status"] != "PASSED"][:5]
-    node["score"] = blend_test_score(node.get("heuristic_score", 0.0), rate,
-                                     bool(node.get("files")))
-    with test_ctx["results_lock"]:
-        test_ctx["results"].extend(results)
-    for r in results:
-        append_event(run_dir, {"round": rnd, "event": "test_result", "agent": r.get("agent", ""),
-                               "node": r.get("node", ""), "artifact": r.get("filename", ""),
-                               "status": r.get("status", "")})
+
+    rate = None
+    if results:
+        passed = sum(1 for r in results if r["status"] == "PASSED")
+        rate = passed / len(results)
+        node["test_pass_rate"] = round(rate, 4)
+        node["test_count"] = len(results)
+        node["tests_passed"] = passed
+        node["test_failures"] = [f"{r['filename']}: {r['status']} {r['message']}"[:200]
+                                 for r in results if r["status"] != "PASSED"][:5]
+        with test_ctx["results_lock"]:
+            test_ctx["results"].extend(results)
+        for r in results:
+            append_event(run_dir, {"round": rnd, "event": "test_result", "agent": r.get("agent", ""),
+                                   "node": r.get("node", ""), "artifact": r.get("filename", ""),
+                                   "status": r.get("status", "")})
+
+    file_level = blend_test_score(node.get("heuristic_score", 0.0), rate, bool(node.get("files")))
+    node["score_file_level"] = file_level
+    q = None
+    if project is not None and not _shutdown_event.is_set():
+        try:
+            q = evaluate_node_integration(node, project, own, run_dir, rnd, test_ctx)
+        except Exception as exc:
+            print(f"\n    [!] {node['task']} integration raised {str(exc)[:80]}", flush=True)
+    if q is not None and EVAL_CREDIT and not _shutdown_event.is_set():
+        try:
+            credit = integration_credit(node, project, run_dir, rnd, test_ctx)
+        except Exception as exc:
+            print(f"\n    [!] {node['task']} credit assignment raised {str(exc)[:80]}", flush=True)
+            credit = None
+        if credit is not None:
+            q = round((1.0 - EVAL_CREDIT_MIX) * q + EVAL_CREDIT_MIX * credit, 6)
+            node["integration_blend"] = q
+    node["score"] = (round((1.0 - EVAL_INTEGRATION_MIX) * file_level + EVAL_INTEGRATION_MIX * q, 6)
+                     if q is not None else file_level)
 
 
 _C_MAIN_RE = re.compile(r'\bint\s+main\s*\(')
@@ -4355,8 +6365,12 @@ def execute_test_artifact(test_meta: dict) -> dict:
 
     try:
         if lang in ("python", "py"):
-            env = _test_env(test_root, venv_bin,
-                            os.pathsep.join([str(artifact_path.parent), str(test_path.parent)]))
+            # The attempt's own directory first (its files shadow everything),
+            # then the assembled project with every sibling's best deliverable.
+            pp = [str(artifact_path.parent), str(test_path.parent)]
+            if test_meta.get("extra_pythonpath"):
+                pp.append(test_meta["extra_pythonpath"])
+            env = _test_env(test_root, venv_bin, os.pathsep.join(pp))
             cmd = [py, "-m", "pytest", "-p", "no:cacheprovider", "--no-header", "--tb=short", "-q", str(test_path)]
             t0 = time.time()
             rc, out, to = _run_limited(cmd, 45, test_path.parent, env)
@@ -4650,6 +6664,9 @@ def policy_budget(budget: int, n_tasks: int) -> int:
 
 
 def main():
+    global _RUN_CONTRACT, _RUN_INTEGRATION_CMD, _RUN_DELIVERABLES, DREAM_FORCE_REVISIONS
+    global _RUN_BRIEF, _RUN_CONTRACT_SYNTHESIZED, _RUN_ALLOWED_IMPORTS, _RUN_COMMAND, _RUN_DIR
+    global _RUN_PROBE_COMMAND
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -4674,14 +6691,22 @@ def main():
     parser.add_argument("--no-dream", action="store_true",
                         help="Skip offline policy improvement. Every round redeploys pi_0 - this is the "
                              "Recursive Fixed Exploration control the paper compares against.")
+    parser.add_argument("--force-dream", action="store_true",
+                        help="Run apex policy revisions even when the replay oracle bound shows less "
+                             "than DREAM_MIN_HEADROOM of headroom over the deployed policy.")
     parser.add_argument("--dream-only", action="store_true",
                         help="Run no agents. Dream over the existing tree pool and write the next policy. "
                              "Requires -r and at least one recorded round.")
+    parser.add_argument("--integration-cmd", type=str, default=None,
+                        help="Shell command run in the assembled project after the built-in checks; "
+                             "exit 0 passes, and a JSON \"score\" in its output is reported. Saved "
+                             "with the run, so -r reuses it. Pass '' to clear.")
     parser.add_argument("--semantic-guidance", action="store_true",
                         help="Inject high-level directional guidance into agent prompts. Off by default: "
                              "the paper's ablation found this underperforms unguided replay at equal budget.")
 
     args = parser.parse_args()
+    DREAM_FORCE_REVISIONS = bool(args.force_dream)
 
     if args.resume and (args.prompt or args.file or args.git):
         parser.error("--resume cannot be combined with -p, -f, or -g.")
@@ -4820,6 +6845,115 @@ def main():
         print(f"[!] Fatal: Could not read {distilled_filepath}.", flush=True)
         sys.exit(1)
 
+    # ---------------- Pinned contract + required deliverables ----------------
+    _RUN_DIR = target_directory
+    meta = load_brief_meta(target_directory)
+    if meta is None:
+        brief_text = target_prompt or (read_file_content_safe(raw_filepath) if raw_filepath else "") or ""
+        contract = extract_pinned_contract(brief_text)
+        deliverables = extract_deliverables(brief_text)
+        synthesized = False
+        if not contract and target_prompt and SYNTHESIZE_CONTRACT:
+            if apex_ok:
+                print("\n[CONTRACT] No pinned section in the prompt; synthesizing DELIVERABLES and "
+                      "CONSTRAINTS from the prompt text only (not the Phase-1 draft)...", flush=True)
+                s_contract, s_deliv = synthesize_contract(target_prompt)
+                if s_contract:
+                    contract, synthesized = s_contract, True
+                    deliverables = deliverables or s_deliv
+            else:
+                print("\n[CONTRACT] Apex offline; cannot synthesize a contract.", flush=True)
+        allowed = None
+        if ENFORCE_DEPENDENCIES:
+            allowed = probe_importable(target_directory, DEPENDENCY_CANDIDATES)
+            contract = (contract + "\n\n" if contract else "") + dependency_section(allowed)
+        facts = probe_api_facts(target_directory, DEPENDENCY_API_PROBE,
+                                allowed if allowed is not None
+                                else probe_importable(target_directory, DEPENDENCY_CANDIDATES))
+        facts_text = api_facts_section(facts)
+        if facts_text:
+            contract = (contract + "\n\n" if contract else "") + facts_text
+            print(f"[API FACTS] probed {', '.join(k for k, v in facts.items() if not v.get('error'))} "
+                  f"-> real members written into the contract ({len(facts_text):,} chars)", flush=True)
+        run_cmd, probe_cmd = "", ""
+        interfaces_synth = False
+        has_interfaces = any(h.startswith("INTERFACES") for h, _ in split_brief_sections(contract) if h)
+        if (SYNTHESIZE_INTERFACES and not has_interfaces and target_prompt and deliverables
+                and any(d.endswith(".py") and not _is_test_file(d) for d in deliverables)):
+            if apex_ok:
+                print("[CONTRACT] No INTERFACES section; the planner chooses one shared API "
+                      "(labelled as planner-chosen)...", flush=True)
+                section, run_cmd, probe_cmd = synthesize_interfaces(target_prompt, contract, deliverables)
+                if section:
+                    contract = contract + "\n\n" + section
+                    interfaces_synth = True
+        run_cmd = validate_run_command(RUN_COMMAND, None) or run_cmd or default_run_command(deliverables)
+        probe_cmd = validate_run_command(PROBE_COMMAND, None) or (probe_cmd if run_cmd else "")
+        if run_cmd:
+            contract = contract + "\n\n" + run_rules_section(run_cmd)
+        if any(_is_test_file(PurePosixPath(d).name) for d in deliverables):
+            contract = contract + "\n\n" + test_rules_section()
+        if synthesized:
+            contract = synthesized_contract_header() + "\n\n" + contract
+        meta = {"contract": enforce_ascii(contract.strip()), "deliverables": deliverables,
+                "integration_cmd": INTEGRATION_CMD, "synthesized": synthesized,
+                "allowed_imports": allowed, "brief": target_prompt or "",
+                "interfaces_synthesized": interfaces_synth, "run_cmd": run_cmd,
+                "probe_cmd": probe_cmd}
+    if args.integration_cmd is not None:
+        meta["integration_cmd"] = args.integration_cmd.strip()
+    save_brief_meta(target_directory, meta)
+    _RUN_CONTRACT = meta.get("contract", "") or ""
+    _RUN_INTEGRATION_CMD = meta.get("integration_cmd", "") or ""
+    required_deliverables: Dict[str, str] = meta.get("deliverables") or {}
+    _RUN_DELIVERABLES = list(required_deliverables)
+    _RUN_CONTRACT_SYNTHESIZED = bool(meta.get("synthesized"))
+    _RUN_ALLOWED_IMPORTS = meta.get("allowed_imports") if ENFORCE_DEPENDENCIES else None
+    _RUN_BRIEF = enforce_ascii(meta.get("brief") or target_prompt or "")
+    _RUN_COMMAND = (validate_run_command(RUN_COMMAND, None) or meta.get("run_cmd")
+                    or default_run_command(meta.get("deliverables") or {}))
+    _RUN_PROBE_COMMAND = validate_run_command(PROBE_COMMAND, None) or meta.get("probe_cmd") or ""
+    if _RUN_CONTRACT:
+        heads = [h for h, _ in split_brief_sections(_RUN_CONTRACT) if h]
+        kind = "Synthesized" if _RUN_CONTRACT_SYNTHESIZED else "Pinned"
+        print(f"\n[CONTRACT] {kind} {', '.join(heads) or 'section(s)'} ({len(_RUN_CONTRACT):,} chars) "
+              f"-> to every agent and test generator. Saved as CONTRACT.md"
+              + (" (marked synthesized)." if _RUN_CONTRACT_SYNTHESIZED else "."), flush=True)
+    else:
+        print(f"\n[CONTRACT] No pinned section ({', '.join(PINNED_SECTIONS)}) found in the brief; "
+              "agents see only their own objective.", flush=True)
+    if required_deliverables:
+        print(f"[DELIVERABLES] {len(required_deliverables)} required: "
+              f"{', '.join(required_deliverables)}", flush=True)
+    if _RUN_ALLOWED_IMPORTS is not None:
+        missing = [c for c in DEPENDENCY_CANDIDATES if c not in _RUN_ALLOWED_IMPORTS]
+        print(f"[DEPENDENCIES] allowed third-party imports: {', '.join(_RUN_ALLOWED_IMPORTS) or '(none)'}"
+              + (f" | not importable here: {', '.join(missing)}" if missing else "")
+              + " | any other third-party import rejects the attempt", flush=True)
+    elif ENFORCE_DEPENDENCIES:
+        print("[DEPENDENCIES] gate off: this run's brief meta predates the dependency probe.", flush=True)
+    if meta.get("interfaces_synthesized"):
+        print("[INTERFACES] planner-chosen API added to the contract (not from the prompt).", flush=True)
+    if _RUN_COMMAND:
+        print(f"[RUN] grounding command after each round: {_RUN_COMMAND} "
+              f"(real output -> every agent; write-ups may only report it)", flush=True)
+    if _RUN_PROBE_COMMAND:
+        print(f"[PROBE] negative control after each successful run: {_RUN_PROBE_COMMAND} "
+              f"(unchanged numbers -> metrics flagged as measuring nothing)", flush=True)
+    elif _RUN_COMMAND:
+        print("[PROBE] no negative-control command (planner gave none; set PROBE_COMMAND to add one).",
+              flush=True)
+    if FREEZE_INTERFACES:
+        print("[API] after each round the integrated project's public API is frozen for the next; "
+              "breaking a used name is a violation.", flush=True)
+    if _RUN_BRIEF:
+        print(f"[BRIEF] original prompt ({len(_RUN_BRIEF):,} chars) -> verbatim to every agent.", flush=True)
+    if EVAL_INTEGRATION:
+        print(f"[INTEGRATION] ON: each attempt is checked inside a project of every sibling's best "
+              f"deliverable (mix {EVAL_INTEGRATION_MIX:.2f})"
+              + (f"; command: {_RUN_INTEGRATION_CMD}" if _RUN_INTEGRATION_CMD else "; no command"),
+              flush=True)
+
     # ---------------- Phase 3: partition ----------------
     master_start_time = time.time()
     roster = load_roster(target_directory) if args.resume else []
@@ -4832,7 +6966,8 @@ def main():
             print("\n[!] Apex tier offline; agent partitioning cannot run. "
                   f"Re-run with -r once the apex ({GEN_API_BASE}) is healthy.", flush=True)
             sys.exit(1)
-        fragments, plan_p, plan_c = decompose_to_atomic_pieces(target_query)
+        fragments, plan_p, plan_c = decompose_to_atomic_pieces(target_query, required_deliverables,
+                                                               _RUN_CONTRACT)
         roster = build_roster(fragments)
         for d in (comms_dir_for, work_dir_for, trees_dir_for, policy_dir_for, dream_dir_for):
             d(target_directory).mkdir(parents=True, exist_ok=True)
@@ -4845,6 +6980,7 @@ def main():
 
     # ---------------- Phase 3-5: recursive rounds ----------------
     done_rounds = completed_rounds(target_directory) if args.resume else []
+    last_online_round = 0
     if done_rounds:
         print(f"[PHASE 3] Rounds already complete: {done_rounds}. "
               f"Continuing from round {max(done_rounds) + 1:02d}.")
@@ -4870,7 +7006,8 @@ def main():
         print(f"\n[RSI] {end_round - start_round + 1} round(s) to run, "
               f"{budget} agent call(s) per round, "
               + ("dreaming DISABLED (fixed-exploration control)"
-                 if args.no_dream else f"{DREAM_CANDIDATES} policy revision(s) per dream")
+                 if args.no_dream else f"{DREAM_CANDIDATES} policy revision(s) per dream"
+                 + (" (forced)" if DREAM_FORCE_REVISIONS else f" (gated at headroom {DREAM_MIN_HEADROOM})"))
               + ".", flush=True)
 
         # A round that never finished is re-run from a clean slate.
@@ -4897,6 +7034,10 @@ def main():
                       f"{start_round:02d}. Stopping - re-run with -r once the apex ({GEN_API_BASE}) is healthy.", flush=True)
                 start_round = end_round + 1
 
+        # Resume: the next round builds against the last frozen API and run output.
+        if start_round > 1:
+            load_round_grounding(target_directory, start_round - 1)
+
         for rnd in range(start_round, end_round + 1):
             if _shutdown_event.is_set():
                 print(f"\n[!] Shutdown requested; stopping before round {rnd:02d}. "
@@ -4915,6 +7056,7 @@ def main():
                                             policy_source, budget,
                                             semantic_guidance=args.semantic_guidance)
             round_stats.append(stats)
+            last_online_round = rnd
 
             round_dir_for(target_directory, rnd).mkdir(parents=True, exist_ok=True)
             with open(round_done_marker(target_directory, rnd), "w", encoding="ascii") as f:
@@ -4938,6 +7080,13 @@ def main():
             _, dstats = dream_policy_improvement(target_directory, rnd, policy_source,
                                                  pool, tasks, budget)
             dream_stats.append(dstats)
+
+    if last_online_round and not _shutdown_event.is_set():
+        try:
+            review = final_skeptic_review(target_directory, last_online_round)
+            final_writeup_refresh(target_directory, roster, last_online_round, target_query, review)
+        except Exception as exc:
+            print(f"    [!] Final write-up refresh failed: {str(exc)[:120]}", flush=True)
 
     master_elapsed_time = time.time() - master_start_time
 
