@@ -1189,14 +1189,47 @@ def _fix_payload_for_400(text: str, kwargs: dict, where: str = "") -> Optional[s
     return None
 
 
+TRANSIENT_RETRIES = int(os.getenv("TRANSIENT_RETRIES", "4"))
+TRANSIENT_BACKOFF_SECS = [float(x) for x in os.getenv("TRANSIENT_BACKOFF_SECS", "5,15,45,90").split(",")]
+_TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+_TRANSIENT_TEXT = re.compile(r'unavailable|high demand|overloaded|rate.?limit|resource.?exhausted|'
+                             r'try again later|temporarily|connection (reset|refused|aborted)', re.I)
+
+
+def _is_transient(e: Exception) -> bool:
+    """Server-side, will-probably-heal errors: 429/5xx, 'high demand', dropped
+    connections. Not 400s (those are fixed or re-raised) and not timeouts of a
+    long generation (retrying those doubles the wall time)."""
+    code = getattr(e, "status_code", None)
+    if code in _TRANSIENT_STATUS:
+        return True
+    name = type(e).__name__
+    if name == "APIConnectionError":
+        return True
+    if name in ("APITimeoutError", "Timeout", "ReadTimeout"):
+        return False
+    return code is None and bool(_TRANSIENT_TEXT.search(str(e)))
+
+
 def _safe_create(client: OpenAI, **kwargs):
-    """chat.completions.create with visible 400 reasons and up to 3 targeted fixes."""
+    """chat.completions.create with visible 400 reasons, up to 3 targeted fixes,
+    and backoff retries for transient upstream errors (503 'high demand', 429)."""
     where = str(getattr(client, "base_url", "?")).rstrip("/")
     _strip_known_rejects(where, kwargs)
-    for _ in range(4):
+    transient = 0
+    for _ in range(4 + TRANSIENT_RETRIES):
         try:
             return client.chat.completions.create(**kwargs)
         except Exception as e:
+            if _is_transient(e) and transient < TRANSIENT_RETRIES and not _shutdown_event.is_set():
+                delay = TRANSIENT_BACKOFF_SECS[min(transient, len(TRANSIENT_BACKOFF_SECS) - 1)]
+                delay += random.uniform(0, delay * 0.2)
+                transient += 1
+                print(f"    [*] {where}: transient error ({getattr(e, 'status_code', None) or type(e).__name__}: "
+                      f"{str(e)[:90]}); retry {transient}/{TRANSIENT_RETRIES} in {delay:.0f}s", flush=True)
+                if _shutdown_event.wait(delay):
+                    raise
+                continue
             if getattr(e, "status_code", None) != 400:
                 raise
             text = _bad_request_text(e)
@@ -7178,6 +7211,31 @@ class _StreamStalled(Exception):
     pass
 
 
+_STALLS: Dict[str, List[float]] = {}
+_STALL_LOCK = threading.Lock()
+
+
+def _mark_stall(endpoint: str) -> None:
+    with _STALL_LOCK:
+        _STALLS.setdefault(endpoint.rstrip("/"), []).append(time.time())
+
+
+def _recent_stalls(endpoint: str, window: float = 300.0) -> int:
+    now = time.time()
+    with _STALL_LOCK:
+        return sum(1 for t in _STALLS.get(endpoint.rstrip("/"), []) if now - t < window)
+
+
+def _failover_endpoint(current: str, home: str) -> str:
+    """Another agent endpoint for a retry after a stall: the one with the fewest
+    stalls in the last 5 minutes, excluding the one that just stalled. With a
+    single endpoint, retry where we are."""
+    others = [e for e in WORKER_ENDPOINTS if e.rstrip("/") != current.rstrip("/")]
+    if not others:
+        return current
+    return min(others, key=lambda e: (_recent_stalls(e), e.rstrip("/") != home.rstrip("/")))
+
+
 def _read_stream(response, t0: float) -> Tuple[str, dict, Optional[str], Optional[float]]:
     """Read an OpenAI-style SSE stream: (text, usage, finish_reason, ttft).
     Raises _StreamStalled when the stream exceeds TEST_TIMEOUT_SECS overall;
@@ -7251,9 +7309,11 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
         "stream": True, "stream_options": {"include_usage": True},
     }
     headers = {"Authorization": f"Bearer {WORKER_API_KEY}"}
+    home_endpoint = endpoint
     for attempt in range(1, MAX_RETRIES + 1):
         if _shutdown_event.is_set():
             return None
+        url = endpoint.rstrip("/") + "/chat/completions"
         try:
             _strip_known_rejects(endpoint.rstrip("/"), payload)
             _t_call = time.time()
@@ -7282,19 +7342,28 @@ def generate_unittest(artifact: dict, endpoint: str) -> Optional[str]:
             if test_code:
                 return enforce_ascii(_strip_markdown_fences(test_code))
         except _StreamStalled as exc:
+            nxt = _failover_endpoint(endpoint, home_endpoint)
+            _mark_stall(endpoint)
             print(f"\n    [*] unit-test generation on {endpoint} stalled ({exc}); "
-                  f"retry {attempt}/{MAX_RETRIES}", flush=True)
+                  f"retry {attempt}/{MAX_RETRIES}" + (f" on {nxt}" if nxt != endpoint else ""), flush=True)
             _LEDGER.add("unit-test generation (stalled)", "agent", 0, 0, time.time() - _t_call,
                         None, True, rnd=getattr(_TOKEN_CTX, "rnd", None), truncated=True)
+            endpoint = nxt
             continue
         except (requests.exceptions.RequestException, ValueError) as exc:
             # A gap mid-stream surfaces as ConnectionError('Read timed out'), before
             # the first byte as ReadTimeout: both are stalls, retried at once.
-            if isinstance(exc, requests.exceptions.ReadTimeout) or "timed out" in str(exc).lower():
-                print(f"\n    [*] unit-test generation on {endpoint}: no data for {TEST_STALL_SECS}s; "
-                      f"retry {attempt}/{MAX_RETRIES}", flush=True)
+            stalled = isinstance(exc, requests.exceptions.ReadTimeout) or "timed out" in str(exc).lower()
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if stalled or status in _TRANSIENT_STATUS or isinstance(exc, requests.exceptions.ConnectionError):
+                nxt = _failover_endpoint(endpoint, home_endpoint)
+                _mark_stall(endpoint)
+                why = f"no data for {TEST_STALL_SECS}s" if stalled else f"{status or type(exc).__name__}"
+                print(f"\n    [*] unit-test generation on {endpoint}: {why}; retry {attempt}/{MAX_RETRIES}"
+                      + (f" on {nxt}" if nxt != endpoint else ""), flush=True)
                 _LEDGER.add("unit-test generation (stalled)", "agent", 0, 0, time.time() - _t_call,
                             None, True, rnd=getattr(_TOKEN_CTX, "rnd", None), truncated=True)
+                endpoint = nxt
                 continue
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER))
