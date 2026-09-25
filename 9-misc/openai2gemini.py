@@ -40,12 +40,17 @@ Each listening port is a *lane*: an independent gateway with its own upstream se
 
 - its own outbound HTTP client (separate connection pool, so separate TCP/TLS sessions and HTTP/2 streams),
 - its own thought-signature cache and its own rate-limit/backoff state (a 429 on one lane does not stall the others),
-- optionally its own API key (`gemini_api_keys`, assigned round-robin), its own session id header (`upstream_session_header`), and any other per-lane setting (`lane_overrides`, e.g. a different `outbound_proxy`, `force_model` or `client_api_keys`).
+- optionally its own model (`lane_models`), its own API key (`gemini_api_keys`, assigned round-robin), its own session id header (`upstream_session_header`), and any other per-lane setting (`lane_overrides`, e.g. a different `outbound_proxy` or `client_api_keys`).
+
+`lane_models` pins a model per port: every chat request on that port is served by that model, whatever the client asks for (it sets the lane's `force_model`). Give it as a list by lane index or a mapping by port; an empty entry means the lane uses the global `force_model`. `/v1/models` on a pinned port lists the pinned model first, for clients that pick the first entry.
 
 ```bash
 python openai2gemini.py                      # 3 lanes: 9931, 9932, 9933
 python openai2gemini.py -n 8                 # 8 lanes: 9931..9938
 python openai2gemini.py --ports 9931,9940    # explicit ports
+python openai2gemini.py --models gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.1-pro   # model per port
+python openai2gemini.py --models 9933=gemini-3.1-pro                                     # only 9933 pinned
+GW_LANE_MODELS='{"9932": "gemini-3.8-flash"}' python openai2gemini.py
 GW_LISTEN_PORT_COUNT=5 GW_GEMINI_API_KEYS=key-a,key-b python openai2gemini.py
 ```
 
@@ -126,6 +131,7 @@ CLI:
     python openai2gemini.py [-c config.yaml]      run the server (default: 3 lanes)
     python openai2gemini.py -n N                  N lanes on consecutive ports from listen_port
     python openai2gemini.py --ports 9931,9940     lanes on exactly these ports
+    python openai2gemini.py --models A,B,C        model per lane (or PORT=MODEL,...)
     python openai2gemini.py --print-config        print the annotated example config
 """
 from __future__ import annotations
@@ -291,6 +297,14 @@ listen_port: {LISTEN_PORT}
 # its own connection pool, thought-signature cache and retry/backoff state.
 listen_port_count: {LISTEN_PORT_COUNT}
 listen_ports: []              # e.g. [9931, 9940, 9941]; overrides listen_port / listen_port_count
+
+# Model per lane: every chat request on that port uses this model (sets the lane's force_model).
+# A list by lane index, or a mapping by port. Empty / missing entry = global force_model.
+lane_models: []
+#  - gemini-3.5-flash-lite      # 9931
+#  - gemini-3.8-flash           # 9932
+#  - gemini-3.1-pro             # 9933
+# lane_models: {{9933: gemini-3.1-pro}}
 log_level: {LOG_LEVEL}
 allow_public_without_auth: {_j(ALLOW_PUBLIC_WITHOUT_AUTH)}
 
@@ -335,7 +349,8 @@ gemini_api_keys: []
 upstream_session_header: ""   # e.g. X-Session-Id
 
 # Per-lane overrides, by lane index. Any config key except listen_*, log_level,
-# gemini_api_keys and lane_overrides. Lanes without an entry use the settings above.
+# gemini_api_keys, lane_models and lane_overrides. Lanes without an entry use the settings
+# above. lane_overrides is applied after lane_models, so it wins if both set a model.
 lane_overrides: []
 #  - {{}}                                             # lane 0: defaults
 #  - {{outbound_proxy: "socks5://127.0.0.1:1081"}}   # lane 1: different egress
@@ -414,6 +429,7 @@ DEFAULTS: dict[str, Any] = {
     "listen_port": LISTEN_PORT,
     "listen_port_count": LISTEN_PORT_COUNT,
     "listen_ports": [],                 # explicit ports; overrides listen_port/listen_port_count
+    "lane_models": [],                  # model per lane: list by lane index, or {port: model}
     "lane_overrides": [],               # per-lane config dicts, by lane index
     "log_level": LOG_LEVEL,
     "allow_public_without_auth": ALLOW_PUBLIC_WITHOUT_AUTH,
@@ -493,7 +509,27 @@ class Config(dict):
             raise AttributeError(item) from e
 
 
+def parse_lane_models(raw: str) -> list[str] | dict[int, str]:
+    """'a,b,c' -> list by lane index ('a,,c' leaves lane 1 on the default);
+    '9932=a,9933=b' or a JSON list/object -> as given."""
+    raw = raw.strip()
+    if raw.startswith(("[", "{")):
+        return json.loads(raw)
+    items = [x.strip() for x in raw.split(",")]
+    if any("=" in x for x in items):
+        out: dict[int, str] = {}
+        for x in filter(None, items):
+            port, sep, model = x.partition("=")
+            if not sep or not port.strip().isdigit():
+                raise ValueError(f"lane model {x!r}: expected PORT=MODEL")
+            out[int(port)] = model.strip()
+        return out
+    return items
+
+
 def _coerce(key: str, raw: str, default: Any) -> Any:
+    if key == "lane_models":
+        return parse_lane_models(raw)
     if key == "verify_tls":
         low = raw.strip().lower()
         return True if low in _TRUE else False if low in _FALSE else raw
@@ -559,7 +595,7 @@ def _normalize(cfg: dict) -> Config:
 
 # Keys that describe the listener set as a whole and cannot differ per lane.
 LANE_FIXED_KEYS = {"listen_host", "listen_port", "listen_port_count", "listen_ports",
-                   "log_level", "lane_overrides", "gemini_api_keys"}
+                   "log_level", "lane_overrides", "gemini_api_keys", "lane_models"}
 
 
 def lane_ports(cfg: Config) -> list[int]:
@@ -586,6 +622,21 @@ def build_lanes(cfg: Config) -> list[Config]:
         log.warning("lane_overrides has %d entries but only %d lanes; extra entries ignored",
                     len(overrides), len(ports))
     keys = cfg.gemini_api_keys
+    models = cfg.lane_models or []
+    if isinstance(models, dict):
+        try:
+            models = {int(k): v for k, v in models.items()}
+        except (TypeError, ValueError):
+            raise ValueError(f"lane_models mapping keys must be ports, got {list(cfg.lane_models)}")
+        unknown = sorted(set(models) - set(ports))
+        if unknown:
+            raise ValueError(f"lane_models names port(s) {unknown} that no lane listens on (ports: {ports})")
+        models = [models.get(p) for p in ports]
+    elif not isinstance(models, list):
+        raise ValueError("lane_models must be a list (by lane index) or a mapping (by port)")
+    elif len(models) > len(ports):
+        log.warning("lane_models has %d entries but only %d lanes; extra entries ignored",
+                    len(models), len(ports))
     if keys and len(keys) < len(ports):
         log.info("%d API keys for %d lanes: some lanes share a key (and its quota)", len(keys), len(ports))
     lanes = []
@@ -598,7 +649,17 @@ def build_lanes(cfg: Config) -> list[Config]:
         bad = sorted(k for k in ov if k in LANE_FIXED_KEYS or k not in DEFAULTS)
         if bad:
             raise ValueError(f"lane_overrides[{i}]: keys not allowed per lane: {bad}")
-        lc = {**cfg, **ov}
+        lc = dict(cfg)
+        model = models[i] if i < len(models) else None
+        if model:
+            if not isinstance(model, str):
+                raise ValueError(f"lane_models entry for port {port} must be a model name, got {model!r}")
+            model = model.strip().removeprefix("models/")
+            lc["force_model"] = lc["default_model"] = model
+            if "force_model" in ov:
+                log.warning("lane%d:%d: lane_overrides force_model %r replaces lane_models %r",
+                            i, port, ov["force_model"], model)
+        lc.update(ov)
         if "gemini_api_key" not in ov and keys:
             lc["gemini_api_key"] = keys[i % len(keys)]
         lc = _normalize(lc)
@@ -1517,8 +1578,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.http = build_http_client(cfg)
-        log.info("%s: upstream=%s mode=%s prefixes=%s root_path=%r key=%s session=%s", cfg._lane,
-                 cfg.gemini_base_url, cfg.upstream_mode, cfg.route_prefixes, cfg.root_path,
+        log.info("%s: model=%s upstream=%s mode=%s prefixes=%s root_path=%r key=%s session=%s", cfg._lane,
+                 cfg.force_model or "(client's choice)", cfg.gemini_base_url, cfg.upstream_mode, cfg.route_prefixes, cfg.root_path,
                  "..." + cfg.gemini_api_key[-4:] if len(cfg.gemini_api_key) > 8 else "-",
                  cfg._session_id[:8] if cfg.upstream_session_header else "-")
         if not cfg.gemini_api_key and not cfg.passthrough_client_key and cfg.auth_mode != "none":
@@ -1698,6 +1759,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         data = [{"id": i, "object": "model", "created": 0, "owned_by": "google"} for i in dict.fromkeys(ids)]
         for alias in cfg.model_aliases:
             data.append({"id": alias, "object": "model", "created": 0, "owned_by": "gateway-alias"})
+        if cfg.force_model:  # this lane serves only one model: list it first
+            data = [{"id": cfg.force_model, "object": "model", "created": 0, "owned_by": "google"}] + \
+                   [d for d in data if d["id"] != cfg.force_model]
         if not data:
             data.append({"id": cfg.default_model, "object": "model", "created": 0, "owned_by": "google"})
         return {"object": "list", "data": data}
@@ -1715,7 +1779,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.get(HEALTH_PATH)
     async def health():
-        return {"status": "ok", "lane": cfg._lane, "port": cfg._port,
+        return {"status": "ok", "lane": cfg._lane, "port": cfg._port, "model": cfg.force_model or None,
                 "mode": cfg.upstream_mode, "upstream": cfg.gemini_base_url,
                 "prefixes": cfg.route_prefixes, "key_configured": bool(cfg.gemini_api_key)}
 
@@ -1787,6 +1851,8 @@ def main() -> None:
                     help=f"number of lanes on consecutive ports from listen_port (default {LISTEN_PORT_COUNT})")
     ap.add_argument("-p", "--ports", metavar="P1,P2,...",
                     help="explicit comma-separated port list (overrides --port-count)")
+    ap.add_argument("-m", "--models", metavar="M1,M2,...",
+                    help="model per lane, by lane index (M1,,M3 skips lane 1) or PORT=MODEL,...")
     ap.add_argument("--print-config", action="store_true", help="print the annotated example config and exit")
     args = ap.parse_args()
     if args.print_config:
@@ -1800,6 +1866,11 @@ def main() -> None:
             cfg["listen_ports"] = [int(p) for p in args.ports.split(",") if p.strip()]
         except ValueError:
             raise SystemExit(f"--ports must be comma-separated integers, got {args.ports!r}")
+    if args.models:
+        try:
+            cfg["lane_models"] = parse_lane_models(args.models)
+        except ValueError as e:
+            raise SystemExit(f"--models: {e}")
     setup_logging(cfg.log_level)
     try:
         lanes = build_lanes(cfg)
