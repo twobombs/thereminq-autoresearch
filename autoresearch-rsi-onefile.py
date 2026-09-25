@@ -5031,14 +5031,38 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
     if not a or not b:
         return {**base, "verdict": "UNCOMPARABLE",
                 "detail": "no numeric JSON fields to compare between the run and the control."}
-    def moved(x: float, y: float) -> bool:
-        return abs(x - y) > 1e-12 * max(1.0, abs(x))
-    if [k for k, _ in a] == [k for k, _ in b]:
-        pairs = [(k, x, y) for (k, x), (_, y) in zip(a, b)]
-    else:
-        da, db = dict(a), dict(b)
-        pairs = [(k, da[k], db[k]) for k in da if k in db]
-    changed = [(k, x, y) for k, x, y in pairs if moved(x, y)]
+
+    def pair_up(u, v):
+        if [k for k, _ in u] == [k for k, _ in v]:
+            return [(k, x, y) for (k, x), (_, y) in zip(u, v)]
+        du, dv = dict(u), dict(v)
+        return [(k, du[k], dv[k]) for k in du if k in dv]
+
+    # Noise floor: run the unmodified RUN command once more. A value that moves
+    # between two identical runs (unseeded sampling, float jitter) can only
+    # count as a response if the control moves it clearly further.
+    noise: Dict[int, float] = {}
+    rerrs: List[str] = []
+    shutil.rmtree(work / "repeat", ignore_errors=True)
+    shutil.copytree(proj, work / "repeat", ignore=shutil.ignore_patterns("__pycache__", ".home"))
+    rrc, rout, rto = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "repeat", env,
+                                  cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=rerrs)
+    noisy_keys: List[str] = []
+    if rrc == 0 and not rto:
+        rep_pairs = pair_up(a, numeric_fingerprint(rout or ""))
+        for i, (k, x, y) in enumerate(rep_pairs):
+            noise[i] = abs(x - y)
+            if abs(x - y) > 1e-9 * max(1.0, abs(x)):
+                noisy_keys.append(k)
+
+    def moved(i: int, x: float, y: float) -> bool:
+        floor = max(1e-6 * max(1.0, abs(x)), 3.0 * noise.get(i, 0.0))
+        return abs(x - y) > floor
+
+    pairs = pair_up(a, b)
+    changed = [(k, x, y) for i, (k, x, y) in enumerate(pairs) if moved(i, x, y)]
+    if noisy_keys:
+        base["noisy"] = sorted(set(noisy_keys))[:8]
     measured = [k for k, _, _ in pairs if not _SUMMARY_KEY_RE.search(k)]
     hard = hardcoded_control_branches(proj, _RUN_PROBE_COMMAND, [k for k, _ in a])
     if hard:
@@ -5048,7 +5072,8 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
                           "nothing about the metrics."}
     if not changed:
         return {**base, "verdict": "INSENSITIVE",
-                "detail": f"all {len(a)} reported number(s) are identical under the control "
+                "detail": f"all {len(a)} reported number(s) are unchanged under the control (differences, if "
+                          f"any, are within float precision or run-to-run noise) "
                           f"(e.g. {', '.join(f'{k}={v:g}' for k, v in a[:4])}). Either the metrics are "
                           f"constant by construction or the entry point ignores the control flag - "
                           f"both break the contract."}
@@ -5058,9 +5083,11 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
                           + "); the measured quantities did not ("
                           + ", ".join(sorted(set(measured))[:6]) + " unchanged). The score does not come from "
                           "the measurement."}
+    note = (f" (run-to-run noise on {', '.join(base['noisy'][:4])}: changes are counted only above "
+            f"3x that noise; seed the randomness for a cleaner control)" if base.get("noisy") else "")
     return {**base, "verdict": "RESPONSIVE",
             "detail": "changed under the control: "
-                      + ", ".join(f"{k} {x:g} -> {y:g}" for k, x, y in changed[:6])}
+                      + ", ".join(f"{k} {x:.6g} -> {y:.6g}" for k, x, y in changed[:6]) + note}
 
 
 _PROMPT_SKEPTIC_REVIEW = (
