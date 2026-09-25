@@ -24,7 +24,7 @@ python openai2gemini.py --print-config > config.yaml   # optional; env vars alon
 python openai2gemini.py -c config.yaml
 ```
 
-By default the gateway listens on 127.0.0.1 only. To bind a public interface (including `0.0.0.0` inside a container), set `client_api_keys` or `passthrough_client_key`; otherwise it refuses to start unless `allow_public_without_auth: true` is set explicitly.
+By default the gateway opens **three** listeners, on ports 9931, 9932 and 9933 (`listen_port`, `listen_port_count`), bound to 127.0.0.1 only. To bind a public interface (including `0.0.0.0` inside a container), set `client_api_keys` or `passthrough_client_key`; otherwise it refuses to start unless `allow_public_without_auth: true` is set explicitly.
 
 Point any OpenAI client at it:
 
@@ -33,6 +33,23 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:9931/v1", api_key="sk-local-change-me")
 client.chat.completions.create(model="gemini-3.8-flash", messages=[{"role": "user", "content": "hi"}])
 ```
+
+## Ports and upstream sessions
+
+Each listening port is a *lane*: an independent gateway with its own upstream session towards the cloud provider. Per lane there is
+
+- its own outbound HTTP client (separate connection pool, so separate TCP/TLS sessions and HTTP/2 streams),
+- its own thought-signature cache and its own rate-limit/backoff state (a 429 on one lane does not stall the others),
+- optionally its own API key (`gemini_api_keys`, assigned round-robin), its own session id header (`upstream_session_header`), and any other per-lane setting (`lane_overrides`, e.g. a different `outbound_proxy`, `force_model` or `client_api_keys`).
+
+```bash
+python openai2gemini.py                      # 3 lanes: 9931, 9932, 9933
+python openai2gemini.py -n 8                 # 8 lanes: 9931..9938
+python openai2gemini.py --ports 9931,9940    # explicit ports
+GW_LISTEN_PORT_COUNT=5 GW_GEMINI_API_KEYS=key-a,key-b python openai2gemini.py
+```
+
+The Gemini API itself is stateless: there is no server-side session object, and lanes that share one API key (or keys from the same Google Cloud project) share that project's quota. Use keys from separate projects if the goal is more throughput rather than isolation. A conversation that uses tool calls should stay on one lane, since each lane remembers only its own thought signatures (the fallback signature covers a switch).
 
 ## Upstream modes
 
@@ -98,7 +115,7 @@ GW_CLIENT_API_KEYS=sk-a,sk-b
 
 ## Limits and notes
 
-- The thought-signature cache is in-memory. If you run several replicas, use sticky sessions or rely on the fallback signature.
+- The thought-signature cache is in-memory and per lane. If you run several replicas or move a conversation between lanes, use sticky sessions or rely on the fallback signature.
 - Embeddings use `batchEmbedContents` (Gemini API). Vertex's `:predict` embedding shape is not translated, so use `upstream_mode: openai` or a separate instance for that.
 - `fetch_remote_media` makes the gateway download URLs supplied by clients. Downloads are streamed with a hard size cap, redirects are followed manually (max 5) and, with `media_block_private_hosts`, every hop must resolve to public addresses only. DNS rebinding can still defeat a resolve-then-connect check, so if untrusted clients can reach the gateway, also restrict egress at the network level or disable the feature.
 - Gemini returns no token counts for embeddings, so `usage` there is 0.
@@ -106,7 +123,9 @@ GW_CLIENT_API_KEYS=sk-a,sk-b
 - **Rate limits and overload**: on an upstream 429 or 503 (`retry_statuses`) the gateway waits the delay Gemini asks for (`RetryInfo.retryDelay`, then `Retry-After`, then the "retry in Ns" text). If none is given, it uses the fixed per-status delay in `retry_status_delays` (503 "high demand": 10s), otherwise exponential backoff from `retry_default_delay`. Then it retries, up to `retry_max_attempts` times. A delay longer than `retry_max_wait` (e.g. a daily quota) is not waited out: the 429 goes straight back to the client with a `Retry-After` header. Your client's own request timeout must exceed the wait, or it will give up first. Set `retry_max_attempts: 0` to disable.
 
 CLI:
-    python openai2gemini.py [-c config.yaml]      run the server
+    python openai2gemini.py [-c config.yaml]      run the server (default: 3 lanes)
+    python openai2gemini.py -n N                  N lanes on consecutive ports from listen_port
+    python openai2gemini.py --ports 9931,9940     lanes on exactly these ports
     python openai2gemini.py --print-config        print the annotated example config
 """
 from __future__ import annotations
@@ -121,6 +140,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import socket
 import struct
 import time
@@ -128,7 +148,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 import httpx
@@ -145,7 +165,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # -- Inbound: where the gateway listens --------------------------------------
 LISTEN_HOST = "127.0.0.1"                  # loopback only; see ALLOW_PUBLIC_WITHOUT_AUTH
-LISTEN_PORT = 9931
+LISTEN_PORT = 9931                         # first lane; further lanes count up from here
+LISTEN_PORT_COUNT = 3                      # number of lanes (ports / upstream sessions)
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 ROUTE_PREFIXES = ["/v1"]                   # every prefix gets the full OpenAI surface
@@ -264,6 +285,12 @@ EXAMPLE_CONFIG = f"""# gemini-openai-gateway configuration
 # allow_public_without_auth: true.
 listen_host: {LISTEN_HOST}
 listen_port: {LISTEN_PORT}
+
+# One listener per upstream session ("lane"). Ports are listen_port, listen_port+1, ...
+# (listen_port_count of them) unless listen_ports lists them explicitly. Each lane has
+# its own connection pool, thought-signature cache and retry/backoff state.
+listen_port_count: {LISTEN_PORT_COUNT}
+listen_ports: []              # e.g. [9931, 9940, 9941]; overrides listen_port / listen_port_count
 log_level: {LOG_LEVEL}
 allow_public_without_auth: {_j(ALLOW_PUBLIC_WITHOUT_AUTH)}
 
@@ -300,6 +327,19 @@ native_path_template: {_j(GEMINI_NATIVE_PATH_TEMPLATE)}
 models_path_template: {_j(GEMINI_MODELS_PATH_TEMPLATE)}
 gemini_openai_path: {GEMINI_OPENAI_PATH}
 gemini_api_key: ""            # prefer the {API_KEY_ENV_VARS[0]} env var
+# Several keys: lane i uses gemini_api_keys[i % len]. Empty = every lane uses gemini_api_key.
+gemini_api_keys: []
+
+# Header carrying a per-lane session id (random hex, fixed for the process lifetime), for
+# proxies or API gateways that pin, meter or trace by session. Empty = not sent.
+upstream_session_header: ""   # e.g. X-Session-Id
+
+# Per-lane overrides, by lane index. Any config key except listen_*, log_level,
+# gemini_api_keys and lane_overrides. Lanes without an entry use the settings above.
+lane_overrides: []
+#  - {{}}                                             # lane 0: defaults
+#  - {{outbound_proxy: "socks5://127.0.0.1:1081"}}   # lane 1: different egress
+#  - {{force_model: gemini-3.1-pro, gemini_api_key: "..."}}
 
 # How the key is sent upstream: header | bearer | query | none
 # (query-mode keys are redacted from logs)
@@ -372,6 +412,9 @@ DEFAULTS: dict[str, Any] = {
     # inbound (what clients talk to)
     "listen_host": LISTEN_HOST,
     "listen_port": LISTEN_PORT,
+    "listen_port_count": LISTEN_PORT_COUNT,
+    "listen_ports": [],                 # explicit ports; overrides listen_port/listen_port_count
+    "lane_overrides": [],               # per-lane config dicts, by lane index
     "log_level": LOG_LEVEL,
     "allow_public_without_auth": ALLOW_PUBLIC_WITHOUT_AUTH,
     "root_path": ROOT_PATH,
@@ -389,6 +432,8 @@ DEFAULTS: dict[str, Any] = {
     "models_path_template": GEMINI_MODELS_PATH_TEMPLATE,
     "gemini_openai_path": GEMINI_OPENAI_PATH,
     "gemini_api_key": "",
+    "gemini_api_keys": [],              # round-robin over lanes
+    "upstream_session_header": "",      # header name for the per-lane session id; "" = off
     "auth_mode": GEMINI_AUTH_MODE,
     "auth_header": GEMINI_AUTH_HEADER,
     "extra_upstream_headers": {},
@@ -487,7 +532,12 @@ def load_config(path: str | None = None) -> Config:
             cfg[k] = _coerce(k, env, d)
     if not cfg["gemini_api_key"]:
         cfg["gemini_api_key"] = next((os.environ[v] for v in API_KEY_ENV_VARS if os.environ.get(v)), "")
+    return _normalize(cfg)
 
+
+def _normalize(cfg: dict) -> Config:
+    """Canonicalise paths/lists and validate enums. Used for the base config and every lane."""
+    cfg = dict(cfg)
     prefixes = []
     for p in cfg["route_prefixes"] or ROUTE_PREFIXES:
         p = "/" + p.strip("/") if p.strip("/") else ""
@@ -498,11 +548,64 @@ def load_config(path: str | None = None) -> Config:
     cfg["gemini_base_url"] = cfg["gemini_base_url"].rstrip("/")
     cfg["gemini_openai_path"] = "/" + cfg["gemini_openai_path"].strip("/")
     cfg["client_api_keys"] = [str(k) for k in cfg["client_api_keys"] or []]
+    cfg["gemini_api_keys"] = [str(k) for k in cfg["gemini_api_keys"] or [] if str(k)]
+    cfg["listen_ports"] = [int(p) for p in cfg["listen_ports"] or []]
     if cfg["upstream_mode"] not in ("native", "openai"):
         raise ValueError("upstream_mode must be 'native' or 'openai'")
     if cfg["auth_mode"] not in ("header", "bearer", "query", "none"):
         raise ValueError("auth_mode must be header | bearer | query | none")
     return Config(cfg)
+
+
+# Keys that describe the listener set as a whole and cannot differ per lane.
+LANE_FIXED_KEYS = {"listen_host", "listen_port", "listen_port_count", "listen_ports",
+                   "log_level", "lane_overrides", "gemini_api_keys"}
+
+
+def lane_ports(cfg: Config) -> list[int]:
+    if cfg.listen_ports:
+        ports = list(cfg.listen_ports)
+    else:
+        if cfg.listen_port_count < 1:
+            raise ValueError("listen_port_count must be at least 1")
+        ports = [cfg.listen_port + i for i in range(cfg.listen_port_count)]
+    bad = [p for p in ports if not 0 < p < 65536]
+    if bad:
+        raise ValueError(f"invalid port(s): {bad}")
+    dupes = sorted({p for p in ports if ports.count(p) > 1})
+    if dupes:
+        raise ValueError(f"duplicate port(s): {dupes}")
+    return ports
+
+
+def build_lanes(cfg: Config) -> list[Config]:
+    """One Config per listening port, each an independent upstream session."""
+    ports = lane_ports(cfg)
+    overrides = cfg.lane_overrides or []
+    if len(overrides) > len(ports):
+        log.warning("lane_overrides has %d entries but only %d lanes; extra entries ignored",
+                    len(overrides), len(ports))
+    keys = cfg.gemini_api_keys
+    if keys and len(keys) < len(ports):
+        log.info("%d API keys for %d lanes: some lanes share a key (and its quota)", len(keys), len(ports))
+    lanes = []
+    for i, port in enumerate(ports):
+        ov = overrides[i] if i < len(overrides) else {}
+        if ov is None:
+            ov = {}
+        if not isinstance(ov, dict):
+            raise ValueError(f"lane_overrides[{i}] must be a mapping, got {type(ov).__name__}")
+        bad = sorted(k for k in ov if k in LANE_FIXED_KEYS or k not in DEFAULTS)
+        if bad:
+            raise ValueError(f"lane_overrides[{i}]: keys not allowed per lane: {bad}")
+        lc = {**cfg, **ov}
+        if "gemini_api_key" not in ov and keys:
+            lc["gemini_api_key"] = keys[i % len(keys)]
+        lc = _normalize(lc)
+        lc.update({"_lane": f"lane{i}:{port}", "_port": port,
+                   "_session_id": uuid.uuid4().hex, "_signatures": LRU()})
+        lanes.append(lc)
+    return lanes
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -521,7 +624,8 @@ def check_bind_safety(cfg: Config) -> None:
     if cfg.client_api_keys or cfg.passthrough_client_key or cfg.allow_public_without_auth:
         return
     raise SystemExit(
-        f"refusing to listen on {cfg.listen_host!r} without client authentication: anyone who can "
+        f"{cfg.get('_lane', 'gateway')}: refusing to listen on {cfg.listen_host!r} without client "
+        "authentication: anyone who can "
         "reach this port could spend your Gemini key and use fetch_remote_media against your "
         "network. Set client_api_keys (or passthrough_client_key), bind a loopback address, or set "
         "allow_public_without_auth: true if you really mean it.")
@@ -637,8 +741,6 @@ class LRU:
         return self.d[k]
 
 
-SIGNATURES = LRU()
-
 _ERR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
               404: "not_found_error", 429: "rate_limit_error"}
 
@@ -693,12 +795,12 @@ async def send_upstream(cfg: Config, http: httpx.AsyncClient, method: str, url: 
         else:
             delay = cfg.retry_default_delay * (2 ** attempt)
         if delay > cfg.retry_max_wait:
-            log.warning("upstream %s: requested wait %.0fs exceeds retry_max_wait (%.0fs); returning it",
-                        resp.status_code, delay, cfg.retry_max_wait)
+            log.warning("%s: upstream %s: requested wait %.0fs exceeds retry_max_wait (%.0fs); returning it",
+                        cfg.get("_lane", "-"), resp.status_code, delay, cfg.retry_max_wait)
             return resp
         await resp.aclose()
         attempt += 1
-        log.warning("upstream %s (%s); waiting %.1fs, then retry %d/%d", resp.status_code,
+        log.warning("%s: upstream %s (%s); waiting %.1fs, then retry %d/%d", cfg.get("_lane", "-"), resp.status_code,
                     "rate limit" if resp.status_code == 429 else "unavailable",
                     delay, attempt, cfg.retry_max_attempts)
         await asyncio.sleep(delay + RETRY_PADDING)
@@ -744,6 +846,8 @@ def native_url(cfg: Config, model: str, method: str) -> str:
 
 def upstream_auth(cfg: Config, key: str | None, openai_style: bool = False) -> tuple[dict, dict]:
     headers, params = dict(cfg.extra_upstream_headers), {}
+    if cfg.upstream_session_header and cfg.get("_session_id"):
+        headers[cfg.upstream_session_header] = cfg._session_id
     if not key or cfg.auth_mode == "none":
         return headers, params
     if openai_style or cfg.auth_mode == "bearer":
@@ -970,7 +1074,7 @@ async def build_contents(cfg: Config, messages: list[dict], model: str,
                 part = {"functionCall": {"name": fn.get("name"), "args": _parse_args(fn.get("arguments"))}}
                 if send_ids and tc.get("id"):
                     part["functionCall"]["id"] = tc["id"]
-                sig = SIGNATURES.get(tc.get("id"))
+                sig = cfg._signatures.get(tc.get("id"))
                 if sig:
                     part["thoughtSignature"] = sig
                 parts.append(part)
@@ -1270,14 +1374,14 @@ def map_finish(reason: str | None, has_tools: bool) -> str:
     return _FINISH.get(reason or "STOP", "stop")
 
 
-def convert_parts(parts: list[dict]) -> tuple[str, str, list[dict]]:
+def convert_parts(parts: list[dict], sigs: LRU) -> tuple[str, str, list[dict]]:
     text, reasoning, calls = [], [], []
     for p in parts:
         if "functionCall" in p:
             fc = p["functionCall"]
             tid = fc.get("id") or "call_" + uuid.uuid4().hex[:24]
             if p.get("thoughtSignature"):
-                SIGNATURES.put(tid, p["thoughtSignature"])
+                sigs.put(tid, p["thoughtSignature"])
             calls.append({"id": tid, "type": "function", "function": {
                 "name": fc.get("name"), "arguments": json.dumps(fc.get("args") or {}, ensure_ascii=True)}})
         elif "text" in p:
@@ -1303,10 +1407,10 @@ def convert_usage(um: dict) -> dict:
             "completion_tokens_details": {"reasoning_tokens": t}}
 
 
-def native_to_openai(data: dict, model_label: str) -> dict:
+def native_to_openai(data: dict, model_label: str, sigs: LRU) -> dict:
     choices = []
     for i, cand in enumerate(data.get("candidates") or []):
-        text, reasoning, calls = convert_parts((cand.get("content") or {}).get("parts") or [])
+        text, reasoning, calls = convert_parts((cand.get("content") or {}).get("parts") or [], sigs)
         msg: dict[str, Any] = {"role": "assistant", "content": text if (text or not calls) else None}
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -1323,7 +1427,7 @@ def native_to_openai(data: dict, model_label: str) -> dict:
             "choices": choices, "usage": convert_usage(data.get("usageMetadata") or {})}
 
 
-async def sse_native(resp: httpx.Response, model_label: str, include_usage: bool):
+async def sse_native(resp: httpx.Response, model_label: str, include_usage: bool, sigs: LRU):
     cid, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
     state: dict[int, dict] = {}
     usage_md: dict = {}
@@ -1363,7 +1467,7 @@ async def sse_native(resp: httpx.Response, model_label: str, include_usage: bool
             for i, cand in enumerate(data.get("candidates") or []):
                 idx = cand.get("index", i)
                 st = state.setdefault(idx, {"role": False, "tools": 0, "done": False})
-                text, reasoning, calls = convert_parts((cand.get("content") or {}).get("parts") or [])
+                text, reasoning, calls = convert_parts((cand.get("content") or {}).get("parts") or [], sigs)
                 delta: dict[str, Any] = {}
                 if not st["role"]:
                     delta["role"], st["role"] = "assistant", True
@@ -1405,16 +1509,21 @@ async def sse_native(resp: httpx.Response, model_label: str, include_usage: bool
 # --------------------------------------------------------------------------- #
 
 def create_app(cfg: Config | None = None) -> FastAPI:
+    """App for one lane. Given a base config (not from build_lanes), serves a single lane on listen_port."""
     cfg = cfg or load_config()
+    if "_lane" not in cfg:
+        cfg = build_lanes(Config({**cfg, "listen_ports": [cfg.listen_port]}))[0]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.http = build_http_client(cfg)
-        log.info("upstream=%s mode=%s prefixes=%s root_path=%r", cfg.gemini_base_url,
-                 cfg.upstream_mode, cfg.route_prefixes, cfg.root_path)
+        log.info("%s: upstream=%s mode=%s prefixes=%s root_path=%r key=%s session=%s", cfg._lane,
+                 cfg.gemini_base_url, cfg.upstream_mode, cfg.route_prefixes, cfg.root_path,
+                 "..." + cfg.gemini_api_key[-4:] if len(cfg.gemini_api_key) > 8 else "-",
+                 cfg._session_id[:8] if cfg.upstream_session_header else "-")
         if not cfg.gemini_api_key and not cfg.passthrough_client_key and cfg.auth_mode != "none":
-            log.warning("no Gemini API key configured (%s unset): upstream requests will be refused "
-                        "until one is set and the gateway is restarted", " / ".join(API_KEY_ENV_VARS))
+            log.warning("%s: no Gemini API key configured (%s unset): upstream requests will be refused "
+                        "until one is set and the gateway is restarted", cfg._lane, " / ".join(API_KEY_ENV_VARS))
         yield
         await app.state.http.aclose()
 
@@ -1502,14 +1611,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     await resp.aclose()
                     return upstream_error(resp.status_code, content)
                 include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-                return StreamingResponse(sse_native(resp, label, include_usage),
+                return StreamingResponse(sse_native(resp, label, include_usage, cfg._signatures),
                                          media_type="text/event-stream", headers=NO_BUFFER_HEADERS)
             resp = await send_upstream(cfg, http, "POST", url, json=payload, headers=headers, params=params)
         except httpx.HTTPError as e:
             return oai_error(502, f"upstream request failed: {e!r}", "api_error")
         if resp.status_code >= 400:
             return upstream_error(resp.status_code, resp.content)
-        return JSONResponse(native_to_openai(resp.json(), label))
+        return JSONResponse(native_to_openai(resp.json(), label, cfg._signatures))
 
     @router.post("/embeddings")
     async def embeddings(request: Request):
@@ -1606,7 +1715,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.get(HEALTH_PATH)
     async def health():
-        return {"status": "ok", "mode": cfg.upstream_mode, "upstream": cfg.gemini_base_url,
+        return {"status": "ok", "lane": cfg._lane, "port": cfg._port,
+                "mode": cfg.upstream_mode, "upstream": cfg.gemini_base_url,
                 "prefixes": cfg.route_prefixes, "key_configured": bool(cfg.gemini_api_key)}
 
     return app
@@ -1621,22 +1731,86 @@ def setup_logging(level: str) -> None:
         h.addFilter(redact)
 
 
+async def serve_lanes(cfg: Config, lanes: list[Config]) -> None:
+    """Run one uvicorn server per lane in a single event loop. All ports are bound
+    before any lane starts, and when one lane stops (signal or failure) all stop."""
+    import uvicorn
+
+    class _LaneServer(uvicorn.Server):
+        # Signals are handled once for all lanes below; uvicorn's own per-server
+        # handlers would overwrite each other.
+        def install_signal_handlers(self) -> None:   # uvicorn < 0.29
+            pass
+
+        @contextmanager
+        def capture_signals(self):                    # uvicorn >= 0.29
+            yield
+
+    servers, sockets = [], []
+    for lc in lanes:
+        uc = uvicorn.Config(create_app(lc), host=cfg.listen_host, port=lc._port, proxy_headers=True,
+                            forwarded_allow_ips=lc.forwarded_allow_ips, log_level=cfg.log_level.lower())
+        sockets.append(uc.bind_socket())  # fail fast (exits) if any port is taken
+        servers.append(_LaneServer(uc))
+
+    def stop(*_: Any) -> None:
+        for srv in servers:
+            if srv.should_exit:
+                srv.force_exit = True   # second Ctrl-C: don't wait for open streams
+            srv.should_exit = True
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop)
+        except (NotImplementedError, RuntimeError):  # Windows
+            signal.signal(sig, stop)
+
+    log.info("starting %d lane(s) on %s: ports %s", len(lanes), cfg.listen_host,
+             ", ".join(str(lc._port) for lc in lanes))
+    tasks = [asyncio.create_task(srv.serve(sockets=[sock]), name=lc._lane)
+             for srv, sock, lc in zip(servers, sockets, lanes)]
+    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in done:
+        if not t.cancelled() and t.exception() is not None:
+            log.error("%s stopped with an error: %r", t.get_name(), t.exception())
+        elif not any(srv.should_exit for srv in servers):
+            log.warning("%s stopped; shutting down the other lanes", t.get_name())
+    stop()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="OpenAI-compatible gateway for the Gemini API")
     ap.add_argument("-c", "--config", help="YAML config file (or set GW_CONFIG)")
+    ap.add_argument("-n", "--port-count", type=int, metavar="N",
+                    help=f"number of lanes on consecutive ports from listen_port (default {LISTEN_PORT_COUNT})")
+    ap.add_argument("-p", "--ports", metavar="P1,P2,...",
+                    help="explicit comma-separated port list (overrides --port-count)")
     ap.add_argument("--print-config", action="store_true", help="print the annotated example config and exit")
     args = ap.parse_args()
     if args.print_config:
         print(EXAMPLE_CONFIG, end="")
         return
     cfg = load_config(args.config)
+    if args.port_count is not None:
+        cfg["listen_port_count"], cfg["listen_ports"] = args.port_count, []
+    if args.ports:
+        try:
+            cfg["listen_ports"] = [int(p) for p in args.ports.split(",") if p.strip()]
+        except ValueError:
+            raise SystemExit(f"--ports must be comma-separated integers, got {args.ports!r}")
     setup_logging(cfg.log_level)
-    check_bind_safety(cfg)
-
-    import uvicorn
-    uvicorn.run(create_app(cfg), host=cfg.listen_host, port=cfg.listen_port,
-                proxy_headers=True, forwarded_allow_ips=cfg.forwarded_allow_ips,
-                log_level=cfg.log_level.lower())
+    try:
+        lanes = build_lanes(cfg)
+    except ValueError as e:
+        raise SystemExit(f"config error: {e}")
+    for lc in lanes:
+        check_bind_safety(lc)
+    try:
+        asyncio.run(serve_lanes(cfg, lanes))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
