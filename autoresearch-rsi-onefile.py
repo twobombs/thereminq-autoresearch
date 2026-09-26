@@ -258,11 +258,18 @@ ABORTED_DIRNAME = "aborted"
 # charged). It is identical online and in replay, matching the paper's equal
 # per-round budgets for Dream-RSI and Recursive Fixed Exploration.
 # ------------------------------------------------------------------------------
-# Default 2: dreaming after round 1 needs a round 2 to deploy into, and the
-# pool needs more than one recorded tree before replay scores mean much.
-DEFAULT_ROUNDS = int(os.getenv("RSI_ROUNDS", "2"))
+# Default 3 rounds: round 1 writes, rounds 2-3 continue the code (CARRY_FORWARD),
+# and dreaming gets two deployments and a pool of more than one recorded tree.
+DEFAULT_ROUNDS = int(os.getenv("RSI_ROUNDS", "3"))
 MAX_ROUNDS = int(os.getenv("RSI_MAX_ROUNDS", "12"))
-ROUND_BUDGET_PER_TASK = float(os.getenv("ROUND_BUDGET_PER_TASK", "2.0"))
+# Agent calls per round: a fixed 15 by default. Setting ROUND_BUDGET_PER_TASK
+# instead scales the budget with the number of assignments.
+ROUND_BUDGET = int(os.getenv("ROUND_BUDGET", "15"))
+ROUND_BUDGET_PER_TASK = float(os.getenv("ROUND_BUDGET_PER_TASK", "0") or 0)
+# Rounds continue the code: in round 2+ each assignment's FIRST new branch starts
+# from that assignment's best attempt so far (a continuation), not from scratch.
+# Further branches in the round stay fresh, so exploration is kept.
+CARRY_FORWARD = os.getenv("CARRY_FORWARD", "1") == "1"
 ROUND_BUDGET_MIN = int(os.getenv("ROUND_BUDGET_MIN", "3"))
 ROUND_BUDGET_MAX = int(os.getenv("ROUND_BUDGET_MAX", "60"))
 
@@ -1505,8 +1512,10 @@ def describe_budget_alignment() -> str:
         f"{'' if TEST_PIP_INSTALL else ', installs OFF'}; untested prior {EVAL_UNTESTED_PRIOR}"
     )
     lines.append(
-        f"    [i] RSI: budget {ROUND_BUDGET_PER_TASK} agent call(s)/task per round"
-        f" (clamped {ROUND_BUDGET_MIN}-{ROUND_BUDGET_MAX})"
+        f"    [i] RSI: {DEFAULT_ROUNDS} round(s), budget "
+        + (f"{ROUND_BUDGET_PER_TASK} agent call(s)/task per round" if ROUND_BUDGET_PER_TASK > 0
+           else f"{ROUND_BUDGET} agent calls per round")
+        + f" (clamped {ROUND_BUDGET_MIN}-{ROUND_BUDGET_MAX})"
         f" | M={DREAM_CANDIDATES + 1} chained policy version(s) per dream on apex"
         f" | V = quality - {DREAM_BETA1}*N + {DREAM_BETA2}*N/k | replay costs 0 agent calls"
         f" | revise only if oracle headroom >= {DREAM_MIN_HEADROOM}"
@@ -2853,6 +2862,18 @@ class LiveExplorer(ExplorerBase):
         if agent is None:
             return None
         parent_task_node = parent if (parent and parent.get("task") == task) else None
+        seeded_from = None
+        if parent_task_node is None and CARRY_FORWARD and self.rnd > 1:
+            with self._lock:
+                seeded = getattr(self, "_seeded_tasks", None)
+                if seeded is None:
+                    seeded = self._seeded_tasks = set()
+                first = task not in seeded
+                seeded.add(task)
+            if first:
+                prior = best_known_nodes(self.run_dir, self.rnd - 1).get(task)
+                if prior is not None and prior.get("files"):
+                    parent_task_node, seeded_from = prior, prior["id"]
         if parent_task_node is not None:
             reference = set(parent_task_node.get("file_hashes", []))
         else:
@@ -2880,6 +2901,8 @@ class LiveExplorer(ExplorerBase):
                                  self.run_dir, self._nodes, self._lock,
                                  parent_task_node=parent_task_node, reference_hashes=reference,
                                  attempt=attempt, semantic_guidance=self.semantic_guidance)
+                if seeded_from:
+                    node["seeded_from"] = seeded_from
                 if node["status"] in ("success", "partial"):
                     # Fixed evaluator, part of the same generation-evaluation
                     # request; runs on the slot this attempt already holds.
@@ -2900,6 +2923,10 @@ class LiveExplorer(ExplorerBase):
                             library_misuse_gate(node, self.run_dir, self.rnd)
                         except Exception as exc:
                             print(f"\n    [!] {task} library scan raised {str(exc)[:80]}", flush=True)
+                    try:
+                        write_evaluation_feedback(node, self.run_dir)
+                    except Exception as exc:
+                        print(f"\n    [!] {task} evaluation feedback raised {str(exc)[:80]}", flush=True)
                     break
             except Exception as exc:
                 print(f"\n    [!] {task} attempt {attempt} raised {str(exc)[:80]}", flush=True)
@@ -3251,8 +3278,19 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     if parent_task_node is not None:
         parent_block = render_parent_deliverables(parent_files, AGENT_PARENT_BUDGET)
         context_budget = max(2000, AGENT_CONTEXT_BUDGET - len(parent_block))
+        carried = parent_task_node.get("id") != parent_id
+        prior_eval = ""
+        if carried:
+            # Carried over from an earlier round: its log is not in this round's
+            # lineage, so hand over what the evaluator found directly.
+            prior_eval = _evaluation_section(run_dir, parent_task_node)
         stage_note = (
-            f"This is a CONTINUATION (depth {depth}) of attempt {parent_task_node['id']}. "
+            (f"This round CONTINUES your best attempt from an earlier round ({parent_task_node['id']}, "
+             f"score {float(parent_task_node.get('score', 0.0)):.3f}) instead of starting over. Fix what "
+             "its evaluation below reports; keep what works.\n\n"
+             + (f"===== EVALUATION OF {parent_task_node['id']} =====\n{prior_eval}\n\n" if prior_eval else "")
+             if carried else "")
+            + f"This is a CONTINUATION (depth {depth}) of attempt {parent_task_node['id']}. "
             "Its deliverables are shown below and are ALREADY IN YOUR DIRECTORY under the same "
             "relative paths. Emit ONLY the files you change or add: a <file> with an existing path "
             "replaces that file; files you do not emit are kept as they are. Improve and complete "
@@ -3979,7 +4017,9 @@ def _policy_interface_doc(budget: int) -> str:
         "  ctx.note(msg) -> record a short diagnostic string\n"
         "\n"
         "LEGALITY (evaluated against the tree as it stood BEFORE the call)\n"
-        "  * (root, task) opens a new independent branch for that assignment.\n"
+        "  * (root, task) opens a new branch for that assignment. In round 2 and later the FIRST\n"
+        "    such branch per assignment continues that assignment's best earlier attempt (its files\n"
+        "    and evaluation carry over); further (root, task) branches in the round start fresh.\n"
         "  * (leaf_id, leaf_task) continues a branch from its current leaf; a node that\n"
         "    already has a child is no longer continuable.\n"
         "  * A batch holds at most W distinct legal actions. Illegal, duplicate or over-W\n"
@@ -7775,6 +7815,56 @@ def _known_class_members() -> Dict[Tuple[str, str], Set[str]]:
     return known
 
 
+_EVAL_HEADER = "## Evaluation (written by the pipeline - read this before changing anything)"
+
+
+def _evaluation_section(run_dir: Path, node: dict, limit: int = 5000) -> str:
+    lp = node.get("log_path")
+    text = read_file_content_safe(run_dir / lp) if lp else None
+    if not text or _EVAL_HEADER not in text:
+        return ""
+    sec = text[text.index(_EVAL_HEADER) + len(_EVAL_HEADER):].strip()
+    return sec[:limit]
+
+
+def write_evaluation_feedback(node: dict, run_dir: Path) -> None:
+    """Everything the fixed evaluator found about this attempt, appended to its
+    log, so whoever continues it starts from a concrete list of what broke:
+    failing unit tests, whole-project integration findings (including the run,
+    the control verdict and modules that never executed), the credit delta and
+    every violation."""
+    lp = node.get("log_path")
+    if not lp or not (run_dir / lp).exists():
+        return
+    L = [f"score {float(node.get('score', 0.0)):.3f}"
+         + (f" | file-level {node['score_file_level']:.3f}" if isinstance(node.get("score_file_level"), (int, float)) else "")
+         + (f" | integration q {node['integration_q']:.3f}" if isinstance(node.get("integration_q"), (int, float)) else "")
+         + (f" | your change to the project q {node['integration_delta']:+.3f} vs {node.get('integration_baseline')}"
+            if isinstance(node.get("integration_delta"), (int, float)) else "")]
+    if node.get("seeded_from"):
+        L.append(f"(continued from {node['seeded_from']}, an earlier round's best attempt)")
+    tc = node.get("test_count")
+    if tc:
+        L.append(f"Unit tests on your files: {node.get('tests_passed', 0)}/{tc} passed.")
+        for f in node.get("test_failures") or []:
+            L.append(f"  - {f}")
+    integ = node.get("integration") or {}
+    if integ.get("groups"):
+        L.append("Whole project with your files (" + ", ".join(f"{k} {v:.2f}" for k, v in integ["groups"].items())
+                 + "):")
+        for grp, lines in (integ.get("details") or {}).items():
+            for ln in lines[:3]:
+                L.append(f"  - [{grp}] {str(ln)[:220]}")
+    for v in node.get("violations") or []:
+        L.append(f"  ! {str(v)[:260]}")
+    if len(L) == 1 and not tc:
+        L.append("(no tests or integration results were produced for this attempt)")
+    body = enforce_ascii("\n".join(L))
+    node["evaluation_text"] = body
+    with open(run_dir / lp, "a", encoding="ascii") as fh:
+        fh.write(f"\n{_EVAL_HEADER}\n\n{body}\n")
+
+
 def library_misuse_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
     """Part of the fixed evaluator: attributes this attempt uses on library class
     instances (sim = QrackSimulator(); sim.rz(...)) that the class does not have,
@@ -8274,8 +8364,15 @@ def signal_handler(sig, frame):
 def round_budget(roster: List[dict]) -> int:
     """Budget is in agent calls and is identical online and in replay, so a
     dreamed policy cannot win by spending more than the one it replaces."""
-    raw = int(round(len(roster) * ROUND_BUDGET_PER_TASK))
-    return max(ROUND_BUDGET_MIN, min(ROUND_BUDGET_MAX, raw))
+    if ROUND_BUDGET_PER_TASK > 0:
+        raw = int(round(len(roster) * ROUND_BUDGET_PER_TASK))
+    else:
+        raw = ROUND_BUDGET
+    budget = max(ROUND_BUDGET_MIN, min(ROUND_BUDGET_MAX, raw))
+    if budget < len(roster):
+        print(f"    [!] Round budget {budget} is below the {len(roster)} assignments: some will get no "
+              f"attempt in a round. Raise ROUND_BUDGET.", flush=True)
+    return budget
 
 
 def support_reserve(budget: int, n_tasks: int) -> int:
