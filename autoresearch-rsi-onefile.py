@@ -679,6 +679,7 @@ _RUN_PROBE_COMMAND: str = ""                       # sensitivity control command
 _RUN_DIR: Optional[Path] = None                    # set in main(); for diagnostics
 _RUN_FROZEN_API: Dict[str, dict] = {}              # module -> name -> {kind, sig, params, used_by}
 _RUN_FROZEN_API_TEXT: str = ""
+_RUN_ROUTED: Dict[str, List[str]] = {}             # task -> findings only that task can fix
 _RUN_LAST_RUN_TEXT: str = ""
 
 
@@ -2871,7 +2872,7 @@ class LiveExplorer(ExplorerBase):
                 first = task not in seeded
                 seeded.add(task)
             if first:
-                prior = best_known_nodes(self.run_dir, self.rnd - 1).get(task)
+                prior = carry_forward_source(self.run_dir, task, self.rnd - 1)
                 if prior is not None and prior.get("files"):
                     parent_task_node, seeded_from = prior, prior["id"]
         if parent_task_node is not None:
@@ -3302,6 +3303,17 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
         stage_note = "This is a fresh attempt at your objective. Produce your deliverables from scratch."
     if extra_stage:
         stage_note = f"{extra_stage}\n\n{stage_note}"
+    with lock:
+        live_snapshot = [dict(n) for n in live_nodes]
+    history = task_attempt_history(run_dir, task, live_snapshot,
+                                   exclude=parent_task_node.get("id") if parent_task_node else None)
+    if history:
+        stage_note += ("\n\n===== PREVIOUS ATTEMPTS AT THIS ASSIGNMENT (do not repeat a change that already "
+                       "failed; try a different approach) =====\n" + history)
+    routed = _RUN_ROUTED.get(task) or []
+    if routed:
+        stage_note += ("\n\n===== FINDINGS ROUTED TO YOU (from the last integrated run - these need a change "
+                       "in YOUR files) =====\n" + "\n".join(f"- {r}" for r in routed[:8]))
     brief_block = (fit_context(_RUN_BRIEF, AGENT_BRIEF_BUDGET, note="...[PROMPT TRUNCATED]...")
                    if _RUN_BRIEF else "")
     api_block = (fit_context(_RUN_FROZEN_API_TEXT, AGENT_API_BUDGET, note="...[API LIST TRUNCATED]...")
@@ -5483,7 +5495,7 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         f.write(text + "\n")
     res = {"round": rnd, "command": _RUN_COMMAND, "ok": ok, "rc": rc, "timed_out": to,
            "score": score, "reported_errors": reported_errors, "status": status,
-           "exception_origins": origins, "not_executed": dead,
+           "exception_origins": origins, "not_executed": dead, "executed": ran or [],
            "elapsed": round(elapsed, 2), "produced": produced, "probe": probe}
     with open(idir / f"round{rnd:02d}_run.json", "w", encoding="ascii") as f:
         json.dump(res, f, indent=2)
@@ -5522,6 +5534,12 @@ def load_round_grounding(run_dir: Path, upto_rnd: int) -> None:
         run_md = idir / f"round{r:02d}_run.md"
         if not _RUN_LAST_RUN_TEXT and run_md.exists():
             _RUN_LAST_RUN_TEXT = read_file_content_safe(run_md) or ""
+            rj = idir / f"round{r:02d}_routed.json"
+            if rj.exists():
+                try:
+                    _RUN_ROUTED.update(json.loads(read_file_content_safe(rj) or "{}"))
+                except json.JSONDecodeError:
+                    pass
 
 
 _ENV_SCAN_SRC = r"""
@@ -5896,6 +5914,11 @@ def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str,
         if not isinstance(call, ast.Call):
             return None
         f = call.func
+        # Class.from_xxx(...) / Class.from_label(...): class-method constructors
+        if isinstance(f, ast.Attribute) and f.attr.startswith("from_"):
+            inner = class_ref(f.value)
+            if inner:
+                return inner
         if isinstance(f, ast.Name) and f.id in cls_by_local:
             return cls_by_local[f.id]
         if isinstance(f, ast.Attribute):
@@ -5906,6 +5929,19 @@ def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str,
             if isinstance(cur, ast.Name) and cur.id in alias:
                 mod = ".".join([alias[cur.id]] + list(reversed(parts[1:])))
                 return (mod, parts[0])
+        return None
+
+    def class_ref(expr) -> Optional[Tuple[str, str]]:
+        """A bare class reference: QrackSimulator or pyqrack.QrackSimulator."""
+        if isinstance(expr, ast.Name) and expr.id in cls_by_local:
+            return cls_by_local[expr.id]
+        if isinstance(expr, ast.Attribute):
+            parts, cur = [expr.attr], expr.value
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name) and cur.id in alias and parts[0][:1].isupper():
+                return (".".join([alias[cur.id]] + list(reversed(parts[1:]))), parts[0])
         return None
 
     def key_of(t) -> Optional[str]:
@@ -6736,6 +6772,203 @@ def final_writeup_refresh(run_dir: Path, roster: List[dict], rnd: int, backgroun
         json.dump({"round": rnd, "run_ok": run_info.get("ok"), "refreshed": summary}, f, indent=2)
 
 
+def _owners_by_file(run_dir: Path) -> Dict[str, str]:
+    """deliverable path -> task id that owns it."""
+    roster = load_roster(run_dir)
+    if not roster or not _RUN_DELIVERABLES:
+        return {}
+    idx, _ = deliverable_coverage([r["objective"] for r in roster], {d: "" for d in _RUN_DELIVERABLES})
+    return {d: roster[i]["id"] for d, i in idx.items() if i is not None and i < len(roster)}
+
+
+def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str, str]]:
+    """Follow the negative-control flag from the entry file through local calls
+    and report the exact place it stops: parsed but never passed on, passed to a
+    function without a matching parameter, or received but never used.
+    Returns (file, finding) pairs."""
+    idents, lits = _flag_tokens(probe_cmd)
+    if not idents and not lits:
+        return []
+    flag_words = [set(i.split("_")) for i in idents]
+
+    def is_flag_name(name: str) -> bool:
+        w = set(name.lower().split("_"))
+        return any(fw and fw <= w for fw in flag_words)
+
+    def refs_flag(expr) -> bool:
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Name) and is_flag_name(n.id):
+                return True
+            if isinstance(n, ast.Attribute) and is_flag_name(n.attr):
+                return True
+        return False
+
+    trees: Dict[str, ast.AST] = {}
+    for p in proj.glob("*.py"):
+        try:
+            trees[p.stem] = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            pass
+    estem = PurePosixPath(entry).stem
+    if estem not in trees:
+        return []
+    # A module that reads the flag itself (sys.argv / the literal) needs nothing passed.
+    for stem, tree in trees.items():
+        if stem == estem:
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in lits:
+                return []
+
+    def funcs_of(stem: str) -> Dict[str, ast.FunctionDef]:
+        return {n.name: n for n in trees[stem].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def local_target(stem: str, call: ast.Call) -> Optional[Tuple[str, str]]:
+        f = call.func
+        imports: Dict[str, Tuple[str, str]] = {}
+        mods: Dict[str, str] = {}
+        for n in ast.walk(trees[stem]):
+            if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in trees:
+                for a in n.names:
+                    imports[a.asname or a.name] = (n.module, a.name)
+            elif isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name in trees:
+                        mods[a.asname or a.name] = a.name
+        if isinstance(f, ast.Name):
+            if f.id in imports:
+                return imports[f.id]
+            if f.id in funcs_of(stem):
+                return (stem, f.id)
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in mods:
+            return (mods[f.value.id], f.attr)
+        return None
+
+    out: List[Tuple[str, str]] = []
+
+    def follow(stem: str, scope, depth: int, origin: str) -> None:
+        passed = False
+        for call in [n for n in ast.walk(scope) if isinstance(n, ast.Call)]:
+            carriers = [(i, a) for i, a in enumerate(call.args) if refs_flag(a)]
+            kcarriers = [k for k in call.keywords if k.value is not None and refs_flag(k.value)]
+            if not carriers and not kcarriers:
+                continue
+            tgt = local_target(stem, call)
+            if tgt is None:
+                continue
+            passed = True
+            mstem, fname = tgt
+            fn = funcs_of(mstem).get(fname) if mstem in trees else None
+            where = f"{stem}.py:{call.lineno}"
+            if fn is None:
+                continue
+            params = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs]
+            received = []
+            for i, _ in carriers:
+                if i < len(params):
+                    received.append(params[i])
+            for k in kcarriers:
+                if k.arg in params:
+                    received.append(k.arg)
+                elif fn.args.kwarg is None:
+                    out.append((f"{mstem}.py", f"{mstem}.{fname}() does not accept `{k.arg}`, but {where} passes "
+                                                f"the control flag as `{k.arg}=`; add that parameter and use it."))
+            for prm in received:
+                used = any(isinstance(n, ast.Name) and n.id == prm and isinstance(n.ctx, ast.Load)
+                           for n in ast.walk(fn))
+                if not used:
+                    out.append((f"{mstem}.py", f"{mstem}.{fname}() receives the control flag as `{prm}` (from "
+                                                f"{where}) but never uses it. It must change the experiment's input "
+                                                f"or procedure (e.g. corrupt the state before it is teleported), "
+                                                f"never set a metric."))
+                elif depth < 3:
+                    follow(mstem, fn, depth + 1, where)
+        if not passed and depth == 0:
+            line = next((n.lineno for n in ast.walk(scope) if isinstance(n, (ast.Name, ast.Attribute))
+                         and is_flag_name(n.id if isinstance(n, ast.Name) else n.attr)), None)
+            out.append((f"{stem}.py", f"{stem}.py parses the control flag {', '.join(sorted(lits)) or ''}"
+                                      + (f" (line {line})" if line else "")
+                                      + " but never passes it to the experiment code - no function it calls can "
+                                        "see it. Pass it to the function that runs the experiment."))
+
+    follow(estem, trees[estem], 0, entry)
+    return out
+
+
+def _interface_blocks(contract: str) -> Dict[str, str]:
+    """module file -> its block of text in the contract's INTERFACES section."""
+    out: Dict[str, str] = {}
+    cur = None
+    in_ifc = False
+    for line in (contract or "").splitlines():
+        if line.startswith("INTERFACES"):
+            in_ifc = True
+            continue
+        if in_ifc and line[:1].isalpha() and line.isupper():
+            break
+        if not in_ifc:
+            continue
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*\.py)\s*$', line.strip()) if not line[:1].isspace() else None
+        if m:
+            cur = m.group(1)
+            out[cur] = ""
+        elif cur:
+            out[cur] += line + "\n"
+    return out
+
+
+def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, List[str]]:
+    """Project-level failures turned into instructions for the owners who have to
+    act: the file where the run crashes, where the control flag stops, and which
+    modules must start calling a required module that never runs."""
+    owners = _owners_by_file(run_dir)
+    if not owners or not res:
+        return {}
+    routed: Dict[str, List[str]] = {}
+
+    def add(path: str, msg: str) -> None:
+        t = owners.get(path) or owners.get(PurePosixPath(path).name)
+        if t and msg not in routed.setdefault(t, []):
+            routed[t].append(msg)
+
+    for o in res.get("exception_origins") or []:
+        m = re.search(r' at ([\w./\-]+\.py):(\d+) in ', o)
+        if m:
+            add(m.group(1), f"The run crashes in YOUR file {m.group(1)}:{m.group(2)}: {o[:220]}")
+    probe = res.get("probe") or {}
+    if res.get("ok") and probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY", "PROBE FAILED", None) \
+            and _RUN_PROBE_COMMAND and len(_RUN_COMMAND.split()) > 1:
+        for path, msg in trace_control_flag(proj, _RUN_COMMAND.split()[1], _RUN_PROBE_COMMAND):
+            add(path, msg)
+    # Only a SUCCESSFUL run says anything about which modules take part: after a
+    # crash, everything past the crash point "never ran".
+    dead = (res.get("not_executed") or []) if res.get("ok") else []
+    if dead:
+        ran = set(res.get("executed") or [])
+        stems = {PurePosixPath(x).stem for x in _RUN_DELIVERABLES}
+        entry = _RUN_COMMAND.split()[1] if len(_RUN_COMMAND.split()) > 1 else ""
+        run_path = []
+        for p in sorted(proj.glob("*.py")):
+            if p.name in dead or _is_test_file(p.name) or (ran and p.name not in ran):
+                continue
+            if any(m in stems for m in _imported_roots(read_file_content_safe(p) or "")):
+                run_path.append(p.name)
+        blocks = _interface_blocks(_RUN_CONTRACT)
+        for d in dead:
+            dstem = PurePosixPath(d).stem
+            # Preferred callers: run-path modules whose INTERFACES block names the
+            # dead module; otherwise the run-path modules below the entry point.
+            callers = [c for c in run_path if dstem in blocks.get(c, "")]
+            if not callers:
+                callers = [c for c in run_path if c != entry] or run_path
+            for c in callers[:2]:
+                add(c, f"{d} is a required deliverable but never runs: nothing on the run path calls it. If "
+                       f"{c} is where it belongs (see INTERFACES for {d}), import and call it.")
+            add(d, f"Your module {d} never runs - no module on the run path calls it. Make its functions match "
+                   f"INTERFACES exactly and send a <note> to the owners of {', '.join(callers[:2]) or 'the caller'}.")
+    return routed
+
+
 def after_round_grounding(run_dir: Path, rnd: int, test_ctx: dict) -> None:
     """Freeze the integrated project's API and run it; both feed the next round."""
     global _RUN_FROZEN_API, _RUN_FROZEN_API_TEXT, _RUN_LAST_RUN_TEXT
@@ -6763,6 +6996,18 @@ def after_round_grounding(run_dir: Path, rnd: int, test_ctx: dict) -> None:
             res = grounding_run(proj, rnd, test_ctx, run_dir)
             if res is not None:
                 _RUN_LAST_RUN_TEXT = read_file_content_safe(idir / f"round{rnd:02d}_run.md") or ""
+                try:
+                    routed = route_findings(run_dir, proj, res)
+                except Exception as exc:
+                    routed = {}
+                    print(f"    [!] Routing failed: {str(exc)[:120]}", flush=True)
+                _RUN_ROUTED.clear()
+                _RUN_ROUTED.update(routed)
+                with open(idir / f"round{rnd:02d}_routed.json", "w", encoding="ascii") as f:
+                    json.dump(routed, f, indent=2)
+                for t, msgs in sorted(routed.items()):
+                    print(f"[ROUTE] {t}: {msgs[0][:170]}" + (f" (+{len(msgs) - 1} more)" if len(msgs) > 1 else ""),
+                          flush=True)
         except Exception as exc:
             print(f"    [!] Grounding run failed: {str(exc)[:120]}", flush=True)
 
@@ -7460,11 +7705,82 @@ def best_known_nodes(run_dir: Path, upto_rnd: int) -> Dict[str, dict]:
         for n in nodes:
             if not n.get("task") or not n.get("files") or n.get("status") not in ("success", "partial"):
                 continue
+            if n.get("dependency_violations"):
+                # rejected by the gate: never integrated, never a credit baseline
+                continue
             key = (float(n.get("score", 0.0)), prnd, n.get("seq", 0))
             cur = best.get(n["task"])
             if cur is None or key > cur[0]:
                 best[n["task"]] = (key, n)
     return {t: v[1] for t, v in best.items()}
+
+
+def carry_forward_source(run_dir: Path, task: str, upto_rnd: int) -> Optional[dict]:
+    """The attempt a new round continues for this task: the highest whole-project
+    q; among equal q (to 3 decimals) the MOST RECENT, because it has already moved
+    past the older one's error. Gate-rejected and shortcut attempts are skipped."""
+    best, best_key = None, None
+    for prnd, nodes in load_pool(run_dir):
+        if prnd > upto_rnd:
+            continue
+        for n in nodes:
+            if n.get("task") != task or not n.get("files") or n.get("status") not in ("success", "partial"):
+                continue
+            if n.get("dependency_violations") or n.get("shortcut_hits"):
+                continue
+            q = n.get("integration_q")
+            qv = round(float(q), 3) if isinstance(q, (int, float)) else -1.0
+            key = (qv, prnd, n.get("seq", 0), float(n.get("score", 0.0)))
+            if best_key is None or key > best_key:
+                best, best_key = n, key
+    return best
+
+
+def task_attempt_history(run_dir: Path, task: str, live: Optional[List[dict]] = None,
+                         exclude: Optional[str] = None, limit: int = 6,
+                         budget: int = 3500) -> str:
+    """What was already tried for this task and how each attempt failed, so a new
+    attempt does not repeat a fix that is known not to work."""
+    seen, rows = set(), []
+    pool = [(prnd, n) for prnd, nodes in load_pool(run_dir) for n in nodes]
+    pool += [(n.get("round", 0), n) for n in (live or [])]
+    for prnd, n in pool:
+        if n.get("task") != task or n.get("id") in seen or n.get("id") == exclude:
+            continue
+        seen.add(n.get("id"))
+        rows.append((prnd, n.get("seq", 0), n))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    out = []
+    for prnd, _, n in rows[-limit:]:
+        fail = _first_failure(n)
+        origin = (f"from {n['seeded_from']}" if n.get("seeded_from") else
+                  f"continuing {n['parent']}" if n.get("parent") and not str(n.get("parent", "")).endswith("0000")
+                  else "fresh")
+        q = n.get("integration_q")
+        out.append(f"- {n['id']} (round {prnd}, {origin}): score {float(n.get('score', 0.0)):.3f}"
+                   + (f", project q {q:.3f}" if isinstance(q, (int, float)) else "")
+                   + (f" -> {fail}" if fail else " -> no failure recorded"))
+    text = "\n".join(out)
+    return text[-budget:] if len(text) > budget else text
+
+
+def _first_failure(n: dict) -> str:
+    for v in n.get("dependency_violations") or []:
+        return f"REJECTED: imports {v}"
+    details = (n.get("integration") or {}).get("details") or {}
+    for line in details.get("run") or []:
+        if "failed" in str(line).lower():
+            return str(line)[:220]
+    for f in n.get("test_failures") or []:
+        return str(f)[:220]
+    for line in details.get("run") or []:
+        return str(line)[:220]
+    for grp in ("import", "compile", "pytest"):
+        for line in details.get(grp) or []:
+            return f"[{grp}] {str(line)[:200]}"
+    for v in n.get("violations") or []:
+        return str(v)[:200]
+    return ""
 
 
 def assemble_project(run_dir: Path, roster: List[dict], chosen: Dict[str, dict],
