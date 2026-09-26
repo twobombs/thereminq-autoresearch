@@ -3310,6 +3310,14 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     if history:
         stage_note += ("\n\n===== PREVIOUS ATTEMPTS AT THIS ASSIGNMENT (do not repeat a change that already "
                        "failed; try a different approach) =====\n" + history)
+    owned = [d for d, t in _owners_by_file(run_dir).items() if t == task] if _RUN_DELIVERABLES else []
+    known = known_answer_lines(_RUN_CONTRACT)
+    if known and any(_is_test_file(PurePosixPath(d).name) for d in owned):
+        stage_note += ("\n\n===== REQUIRED TEST CASES (from the contract's KNOWN ANSWERS) =====\n"
+                       "Write at least one test per line below. Each test calls the measuring function DIRECTLY "
+                       "with that concrete input and asserts the expected value (with a tolerance for sampled "
+                       "results). A failing known-answer test is the point: it exposes a broken measurement.\n"
+                       + "\n".join(f"- {k}" for k in known))
     routed = _RUN_ROUTED.get(task) or []
     if routed:
         stage_note += ("\n\n===== FINDINGS ROUTED TO YOU (from the last integrated run - these need a change "
@@ -4242,6 +4250,12 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     def _evaluate(name: str, idx: int, src: str) -> dict:
         res = replay_score(src, pool, tasks, budget)
         res.update({"name": name, "index": idx})
+        # A revision that leaves assignments without any attempt can look cheap in
+        # V but abandons deliverables; it is not a candidate.
+        if idx > 0 and res.get("valid") and float(res.get("coverage", 1.0)) < 0.999:
+            res["valid"] = False
+            res["detail"] = (f"covers only {float(res.get('coverage', 0)):.0%} of the assignments; every "
+                             f"assignment must get at least one attempt")
         versions.append({"name": name, "index": idx, "source": src, "result": res})
         if res["valid"]:
             print(f"    [+] {name}: V {res['score']:.4f} | quality {res['quality']:.4f} "
@@ -4273,8 +4287,14 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     for m in range(1, 0 if skipped else DREAM_CANDIDATES + 1):
         if _shutdown_event.is_set():
             break
-        prev = versions[-1]
-        earlier = "\n".join(_result_line(v["name"], v["result"]) for v in versions)
+        # Revise the best VALID version so far, not the last one: chaining off a
+        # rejected revision only reproduces its mistake.
+        valid_versions = [v for v in versions if v["result"].get("valid")]
+        prev = (max(valid_versions, key=lambda v: float(v["result"].get("score", -1.0)))
+                if valid_versions else versions[-1])
+        earlier = "\n".join(_result_line(v["name"], v["result"])
+                            + ("" if v["result"].get("valid") else f"  [REJECTED: {v['result'].get('detail', '')}]")
+                            for v in versions)
         user = (
             f"{_policy_interface_doc(budget)}\n\n"
             f"===== CURRENT POLICY: VERSION {prev['index']} SOURCE =====\n"
@@ -4289,7 +4309,8 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
             f"Revise version {prev['index']} into version {m}. Keep what the trajectories show "
             f"working, fix what they show failing. Change the search SHAPE - which "
             f"continuations, batch composition, depth versus breadth, stopping - never the "
-            f"agents' objectives. Output only Python."
+            f"agents' objectives. Every assignment must get at least one attempt each round: a "
+            f"version that skips assignments is rejected. Output only Python."
         )
         try:
             raw, _, _ = _apex_completion(client, _PROMPT_POLICY_DEV, user,
@@ -4542,6 +4563,14 @@ _PROMPT_INTERFACES_SYNTH = (
     "# (op, qubits, params); rz params=[theta]\n"
     "  and every producer emits only those names while every consumer accepts all of them. Put "
     "shared vocabularies as named aliases at the top of the module that owns them.\n"
+    "- THREAD THE PROBE FLAG: the PROBE's flag must appear as an optional parameter in BOTH the "
+    "entry module's function that parses/handles it AND the function that prepares and runs the "
+    "experiment, e.g. `def run_experiment(coupling: str, corrupt: bool = False) -> float`. The "
+    "experiment function applies the corruption to its INPUT (e.g. flips or randomises the state "
+    "to be teleported) and then measures exactly as in a normal run.\n"
+    "- PIN MEASUREMENT KEY FORMATS: any dict of counts or probabilities states its keys exactly, "
+    "e.g. `dict[str, int]  # keys: bitstrings of length qubit_count, character i = qubit i "
+    "(qubit 0 leftmost)`. A function returning a single-qubit marginal says so ('0'/'1' keys).\n"
     "- If a module wraps an external library, name the library calls it must use ONLY from the "
     "LIBRARY API FACTS given below, and use only libraries listed in the CONTAINER ENVIRONMENT.\n"
     "- RUN is ONE command, no shell operators, that runs the project's entry point with its "
@@ -4646,6 +4675,14 @@ def synthesize_interfaces(prompt: str, contract: str,
         if not named & set(modules):
             print(f"    [!] Interface synthesis produced no module blocks (attempt {attempt}/2).", flush=True)
             continue
+        problems = interface_problems(body, run_lines, probe_lines, deliverables)
+        if problems and attempt < 2:
+            print(f"    [!] Interfaces need revision (attempt {attempt}/2): {'; '.join(problems)[:200]}", flush=True)
+            user += ("\n\nYOUR PREVIOUS ANSWER HAD THESE PROBLEMS - fix them:\n- " + "\n- ".join(problems)
+                     + "\n\nPREVIOUS ANSWER:\n" + text[:6000])
+            continue
+        for pr in problems:
+            print(f"    [!] Interfaces still: {pr[:200]}", flush=True)
         run_cmd = validate_run_command(run_lines[0] if run_lines else "", deliverables)
         probe_cmd = ""
         if run_cmd and probe_lines:
@@ -4670,9 +4707,13 @@ def synthesize_interfaces(prompt: str, contract: str,
                         + (f"  {effect}\n" if effect else "")
                         + "  If the reported numbers do not change under PROBE, the metrics are flagged as\n"
                           "  measuring nothing.\n"
-                          "  The effect above is a PREDICTION the pipeline tests, never a value to emit: the flag\n"
-                          "  must change the experiment's input or procedure, and no code may branch on it to set\n"
-                          "  a metric or score. The pipeline scans for that and for a score that moves alone.")
+                          "  HOW TO WIRE IT: the entry point passes the flag into the experiment function (see\n"
+                          "  INTERFACES). That function USES it: it corrupts its own INPUT (e.g. flips or\n"
+                          "  randomises the state to be teleported) and then runs and measures exactly as in a\n"
+                          "  normal run. The metrics then change because the physics changed.\n"
+                          "  What is not allowed: computing the metrics or the score differently under the flag,\n"
+                          "  or setting any of them to a value. The effect above is a prediction the pipeline\n"
+                          "  checks, not a value to produce.")
         if known:
             section += ("\n\nKNOWN ANSWERS (planner-chosen; the tests must check these)\n"
                         "  Each is a measured quantity on a concrete input, computed by calling the measuring\n"
@@ -4685,6 +4726,42 @@ def synthesize_interfaces(prompt: str, contract: str,
                         "  basis state, called directly with that input.")
         return enforce_ascii(section), run_cmd, probe_cmd
     return "", "", ""
+
+
+def interface_problems(body: List[str], run_lines: List[str], probe_lines: List[str],
+                       deliverables: Dict[str, str]) -> List[str]:
+    """Checks the planner's INTERFACES can actually be implemented as the pipeline
+    will test them: the PROBE flag is threaded from the entry point into an
+    experiment function, and count/probability dicts pin their key format."""
+    problems: List[str] = []
+    run_cmd = validate_run_command(run_lines[0] if run_lines else "", deliverables)
+    probe_cmd = validate_run_command(probe_lines[0] if probe_lines else "", deliverables)
+    entry = run_cmd.split()[1] if run_cmd else ""
+    idents, _ = _flag_tokens(probe_cmd)
+    if idents:
+        words = [set(i.split("_")) for i in idents]
+        cur, holders = None, set()
+        for line in body:
+            if not line.startswith(" "):
+                cur = line.strip()
+                continue
+            m = re.search(r'\bdef\s+\w+\s*\((.*)\)', line)
+            if not m or not cur:
+                continue
+            params = {p.split(":")[0].split("=")[0].strip().lower() for p in m.group(1).split(",")}
+            if any(any(fw and fw <= set(p.split("_")) for fw in words) for p in params):
+                holders.add(cur)
+        flag = sorted(idents)[0]
+        if entry and entry not in holders:
+            problems.append(f"the entry module {entry} has no function with a `{flag}` parameter")
+        if not (holders - {entry}):
+            problems.append(f"no experiment function outside {entry or 'the entry module'} takes the PROBE flag "
+                            f"(`{flag}: bool = False`); the flag cannot reach the experiment")
+    text = "\n".join(body)
+    if re.search(r'dict\[str,\s*(int|float)\]', text) and not re.search(r'bitstring|key[s]?\s*:', text, re.I):
+        problems.append("dicts of counts/probabilities do not state their key format (bitstring length and "
+                        "qubit order)")
+    return problems
 
 
 def validate_run_command(cmd: str, deliverables) -> str:
@@ -6772,7 +6849,33 @@ def final_writeup_refresh(run_dir: Path, roster: List[dict], rnd: int, backgroun
         json.dump({"round": rnd, "run_ok": run_info.get("ok"), "refreshed": summary}, f, indent=2)
 
 
+def known_answer_lines(contract: str) -> List[str]:
+    out, on = [], False
+    for line in (contract or "").splitlines():
+        if line.startswith("KNOWN ANSWERS"):
+            on = True
+            continue
+        if on and line[:1].isalpha():
+            break
+        if on and "->" in line:
+            out.append(line.strip())
+    return out[:12]
+
+
+_OWNERS_CACHE: Dict[str, Dict[str, str]] = {}
+
+
 def _owners_by_file(run_dir: Path) -> Dict[str, str]:
+    key = str(run_dir)
+    if key in _OWNERS_CACHE:
+        return _OWNERS_CACHE[key]
+    res = _owners_by_file_uncached(run_dir)
+    if res:
+        _OWNERS_CACHE[key] = res
+    return res
+
+
+def _owners_by_file_uncached(run_dir: Path) -> Dict[str, str]:
     """deliverable path -> task id that owns it."""
     roster = load_roster(run_dir)
     if not roster or not _RUN_DELIVERABLES:
@@ -6845,6 +6948,8 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str
         return None
 
     out: List[Tuple[str, str]] = []
+    reached = {"outside": False}
+    local_use: List[str] = []
 
     def follow(stem: str, scope, depth: int, origin: str) -> None:
         passed = False
@@ -6876,6 +6981,10 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str
             for prm in received:
                 used = any(isinstance(n, ast.Name) and n.id == prm and isinstance(n.ctx, ast.Load)
                            for n in ast.walk(fn))
+                if used and mstem != estem:
+                    reached["outside"] = True
+                elif used:
+                    local_use.append(f"{mstem}.{fname}() ({mstem}.py:{fn.lineno})")
                 if not used:
                     out.append((f"{mstem}.py", f"{mstem}.{fname}() receives the control flag as `{prm}` (from "
                                                 f"{where}) but never uses it. It must change the experiment's input "
@@ -6891,7 +7000,30 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str
                                       + " but never passes it to the experiment code - no function it calls can "
                                         "see it. Pass it to the function that runs the experiment."))
 
-    follow(estem, trees[estem], 0, entry)
+    def follow_wrapper():
+        follow(estem, trees[estem], 0, entry)
+    follow_wrapper()
+    if not reached["outside"] and not any(f == f"{estem}.py" for f, _ in out):
+        where = ", ".join(local_use[:2]) or entry
+        out.append((f"{estem}.py", f"The control flag never leaves {estem}.py: {where} only uses it locally (e.g. to "
+                                   f"change what is printed). Pass it into the experiment function so the "
+                                   f"corruption is applied to the experiment's input."))
+    # Tell the owners of the experiment functions the entry calls, if they lack a flag parameter.
+    if not reached["outside"]:
+        for call in [n for n in ast.walk(trees[estem]) if isinstance(n, ast.Call)]:
+            tgt = local_target(estem, call)
+            if not tgt or tgt[0] == estem or tgt[0] not in trees:
+                continue
+            fn = funcs_of(tgt[0]).get(tgt[1])
+            if fn is None:
+                continue
+            params = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs]
+            if not any(is_flag_name(p) for p in params):
+                flag = sorted(idents)[0] if idents else "corrupt"
+                out.append((f"{tgt[0]}.py", f"{tgt[0]}.{tgt[1]}() has no parameter for the negative control. Add "
+                                            f"`{flag}: bool = False` (an optional parameter does not break the frozen "
+                                            f"API) and, when it is True, corrupt the experiment's INPUT before running "
+                                            f"it; measure exactly as normal."))
     return out
 
 
@@ -6931,7 +7063,20 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
         if t and msg not in routed.setdefault(t, []):
             routed[t].append(msg)
 
+    stems = {PurePosixPath(d).stem: d for d in _RUN_DELIVERABLES if d.endswith(".py")}
     for o in res.get("exception_origins") or []:
+        miss = re.search(r"No module named '([\w.]+)'", o)
+        if miss and miss.group(1).split(".")[0] in stems:
+            # The importer is fine; the module it needs is missing from the project.
+            d = stems[miss.group(1).split(".")[0]]
+            t = owners.get(d)
+            tried = [f for f in (_first_failure(n) for _, nodes in load_pool(run_dir) for n in nodes
+                                 if n.get("task") == t) if f][-3:]
+            add(d, f"Your module {d} is MISSING from the project, so the run cannot import it ({o[:120]}). "
+                   + ("Every attempt so far failed: " + " | ".join(x[:120] for x in tried) if tried
+                      else "No usable attempt exists yet.")
+                   + " Produce a version that passes the gates first; completeness comes second.")
+            continue
         m = re.search(r' at ([\w./\-]+\.py):(\d+) in ', o)
         if m:
             add(m.group(1), f"The run crashes in YOUR file {m.group(1)}:{m.group(2)}: {o[:220]}")
