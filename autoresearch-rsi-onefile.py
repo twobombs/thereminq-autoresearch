@@ -270,6 +270,11 @@ ROUND_BUDGET_PER_TASK = float(os.getenv("ROUND_BUDGET_PER_TASK", "0") or 0)
 # from that assignment's best attempt so far (a continuation), not from scratch.
 # Further branches in the round stay fresh, so exploration is kept.
 CARRY_FORWARD = os.getenv("CARRY_FORWARD", "1") == "1"
+# A lineage (an attempt and its continuations, across rounds) is declared DEAD
+# after this many consecutive continuations without improvement; it is then no
+# longer continued or carried forward, and a fresh attempt is opened instead.
+LINEAGE_PATIENCE = int(os.getenv("LINEAGE_PATIENCE", "2"))
+LINEAGE_EPS = float(os.getenv("LINEAGE_EPS", "0.005"))
 ROUND_BUDGET_MIN = int(os.getenv("ROUND_BUDGET_MIN", "3"))
 ROUND_BUDGET_MAX = int(os.getenv("ROUND_BUDGET_MAX", "60"))
 
@@ -2534,6 +2539,9 @@ def _node_view(n: dict) -> dict:
             "test_failures": [str(x)[:160] for x in (n.get("test_failures") or [])[:5]],
             "integration_delta": float(n.get("integration_delta") or 0.0),
             "integration_delta_known": n.get("integration_delta") is not None,
+            "lineage_stalls": int(n.get("lineage_stalls") or 0),
+            "lineage_dead": bool(n.get("lineage_dead")),
+            "lineage_verdict": str(n.get("lineage_verdict") or ""),
         },
     }
 
@@ -2864,7 +2872,7 @@ class LiveExplorer(ExplorerBase):
             return None
         parent_task_node = parent if (parent and parent.get("task") == task) else None
         seeded_from = None
-        if parent_task_node is None and CARRY_FORWARD and self.rnd > 1:
+        if parent_task_node is None and CARRY_FORWARD and (self.rnd > 1 or (self.run_dir / "seeds.jsonl").exists()):
             with self._lock:
                 seeded = getattr(self, "_seeded_tasks", None)
                 if seeded is None:
@@ -2915,6 +2923,10 @@ class LiveExplorer(ExplorerBase):
                                                  self.test_ctx)
                         except Exception as exc:
                             print(f"\n    [!] {task} evaluation raised {str(exc)[:80]}", flush=True)
+                    try:
+                        lineage_verdict(node, parent_task_node)
+                    except Exception as exc:
+                        print(f"\n    [!] {task} lineage verdict raised {str(exc)[:80]}", flush=True)
                     if not rejected:
                         try:
                             shortcut_gate(node, self.run_dir, self.rnd)
@@ -3629,7 +3641,15 @@ def explore(ctx):
         revealed = run_batches(ctx, queue, w)
         if not revealed:
             break
-        queue = [(n["id"], n["task"]) for n in sorted(revealed, key=lambda n: (n["score"], n["id"]))]
+        # A dead line of work (no improvement for several continuations) is not
+        # continued: that assignment gets a fresh branch instead.
+        nxt = []
+        for n in sorted(revealed, key=lambda n: (n["score"], n["id"])):
+            if n.get("diagnostics", {}).get("lineage_dead"):
+                nxt.append((root, n["task"]))
+            else:
+                nxt.append((n["id"], n["task"]))
+        queue = nxt
 '''.replace("%%BRANCH_FRACTION%%", repr(PI0_BRANCH_FRACTION))
 
 _POLICY_BLOCKED_NAMES = {
@@ -3930,6 +3950,103 @@ def run_policy(source: str, explorer: ExplorerBase,
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
+INHERIT_POLICY = os.getenv("INHERIT_POLICY", "1") == "1"
+
+
+def _policy_body(src: str) -> str:
+    lines = (src or "").strip().splitlines()
+    while lines and lines[0].startswith("#"):
+        lines.pop(0)
+    return "\n".join(l.rstrip() for l in lines).strip()
+
+
+def find_inherited_policy(run_dir: Path) -> Optional[Tuple[str, str]]:
+    """(source, origin) of the newest earlier run's final dreamed policy, if that
+    run's dreaming ever replaced pi_0 and the source still validates. Self-
+    improvement then compounds across runs instead of restarting at pi_0."""
+    projects = run_dir.parent
+    if not projects.exists():
+        return None
+    earlier = sorted((d for d in projects.iterdir()
+                      if d.is_dir() and d.name.startswith("run_") and d.name < run_dir.name),
+                     key=lambda d: d.name, reverse=True)
+    default_body = _policy_body(DEFAULT_POLICY_SOURCE)
+    for d in earlier[:20]:
+        pdir = policy_dir_for(d)
+        files = sorted(pdir.glob("pi_r*.py")) if pdir.exists() else []
+        if not files:
+            continue
+        src = read_file_content_safe(files[-1]) or ""
+        body = _policy_body(src)
+        if not body or body == default_body:
+            continue
+        # Only a policy that some dream actually selected over its predecessor.
+        if not any(_policy_body(read_file_content_safe(f) or "") != _policy_body(
+                read_file_content_safe(files[0]) or "") for f in files[1:]):
+            continue
+        ok, _ = validate_policy_source(body)
+        if ok:
+            return body, f"{d.name}/{files[-1].name}"
+    return None
+
+
+def seed_from_previous_run(run_dir: Path, roster: List[dict], spec: str) -> int:
+    """Seed this run from an earlier run's final project: every assignment whose
+    deliverables all exist in that project gets a round-0 seed attempt, which
+    round 1 continues (carry-forward) instead of starting from scratch."""
+    projects = run_dir.parent
+    if spec == "latest":
+        cands = sorted((d for d in projects.iterdir() if d.is_dir() and d.name.startswith("run_")
+                        and d.name < run_dir.name and (d / INTEGRATION_DIRNAME / "latest").exists()),
+                       key=lambda d: d.name)
+        src_run = cands[-1] if cands else None
+    else:
+        p = Path(spec)
+        src_run = p if p.is_absolute() else (projects / spec)
+    latest = (src_run / INTEGRATION_DIRNAME / "latest") if src_run else None
+    if not latest or not latest.exists():
+        print(f"    [!] --seed-from {spec}: no integrated project found; starting fresh.", flush=True)
+        return 0
+    owners = _owners_by_file(run_dir)
+    by_task: Dict[str, List[str]] = {}
+    for d, t in owners.items():
+        by_task.setdefault(t, []).append(d)
+    wroot = work_dir_for(run_dir)
+    seeds = []
+    for agent in roster:
+        files = by_task.get(agent["id"], [])
+        if not files or not all((latest / f).is_file() for f in files):
+            continue
+        sid = f"s00{agent['id']}"
+        ndir = wroot / agent["dir"] / sid
+        for f in files:
+            (ndir / f).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(latest / f, ndir / f)
+        seeds.append({"id": sid, "task": agent["id"], "dir": agent["dir"], "round": 0, "seq": 0,
+                      "parent": None, "depth": 0, "status": "success", "score": 0.0,
+                      "files": [f"{agent['dir']}/{sid}/{f}" for f in files],
+                      "seed_of_run": src_run.name})
+    with open(run_dir / "seeds.jsonl", "w", encoding="ascii") as fh:
+        for n in seeds:
+            fh.write(json.dumps(n) + "\n")
+    print(f"[SEED] {len(seeds)}/{len(roster)} assignment(s) seeded from {src_run.name}/"
+          f"{INTEGRATION_DIRNAME}/latest; round 1 continues them.", flush=True)
+    return len(seeds)
+
+
+def load_seeds(run_dir: Path) -> Dict[str, dict]:
+    path = run_dir / "seeds.jsonl"
+    out: Dict[str, dict] = {}
+    if path.exists():
+        for line in (read_file_content_safe(path) or "").splitlines():
+            try:
+                n = json.loads(line)
+                out[n["task"]] = n
+            except (json.JSONDecodeError, KeyError):
+                pass
+    return out
+
+
 def policy_path(run_dir: Path, rnd: int) -> Path:
     return policy_dir_for(run_dir) / f"pi_r{rnd:02d}.py"
 
@@ -4053,6 +4170,9 @@ def _policy_interface_doc(budget: int) -> str:
         "  (agent calls incl. retries), files, and diagnostics {violations, truncated,\n"
         "  emitted, inherited, tests_passed, tests_total, test_failures, integration_delta,\n"
         "  integration_delta_known}.\n"
+        "  lineage_verdict: GOOD (project runs and responds), ENGINEER (still improving),\n"
+        "  DEAD (lineage_stalls continuations in a row without improvement; stop continuing it and\n"
+        "  open a fresh (root, task) branch instead), BAD (rejected by a gate).\n"
         "  integration_delta (always a float) = project q with this attempt minus q with its\n"
         "  task's previous best; > 0 means the attempt improved the whole project. It is 0.0 with\n"
         "  integration_delta_known False for a task's first attempt and for test-only attempts.\n"
@@ -4324,6 +4444,12 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
             f.write(source + "\n")
         _evaluate(f"pi_{m}", m, source)
 
+    # An inherited or dreamed policy is always checked against the current
+    # default pi_0 on this pool: zero agent calls, and it lets a bad inheritance
+    # be corrected after one round.
+    if _policy_body(current_source) != _policy_body(DEFAULT_POLICY_SOURCE):
+        _evaluate("pi_default (fresh pi_0)", len(versions), DEFAULT_POLICY_SOURCE)
+
     results = [v["result"] for v in versions]
     winner = _select_winner(results)
     winner_source = versions[winner["index"]]["source"]
@@ -4545,6 +4671,11 @@ _PROMPT_INTERFACES_SYNTH = (
     "PROBE\n"
     "python3 entry_module.py --some-flag value\n"
     "  effect: which reported metric must change, and in which direction\n\n"
+    "ABLATIONS\n"
+    "python3 entry_module.py --ablate-something True\n"
+    "  effect: predicted direction of change, and why this component should matter\n"
+    "python3 entry_module.py --ablate-other True\n"
+    "  effect: ...\n\n"
     "KNOWN ANSWERS\n"
     "  metric_name: known-good case -> expected value; known-bad case -> different expected value\n\n"
     "Rules:\n"
@@ -4581,6 +4712,10 @@ _PROMPT_INTERFACES_SYNTH = (
     "hypothesis being tested (e.g. deliberately corrupt the transmitted state, skip a required "
     "correction, use an orthogonal target). If the metrics do not move under PROBE, they measure "
     "nothing. The flag must appear in the entry module's interface. Same output format as RUN.\n"
+    "- ABLATIONS: two or three commands, each switching off or replacing ONE component of the "
+    "method (e.g. skip the coupling, use the reference simulator instead of PyQrack), threaded "
+    "into the experiment function like the PROBE flag. They tell which components actually move "
+    "the metrics. Predict a direction; never state a value.\n"
     "- KNOWN ANSWERS: for every MEASURED quantity (not the summary score), one concrete input "
     "with a known expected value and one with a DIFFERENT known expected value, stated from "
     "first principles, as 'metric: <concrete input> -> <value>' (e.g. 'fidelity: ideal "
@@ -4590,6 +4725,8 @@ _PROMPT_INTERFACES_SYNTH = (
     "- Serve the user's request and the deliverables; do not add features."
 )
 
+_SYNTH_ABLATIONS: List[dict] = []
+_RUN_ABLATIONS: List[dict] = []
 _SHELL_META_RE = re.compile(r'[;&|`$<>\\]')
 
 _RUN_MODE_WORDS = re.compile(r'\b(control|probe|negative|default[_ ]?config|corrupted[_ ]?config|run mode|'
@@ -4643,6 +4780,7 @@ def synthesize_interfaces(prompt: str, contract: str,
             continue
         text = re.sub(r'^```[a-zA-Z]*\s*$', '', enforce_ascii(raw or ""), flags=re.MULTILINE)
         body, run_lines, probe_lines, known, cur = [], [], [], [], None
+        abl_lines: List[str] = []
         for line in text.splitlines():
             st = line.strip()
             if re.match(r'^INTERFACES\b', st):
@@ -4656,6 +4794,12 @@ def synthesize_interfaces(prompt: str, contract: str,
                 continue
             if re.match(r'^KNOWN ANSWERS\b\s*:?\s*$', st):
                 cur = "k"
+                continue
+            if re.match(r'^ABLATIONS?\b\s*:?\s*$', st):
+                cur = "a"
+                continue
+            if cur == "a" and st:
+                abl_lines.append(st.strip("`"))
                 continue
             if cur == "p" and st:
                 probe_lines.append(st.strip("`"))
@@ -4714,6 +4858,21 @@ def synthesize_interfaces(prompt: str, contract: str,
                           "  What is not allowed: computing the metrics or the score differently under the flag,\n"
                           "  or setting any of them to a value. The effect above is a prediction the pipeline\n"
                           "  checks, not a value to produce.")
+        ablations = []
+        for line in abl_lines:
+            c = validate_run_command(line, deliverables)
+            if c and c not in (run_cmd, probe_cmd) and len(ablations) < 3:
+                ablations.append({"cmd": c, "effect": ""})
+            elif ablations and not c:
+                ablations[-1]["effect"] = (ablations[-1]["effect"] + " "
+                                           + re.sub(r'^\s*effect:\s*', '', line, flags=re.I)).strip()[:240]
+        _SYNTH_ABLATIONS[:] = ablations
+        if ablations:
+            section += ("\n\nABLATIONS (component checks the pipeline runs after every successful run)\n"
+                        + "\n".join(f"  {a['cmd']}\n    predicted: {a['effect'] or '(direction not stated)'}"
+                                     for a in ablations)
+                        + "\n  Wire each flag like the PROBE flag: into the experiment function, changing one "
+                          "component;\n  metrics are then measured exactly as normal.")
         if known:
             section += ("\n\nKNOWN ANSWERS (planner-chosen; the tests must check these)\n"
                         "  Each is a measured quantity on a concrete input, computed by calling the measuring\n"
@@ -5166,21 +5325,23 @@ def free_text_fields(out: str) -> List[str]:
 
 
 def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
-                      run_out: str, work: Optional[Path] = None) -> Optional[dict]:
+                      run_out: str, work: Optional[Path] = None,
+                      cmd: Optional[str] = None) -> Optional[dict]:
     """Run the negative-control command and compare its numbers with the main
     run's. RESPONSIVE: something moved. INSENSITIVE: every reported number is
     identical under a change that must affect them."""
-    if not _RUN_PROBE_COMMAND:
+    _PCMD = cmd or _RUN_PROBE_COMMAND
+    if not _PCMD:
         return None
     work = work or (run_dir / "tests" / f"round{rnd:02d}" / "grounding_probe")
     shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(proj, work / "project", ignore=shutil.ignore_patterns("__pycache__", ".home"))
     env = _test_env(work, test_ctx.get("venv_bin"), str(work / "project"))
     perrs: List[str] = []
-    rc, out, to = _run_limited(_RUN_PROBE_COMMAND.split(), RUN_COMMAND_SECS, work / "project", env,
+    rc, out, to = _run_limited(_PCMD.split(), RUN_COMMAND_SECS, work / "project", env,
                                cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=perrs)
     ptail = (out or "").strip()
-    base = {"command": _RUN_PROBE_COMMAND, "rc": rc, "timed_out": to,
+    base = {"command": _PCMD, "rc": rc, "timed_out": to,
             "output_tail": ptail if len(ptail) <= 2500 else "...[cut]...\n" + ptail[-2500:]}
     perr = (perrs[0] if perrs else "")
     if to or rc != 0 or run_output_errors(out or ""):
@@ -5226,7 +5387,7 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
     if noisy_keys:
         base["noisy"] = sorted(set(noisy_keys))[:8]
     measured = [k for k, _, _ in pairs if not _SUMMARY_KEY_RE.search(k)]
-    hard = hardcoded_control_branches(proj, _RUN_PROBE_COMMAND, [k for k, _ in a])
+    hard = hardcoded_control_branches(proj, _PCMD, [k for k, _ in a])
     if hard:
         return {**base, "verdict": "HARDCODED", "hardcoded": hard,
                 "detail": "the code assigns a fixed value to a reported metric when the control flag is set ("
@@ -5278,6 +5439,100 @@ _PROMPT_SKEPTIC_REVIEW = (
     "OVERALL: <one sentence on whether the run's score can be reported as a finding>\n"
     "Judge only what the code does. Do not suggest fixes. Do not praise."
 )
+
+
+REBUTTAL_CALLS = int(os.getenv("REBUTTAL_CALLS", "4"))
+
+_REBUTTAL_POLICY = '''\\
+# Rebuttal round: act on the skeptic review. Each target assignment gets one
+# attempt (a continuation of its best, with the findings routed to it), then
+# the remaining budget continues the attempts that ran, lowest score first.
+TARGETS = %%TARGETS%%
+
+
+def explore(ctx):
+    w = ctx.max_parallelism()
+    root = ctx.root()
+    tasks = [t for t in TARGETS if t in ctx.tasks()]
+    queue = [(root, t) for t in tasks]
+    while queue and ctx.budget_left() > 0 and ctx.rounds_left() > 0:
+        batch = queue[:w]
+        queue = queue[w:]
+        got = [n for n in ctx.expand_parallel(batch) if n]
+        if not queue:
+            queue = [(n["id"], n["task"]) for n in sorted(got, key=lambda n: (n["score"], n["id"]))]
+'''
+
+
+def review_findings(run_dir: Path, review: str) -> Dict[str, List[str]]:
+    """Skeptic-review verdicts turned into per-owner fixes: each suspect/invalid
+    metric goes to the owner of the file its evidence points at."""
+    owners = _owners_by_file(run_dir)
+    out: Dict[str, List[str]] = {}
+    blocks = re.split(r'(?m)^\s*METRIC:\s*', review or "")[1:]
+    for b in blocks:
+        name = b.splitlines()[0].strip() if b.splitlines() else "?"
+        v = re.search(r'VERDICT:\s*(valid|suspect|invalid)', b, re.I)
+        if not v or v.group(1).lower() == "valid":
+            continue
+        ev = re.search(r'EVIDENCE:\s*([\w./\-]+\.py)(?::\s*|:)?(.*)', b)
+        reason = re.search(r'REASON:\s*(.+)', b)
+        path = ev.group(1) if ev else None
+        t = owners.get(path) or (owners.get(PurePosixPath(path).name) if path else None)
+        if not t:
+            continue
+        msg = (f"Skeptic review: metric `{name}` is {v.group(1).lower()}"
+               + (f" - {reason.group(1).strip()[:220]}" if reason else "")
+               + (f" (evidence {path}: {ev.group(2).strip()[:120]})" if ev else "")
+               + ". Fix the measurement so it measures what its name says; do not change what is printed "
+                 "instead.")
+        out.setdefault(t, []).append(msg)
+    c = re.search(r'CONTROL:\s*(hardcoded|not wired)[\s\S]*?EVIDENCE:\s*([\w./\-]+\.py)', review or "", re.I)
+    if c:
+        t = owners.get(c.group(2)) or owners.get(PurePosixPath(c.group(2)).name)
+        if t:
+            out.setdefault(t, []).append(
+                f"Skeptic review: the negative control is {c.group(1).lower()} ({c.group(2)}). Pass the flag "
+                f"into the experiment function and let it corrupt the experiment's INPUT; measure as normal.")
+    return out
+
+
+def rebuttal_round(run_dir: Path, roster: List[dict], rnd: int, background: str, review: str,
+                   semantic_guidance: bool = False) -> Optional[int]:
+    """One short extra round spent only on what the skeptic review found. Uses the
+    normal machinery: carry-forward continuations, evaluation, integration,
+    grounding and routing. Returns the round number if it ran."""
+    global _CURRENT_ROUND
+    findings = review_findings(run_dir, review)
+    for t, msgs in _RUN_ROUTED.items():
+        if t in findings:
+            findings[t] = findings[t] + [m for m in msgs if m not in findings[t]]
+    if not findings:
+        print("\n[REBUTTAL] Skipped: the review raised nothing an owner can fix.", flush=True)
+        return None
+    targets = sorted(findings)
+    budget = max(len(targets), min(REBUTTAL_CALLS, 2 * len(targets)))
+    print(f"\n[REBUTTAL] ROUND {rnd:02d}: {budget} agent call(s) on {', '.join(targets)} to act on the "
+          f"review's findings", flush=True)
+    for t in targets:
+        print(f"    - {t}: {findings[t][0][:150]}", flush=True)
+    _RUN_ROUTED.clear()
+    _RUN_ROUTED.update(findings)
+    source = _REBUTTAL_POLICY.replace("%%TARGETS%%", repr(targets))
+    ppath = policy_path(run_dir, rnd)
+    ppath.parent.mkdir(parents=True, exist_ok=True)
+    with open(ppath, "w", encoding="ascii") as f:
+        f.write("# Rebuttal round (not dreamed): acts on the skeptic review.\n" + source)
+    _CURRENT_ROUND = rnd
+    try:
+        run_online_round(roster, rnd, background, run_dir, source, budget, semantic_guidance=semantic_guidance)
+    finally:
+        _CURRENT_ROUND = None
+    round_dir_for(run_dir, rnd).mkdir(parents=True, exist_ok=True)
+    with open(round_done_marker(run_dir, rnd), "w", encoding="ascii") as f:
+        f.write(datetime.now().isoformat(timespec="seconds") + " rebuttal\n")
+    append_event(run_dir, {"round": rnd, "event": "rebuttal", "targets": targets, "budget": budget})
+    return rnd
 
 
 def final_skeptic_review(run_dir: Path, rnd: int) -> str:
@@ -5502,6 +5757,14 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     else:
         status = "FAILED (exit 0, but no \"score\": <number> line was printed)"
     probe = sensitivity_probe(proj, rnd, test_ctx, run_dir, out or "") if ok else None
+    ablation_results = []
+    if ok and _RUN_ABLATIONS:
+        for i, a in enumerate(_RUN_ABLATIONS):
+            r = sensitivity_probe(proj, rnd, test_ctx, run_dir, out or "",
+                                  work=run_dir / "tests" / f"round{rnd:02d}" / f"ablation_{i}", cmd=a["cmd"])
+            if r:
+                r["predicted"] = a.get("effect", "")
+                ablation_results.append(r)
     # Libraries (PyQrack/OpenCL among them) also print to stdout; keep the JSON
     # result lines apart from those messages.
     so_lines = (out or "").strip().splitlines()
@@ -5546,6 +5809,17 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
         lines.append("control output:")
         lines.append(probe.get("output_tail") or "(no output)")
         lines.append("")
+    if ablation_results:
+        label = {"RESPONSIVE": "MOVES THE METRICS", "INSENSITIVE": "NO EFFECT", "SCORE-ONLY": "ONLY THE SCORE MOVES",
+                 "HARDCODED": "HARDCODED", "PROBE FAILED": "FAILED TO RUN", "UNCOMPARABLE": "UNCOMPARABLE"}
+        lines.append("ABLATIONS (one component switched off or replaced; measured exactly as normal):")
+        for r in ablation_results:
+            lines.append(f"  {r['command']} -> {label.get(r['verdict'], r['verdict'])}")
+            lines.append(f"    {r['detail'][:260]}")
+            if r.get("predicted"):
+                lines.append(f"    predicted: {r['predicted'][:200]}")
+        lines.append("  A write-up reports these as the ablation study: which components matter and which do not.")
+        lines.append("")
     prose = free_text_fields(out or "")
     if prose:
         lines.append(f"UNTRUSTED FREE TEXT: the output field(s) {', '.join(prose)} are prose the code prints, "
@@ -5573,7 +5847,8 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     res = {"round": rnd, "command": _RUN_COMMAND, "ok": ok, "rc": rc, "timed_out": to,
            "score": score, "reported_errors": reported_errors, "status": status,
            "exception_origins": origins, "not_executed": dead, "executed": ran or [],
-           "elapsed": round(elapsed, 2), "produced": produced, "probe": probe}
+           "elapsed": round(elapsed, 2), "produced": produced, "probe": probe,
+           "ablations": [{k: v for k, v in r.items() if k != "output_tail"} for r in ablation_results]}
     with open(idir / f"round{rnd:02d}_run.json", "w", encoding="ascii") as f:
         json.dump(res, f, indent=2)
     print(f"[RUN] ROUND {rnd:02d}: {_RUN_COMMAND} -> {status} in {elapsed:.1f}s"
@@ -5581,6 +5856,8 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     if probe:
         print(f"[PROBE] ROUND {rnd:02d}: {probe['command']} -> {probe['verdict']}: {probe['detail'][:160]}",
               flush=True)
+    for r in ablation_results:
+        print(f"[ABLATION] ROUND {rnd:02d}: {r['command']} -> {r['verdict']}: {r['detail'][:140]}", flush=True)
     if reported_errors:
         m_err = re.search(r'"(?:error|exception)"\s*:\s*"([^"]{1,200})', out or "", re.I)
         if m_err:
@@ -7853,7 +8130,14 @@ def best_known_nodes(run_dir: Path, upto_rnd: int) -> Dict[str, dict]:
             if n.get("dependency_violations"):
                 # rejected by the gate: never integrated, never a credit baseline
                 continue
-            key = (float(n.get("score", 0.0)), prnd, n.get("seq", 0))
+            if n.get("shortcut_hits"):
+                continue
+            # The integrated version only changes on STRICT improvement: higher
+            # whole-project q, then higher score; on a tie the incumbent (earlier)
+            # attempt stays, so the project can never slide backwards.
+            q = n.get("integration_q")
+            key = (round(float(q), 3) if isinstance(q, (int, float)) else -1.0,
+                   round(float(n.get("score", 0.0)), 3), -prnd, -n.get("seq", 0))
             cur = best.get(n["task"])
             if cur is None or key > cur[0]:
                 best[n["task"]] = (key, n)
@@ -7871,13 +8155,15 @@ def carry_forward_source(run_dir: Path, task: str, upto_rnd: int) -> Optional[di
         for n in nodes:
             if n.get("task") != task or not n.get("files") or n.get("status") not in ("success", "partial"):
                 continue
-            if n.get("dependency_violations") or n.get("shortcut_hits"):
+            if n.get("dependency_violations") or n.get("shortcut_hits") or n.get("lineage_dead"):
                 continue
             q = n.get("integration_q")
             qv = round(float(q), 3) if isinstance(q, (int, float)) else -1.0
             key = (qv, prnd, n.get("seq", 0), float(n.get("score", 0.0)))
             if best_key is None or key > best_key:
                 best, best_key = n, key
+    if best is None:
+        best = load_seeds(run_dir).get(task)
     return best
 
 
@@ -7902,7 +8188,9 @@ def task_attempt_history(run_dir: Path, task: str, live: Optional[List[dict]] = 
                   f"continuing {n['parent']}" if n.get("parent") and not str(n.get("parent", "")).endswith("0000")
                   else "fresh")
         q = n.get("integration_q")
-        out.append(f"- {n['id']} (round {prnd}, {origin}): score {float(n.get('score', 0.0)):.3f}"
+        out.append(f"- {n['id']} (round {prnd}, {origin}"
+                   + (f", line {n['lineage_verdict']}" if n.get("lineage_verdict") else "")
+                   + f"): score {float(n.get('score', 0.0)):.3f}"
                    + (f", project q {q:.3f}" if isinstance(q, (int, float)) else "")
                    + (f" -> {fail}" if fail else " -> no failure recorded"))
     text = "\n".join(out)
@@ -8288,6 +8576,37 @@ def _evaluation_section(run_dir: Path, node: dict, limit: int = 5000) -> str:
     return sec[:limit]
 
 
+def _progress_value(n: dict) -> float:
+    q = n.get("integration_q")
+    return float(q) if isinstance(q, (int, float)) else float(n.get("score", 0.0))
+
+
+def lineage_verdict(node: dict, parent: Optional[dict]) -> None:
+    """GOOD / ENGINEER / DEAD for the line of work this attempt belongs to.
+    Improvement is measured on whole-project q (score when q is absent). A
+    continuation that does not improve on its parent adds a stall; after
+    LINEAGE_PATIENCE stalls in a row the lineage is DEAD."""
+    if node.get("dependency_violations"):
+        node["lineage_verdict"] = "BAD"
+        node["lineage_stalls"] = (int(parent.get("lineage_stalls", 0)) + 1) if parent else 1
+        node["lineage_dead"] = node["lineage_stalls"] >= LINEAGE_PATIENCE
+        return
+    if parent is None:
+        node["lineage_stalls"] = 0
+    elif _progress_value(node) > _progress_value(parent) + LINEAGE_EPS:
+        node["lineage_stalls"] = 0
+    else:
+        node["lineage_stalls"] = int(parent.get("lineage_stalls", 0)) + 1
+    node["lineage_dead"] = node["lineage_stalls"] >= LINEAGE_PATIENCE
+    run = ((node.get("integration") or {}).get("groups") or {}).get("run")
+    if node["lineage_dead"]:
+        node["lineage_verdict"] = "DEAD"
+    elif run is not None and run >= 0.999:
+        node["lineage_verdict"] = "GOOD"
+    else:
+        node["lineage_verdict"] = "ENGINEER"
+
+
 def write_evaluation_feedback(node: dict, run_dir: Path) -> None:
     """Everything the fixed evaluator found about this attempt, appended to its
     log, so whoever continues it starts from a concrete list of what broke:
@@ -8304,6 +8623,12 @@ def write_evaluation_feedback(node: dict, run_dir: Path) -> None:
             if isinstance(node.get("integration_delta"), (int, float)) else "")]
     if node.get("seeded_from"):
         L.append(f"(continued from {node['seeded_from']}, an earlier round's best attempt)")
+    if node.get("lineage_verdict"):
+        L.append(f"Line-of-work verdict: {node['lineage_verdict']}"
+                 + (f" ({node.get('lineage_stalls', 0)} continuation(s) without improvement; this line is "
+                    f"abandoned - a fresh approach is needed)" if node.get("lineage_dead") else
+                    f" ({node.get('lineage_stalls', 0)} continuation(s) without improvement so far, "
+                    f"{LINEAGE_PATIENCE} ends the line)"))
     tc = node.get("test_count")
     if tc:
         L.append(f"Unit tests on your files: {node.get('tests_passed', 0)}/{tc} passed.")
@@ -8879,6 +9204,9 @@ def main():
     parser.add_argument("--no-dream", action="store_true",
                         help="Skip offline policy improvement. Every round redeploys pi_0 - this is the "
                              "Recursive Fixed Exploration control the paper compares against.")
+    parser.add_argument("--seed-from", default="",
+                        help="Start from an earlier run's final project: 'latest' or a run directory name. "
+                             "Each assignment whose deliverables exist there is continued, not rewritten.")
     parser.add_argument("--force-dream", action="store_true",
                         help="Run apex policy revisions even when the replay oracle bound shows less "
                              "than DREAM_MIN_HEADROOM of headroom over the deployed policy.")
@@ -9096,7 +9424,7 @@ def main():
                 "integration_cmd": INTEGRATION_CMD, "synthesized": synthesized,
                 "allowed_imports": allowed, "brief": target_prompt or "",
                 "interfaces_synthesized": interfaces_synth, "run_cmd": run_cmd,
-                "probe_cmd": probe_cmd}
+                "probe_cmd": probe_cmd, "ablations": list(_SYNTH_ABLATIONS)}
     if args.integration_cmd is not None:
         meta["integration_cmd"] = args.integration_cmd.strip()
     save_brief_meta(target_directory, meta)
@@ -9116,6 +9444,10 @@ def main():
     _RUN_COMMAND = (validate_run_command(RUN_COMMAND, None) or meta.get("run_cmd")
                     or default_run_command(meta.get("deliverables") or {}))
     _RUN_PROBE_COMMAND = validate_run_command(PROBE_COMMAND, None) or meta.get("probe_cmd") or ""
+    _RUN_ABLATIONS[:] = [a for a in (meta.get("ablations") or []) if a.get("cmd")]
+    if _RUN_ABLATIONS:
+        print(f"[ABLATIONS] {len(_RUN_ABLATIONS)} component check(s) after each successful run: "
+              + "; ".join(a["cmd"] for a in _RUN_ABLATIONS), flush=True)
     if _RUN_CONTRACT:
         heads = [h for h, _ in split_brief_sections(_RUN_CONTRACT) if h]
         kind = "Synthesized" if _RUN_CONTRACT_SYNTHESIZED else "Pinned"
@@ -9257,6 +9589,20 @@ def main():
                 refresh_environment(target_directory, rnd, focus_text=_RUN_BRIEF,
                                     project=prev_proj if prev_proj.exists() else None)
 
+            if rnd == 1 and not args.no_dream and INHERIT_POLICY and \
+                    not policy_path(target_directory, 1).exists():
+                inh = find_inherited_policy(target_directory)
+                if inh:
+                    ppath = policy_path(target_directory, 1)
+                    ppath.parent.mkdir(parents=True, exist_ok=True)
+                    with open(ppath, "w", encoding="ascii") as f:
+                        f.write(f"# Inherited for round 1 from {inh[1]} (selected by that run's dreaming).\n"
+                                + inh[0] + "\n")
+                    print(f"[RSI] round 01 policy inherited from {inh[1]}; pi_0 stays in replay as a "
+                          f"fallback candidate.", flush=True)
+                    append_event(target_directory, {"round": 1, "event": "policy_inherited", "from": inh[1]})
+            if rnd == 1 and getattr(args, "seed_from", "") and not (target_directory / "seeds.jsonl").exists():
+                seed_from_previous_run(target_directory, roster, args.seed_from)
             policy_source = (DEFAULT_POLICY_SOURCE if args.no_dream
                              else load_or_init_policy(target_directory, rnd))
             if args.no_dream:
@@ -9302,9 +9648,17 @@ def main():
     if last_online_round and not _shutdown_event.is_set():
         try:
             review = final_skeptic_review(target_directory, last_online_round)
+            # Rebuttal: the review's findings go to the owners as fixes in one short
+            # extra round, then the project is re-run and re-reviewed.
+            if review and REBUTTAL_CALLS > 0 and not args.no_dream:
+                rb = rebuttal_round(target_directory, roster, last_online_round + 1, target_query,
+                                    review, args.semantic_guidance)
+                if rb:
+                    last_online_round = rb
+                    review = final_skeptic_review(target_directory, last_online_round)
             final_writeup_refresh(target_directory, roster, last_online_round, target_query, review)
         except Exception as exc:
-            print(f"    [!] Final write-up refresh failed: {str(exc)[:120]}", flush=True)
+            print(f"    [!] Final review/rebuttal/write-up failed: {str(exc)[:120]}", flush=True)
 
     master_elapsed_time = time.time() - master_start_time
 
