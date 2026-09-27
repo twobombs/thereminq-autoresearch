@@ -398,7 +398,7 @@ EVAL_SHORTCUT_CAP = float(os.getenv("EVAL_SHORTCUT_CAP", "0.2"))
 # An attempt that calls library members that do not exist is capped too.
 EVAL_MISUSE_CAP = float(os.getenv("EVAL_MISUSE_CAP", "0.3"))
 # Unit-test generation streams; no data for this long counts as a stall and is retried.
-TEST_STALL_SECS = int(os.getenv("TEST_STALL_SECS", "45"))
+TEST_STALL_SECS = int(os.getenv("TEST_STALL_SECS", "20"))
 # Packaging machinery is how abilities get installed, not an ability itself.
 _TOOLING_DISTS = {"pip", "setuptools", "wheel", "distribute", "pkg-resources", "pkg_resources"}
 # Library API facts are discovered too: modules the brief mentions and every
@@ -2531,6 +2531,10 @@ def _node_view(n: dict) -> dict:
         "depth": n.get("depth", 0), "score": float(n.get("score", 0.0)),
         "gain": float(n.get("gain") or 0.0), "status": n.get("status"), "cost": int(n.get("cost") or 1),
         "files": list(n.get("files", [])),
+        # mirrored from diagnostics so either spelling works in a policy
+        "lineage_verdict": str(n.get("lineage_verdict") or ""),
+        "lineage_dead": bool(n.get("lineage_dead")),
+        "lineage_stalls": int(n.get("lineage_stalls") or 0),
         "diagnostics": {
             "violations": [str(v)[:160] for v in (n.get("violations") or [])[:5]],
             "truncated": bool(n.get("truncated", False)),
@@ -4697,8 +4701,12 @@ _PROMPT_INTERFACES_SYNTH = (
     "- THREAD THE PROBE FLAG: the PROBE's flag must appear as an optional parameter in BOTH the "
     "entry module's function that parses/handles it AND the function that prepares and runs the "
     "experiment, e.g. `def run_experiment(coupling: str, corrupt: bool = False) -> float`. The "
-    "experiment function applies the corruption to its INPUT (e.g. flips or randomises the state "
-    "to be teleported) and then measures exactly as in a normal run.\n"
+    "corruption breaks the PROCESS (e.g. skip the correction gates, replace the entangled pair by a "
+    "product state, flip the input WITHOUT telling the metric), while every metric keeps comparing "
+    "against the ORIGINAL intended reference. A control that changes the reference together with "
+    "the input cancels itself and measures nothing.\n"
+    "- FLAGS ARE BARE SWITCHES: PROBE and ABLATION commands use bare flags (`python3 runner.py "
+    "--corrupt`), parsed with argparse action='store_true'. Never write `--flag True`.\n"
     "- PIN MEASUREMENT KEY FORMATS: any dict of counts or probabilities states its keys exactly, "
     "e.g. `dict[str, int]  # keys: bitstrings of length qubit_count, character i = qubit i "
     "(qubit 0 leftmost)`. A function returning a single-qubit marginal says so ('0'/'1' keys).\n"
@@ -4830,7 +4838,7 @@ def synthesize_interfaces(prompt: str, contract: str,
         run_cmd = validate_run_command(run_lines[0] if run_lines else "", deliverables)
         probe_cmd = ""
         if run_cmd and probe_lines:
-            probe_cmd = validate_run_command(probe_lines[0], deliverables)
+            probe_cmd = validate_run_command(_bare_flags(probe_lines[0]), deliverables)
             if probe_cmd == run_cmd:
                 probe_cmd = ""
         effect = " ".join(l for l in probe_lines[1:] if l)[:300]
@@ -4852,15 +4860,18 @@ def synthesize_interfaces(prompt: str, contract: str,
                         + "  If the reported numbers do not change under PROBE, the metrics are flagged as\n"
                           "  measuring nothing.\n"
                           "  HOW TO WIRE IT: the entry point passes the flag into the experiment function (see\n"
-                          "  INTERFACES). That function USES it: it corrupts its own INPUT (e.g. flips or\n"
-                          "  randomises the state to be teleported) and then runs and measures exactly as in a\n"
-                          "  normal run. The metrics then change because the physics changed.\n"
+                          "  INTERFACES). That function USES it to break the PROCESS - e.g. skip the correction\n"
+                          "  gates, replace the entangled pair by a product state, or flip the input WITHOUT\n"
+                          "  telling the metric - and then runs and measures exactly as in a normal run.\n"
+                          "  The metric's REFERENCE (expected state, target, ideal value) must NOT depend on the\n"
+                          "  flag: if the reference follows the corrupted input, the control cancels itself.\n"
+                          "  The metrics then change because the physics changed.\n"
                           "  What is not allowed: computing the metrics or the score differently under the flag,\n"
                           "  or setting any of them to a value. The effect above is a prediction the pipeline\n"
                           "  checks, not a value to produce.")
         ablations = []
         for line in abl_lines:
-            c = validate_run_command(line, deliverables)
+            c = validate_run_command(_bare_flags(line), deliverables)
             if c and c not in (run_cmd, probe_cmd) and len(ablations) < 3:
                 ablations.append({"cmd": c, "effect": ""})
             elif ablations and not c:
@@ -4917,10 +4928,33 @@ def interface_problems(body: List[str], run_lines: List[str], probe_lines: List[
             problems.append(f"no experiment function outside {entry or 'the entry module'} takes the PROBE flag "
                             f"(`{flag}: bool = False`); the flag cannot reach the experiment")
     text = "\n".join(body)
-    if re.search(r'dict\[str,\s*(int|float)\]', text) and not re.search(r'bitstring|key[s]?\s*:', text, re.I):
+    if re.search(r'dict\[str,\s*(int|float)\]', text) and \
+            not re.search(r'bitstring|marginal|\bkeys?\b|\bkeyed\b', text, re.I):
         problems.append("dicts of counts/probabilities do not state their key format (bitstring length and "
                         "qubit order)")
     return problems
+
+
+def _bare_flags(cmd: str) -> str:
+    """'--corrupt True' -> '--corrupt'; '--x False' drops the flag. Switches are store_true."""
+    toks = cmd.split()
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t.startswith("--") and nxt.lower() in ("true", "false", "1", "0", "yes", "no"):
+            if nxt.lower() in ("true", "1", "yes"):
+                out.append(t.split("=")[0])
+            i += 2
+            continue
+        if t.startswith("--") and "=" in t and t.split("=", 1)[1].lower() in ("true", "false"):
+            if t.split("=", 1)[1].lower() == "true":
+                out.append(t.split("=")[0])
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return " ".join(out)
 
 
 def validate_run_command(cmd: str, deliverables) -> str:
@@ -5197,6 +5231,8 @@ def run_rules_section(cmd: str) -> str:
         '  "score": <finite number>, and reports no error ("status": "error", an "error" field,',
         "  or a traceback in its output).",
         "- Printed prose (conclusions, notes) is not a result; only measured numbers count.",
+        "- Boolean switches are bare flags parsed with argparse action='store_true' (present = on).",
+        "  Never type=bool: argparse turns '--flag False' into True.",
         "- On any failure, print the full traceback to stderr (traceback.print_exc()) before exiting",
         "  non-zero, so the failing file and line are visible to everyone. The pipeline also records",
         "  where exceptions originate, but a traceback is the owner's job.",
@@ -5422,9 +5458,10 @@ _PROMPT_SKEPTIC_REVIEW = (
     "operations that cannot affect the measured quantity, silent fallbacks, and circuits or models "
     "missing the steps their names imply. Quote the exact code line that decides your verdict.\n"
     "Also trace the negative-control flag from the entry point: what does it actually change? It must "
-    "alter the experiment's input or procedure so the metric changes BY MEASUREMENT. If any code "
-    "branches on the flag to set a score or metric directly, or the flag never reaches the "
-    "computation, say so. Trace each printed key back to the line that computes it, starting from "
+    "break the experiment's PROCESS so the metric changes BY MEASUREMENT, while the metric's reference "
+    "(expected state, target, ideal value) stays the original. If any code branches on the flag to set "
+    "a score or metric directly, the flag never reaches the computation, or the flag ALSO changes the "
+    "reference so the effect cancels out, say so. Trace each printed key back to the line that computes it, starting from "
     "the RUN entry file.\n\n"
     "Output plain text only, one block per metric:\n"
     "METRIC: <name as printed>\n"
@@ -5432,7 +5469,7 @@ _PROMPT_SKEPTIC_REVIEW = (
     "EVIDENCE: <file>:<the exact line>\n"
     "REASON: <one or two sentences>\n\n"
     "Then:\n"
-    "CONTROL: genuine | hardcoded | not wired\n"
+    "CONTROL: genuine | hardcoded | not wired | self-cancelling\n"
     "EVIDENCE: <file>:<the exact line>\n"
     "REASON: <one sentence>\n"
     "Then one final line:\n"
@@ -5487,13 +5524,39 @@ def review_findings(run_dir: Path, review: str) -> Dict[str, List[str]]:
                + ". Fix the measurement so it measures what its name says; do not change what is printed "
                  "instead.")
         out.setdefault(t, []).append(msg)
-    c = re.search(r'CONTROL:\s*(hardcoded|not wired)[\s\S]*?EVIDENCE:\s*([\w./\-]+\.py)', review or "", re.I)
+    c = re.search(r'CONTROL:\s*(hardcoded|not wired|self-cancelling)', review or "", re.I)
     if c:
-        t = owners.get(c.group(2)) or owners.get(PurePosixPath(c.group(2)).name)
-        if t:
-            out.setdefault(t, []).append(
-                f"Skeptic review: the negative control is {c.group(1).lower()} ({c.group(2)}). Pass the flag "
-                f"into the experiment function and let it corrupt the experiment's INPUT; measure as normal.")
+        verdict = c.group(1).lower()
+        tail = (review or "")[c.end():c.end() + 600]
+        ev = re.search(r'EVIDENCE:\s*([\w./\-]+\.py)', tail)
+        why = re.search(r'REASON:\s*(.+)', tail)
+        advice = {"self-cancelling": "The flag changes the metric's reference together with the input, so the "
+                                     "effect cancels. Keep the reference the ORIGINAL intended state; let the "
+                                     "flag break only the process (skip correction, break the entangled pair).",
+                  "hardcoded": "Do not set any metric from the flag; let it break the process and measure "
+                               "as normal.",
+                  "not wired": "Pass the flag into the experiment function and let it break the process; "
+                               "measure as normal."}[verdict]
+        msg = (f"Skeptic review: the negative control is {verdict}"
+               + (f" - {why.group(1).strip()[:200]}" if why else "") + f". {advice}")
+        targets = set()
+        if ev:
+            t = owners.get(ev.group(1)) or owners.get(PurePosixPath(ev.group(1)).name)
+            if t:
+                targets.add(t)
+        if not targets:
+            # No evidence line: the entry point and the modules it calls own the wiring.
+            entry = _RUN_COMMAND.split()[1] if len(_RUN_COMMAND.split()) > 1 else ""
+            if entry and owners.get(entry):
+                targets.add(owners[entry])
+            proj = integration_dir_for(run_dir) / "latest"
+            src = read_file_content_safe(proj / entry) if entry else ""
+            stems = {PurePosixPath(d).stem: d for d in owners}
+            for m in _imported_roots(src or ""):
+                if m in stems and owners.get(stems[m]) and not _is_test_file(stems[m]):
+                    targets.add(owners[stems[m]])
+        for t in targets:
+            out.setdefault(t, []).append(msg)
     return out
 
 
@@ -5504,14 +5567,18 @@ def rebuttal_round(run_dir: Path, roster: List[dict], rnd: int, background: str,
     grounding and routing. Returns the round number if it ran."""
     global _CURRENT_ROUND
     findings = review_findings(run_dir, review)
+    named = set(findings)
+    # Everything the last round routed counts too, not only for tasks the review named.
     for t, msgs in _RUN_ROUTED.items():
-        if t in findings:
-            findings[t] = findings[t] + [m for m in msgs if m not in findings[t]]
+        cur = findings.setdefault(t, [])
+        cur.extend(m for m in msgs if m not in cur)
     if not findings:
         print("\n[REBUTTAL] Skipped: the review raised nothing an owner can fix.", flush=True)
         return None
-    targets = sorted(findings)
-    budget = max(len(targets), min(REBUTTAL_CALLS, 2 * len(targets)))
+    # Review-named tasks first; the budget stays small (REBUTTAL_CALLS) unless the
+    # review itself names more tasks than that.
+    targets = sorted(findings, key=lambda t: (t not in named, t))
+    budget = min(max(REBUTTAL_CALLS, len(named)), 2 * len(targets))
     print(f"\n[REBUTTAL] ROUND {rnd:02d}: {budget} agent call(s) on {', '.join(targets)} to act on the "
           f"review's findings", flush=True)
     for t in targets:
@@ -5588,7 +5655,7 @@ def final_skeptic_review(run_dir: Path, rnd: int) -> str:
           f"{counts['invalid']} invalid -> {INTEGRATION_DIRNAME}/final_review.md", flush=True)
     for m in re.finditer(r'METRIC:\s*(.+)\n\s*VERDICT:\s*(suspect|invalid)', text, re.I):
         print(f"    [-] {m.group(1).strip()[:60]}: {m.group(2).lower()}", flush=True)
-    ctrl = re.search(r'^\s*CONTROL:\s*(genuine|hardcoded|not wired)', text, re.I | re.M)
+    ctrl = re.search(r'^\s*CONTROL:\s*(genuine|hardcoded|not wired|self-cancelling)', text, re.I | re.M)
     if ctrl:
         print(f"    [{'+' if ctrl.group(1).lower() == 'genuine' else '-'}] negative control: "
               f"{ctrl.group(1).lower()}", flush=True)
@@ -6174,6 +6241,10 @@ def refresh_environment(run_dir: Path, rnd: int, focus_text: str = "",
     _RUN_API_FACTS.clear()
     _RUN_API_FACTS.update(facts)
     _RUN_API_FACTS_TEXT = render_api_facts(facts)
+    wrong = arity_problems(refs.get("calls", []), _known_class_sigs()) if refs else []
+    if wrong:
+        _RUN_API_FACTS_TEXT = ("WRONG ARGUMENTS in library calls of the current project (fix these first):\n"
+                               + "\n".join(f"  - {w}" for w in wrong[:20]) + "\n\n" + _RUN_API_FACTS_TEXT)
     with open(edir / f"round{rnd:02d}_api_facts.md", "w", encoding="ascii") as f:
         f.write((_RUN_API_FACTS_TEXT or "(no library API facts)") + "\n")
     if quiet:
@@ -6210,7 +6281,7 @@ def load_last_env(run_dir: Path) -> Dict[str, Any]:
 def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str, Any]:
     """Third-party usage in a project, from its source: modules imported, names
     imported from them, and attribute chains on module aliases."""
-    out = {"modules": [], "names": [], "chains": [], "instances": []}
+    out = {"modules": [], "names": [], "chains": [], "instances": [], "calls": []}
     if project is None or not project.exists():
         return out
     names, chains, mods = set(), set(), set()
@@ -6246,7 +6317,7 @@ def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str
                 if isinstance(cur, ast.Name) and cur.id in alias:
                     chains.add(tuple(alias[cur.id].split(".") + list(reversed(parts))))
         rel = p.name if p.parent == project else str(p.relative_to(project))
-        instances |= _instance_method_calls(tree, alias, names, rel)
+        instances |= _instance_method_calls(tree, alias, names, rel, calls_out=out["calls"])
     # keep only maximal chains (a.b.c covers a.b)
     maximal = {c for c in chains if not any(len(o) > len(c) and o[:len(c)] == c for o in chains)}
     out["modules"] = sorted(mods)
@@ -6257,7 +6328,7 @@ def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str
 
 
 def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str, str]],
-                           rel: str) -> Set[Tuple[str, str, str, str]]:
+                           rel: str, calls_out: Optional[list] = None) -> Set[Tuple[str, str, str, str]]:
     """(module, Class, attribute, 'file:line') for attributes used on variables
     holding a library class instance: `sim = QrackSimulator(...)` or
     `self.sim = pyqrack.QrackSimulator(...)`, then `sim.rz(...)` / `self.sim.rz`.
@@ -6329,6 +6400,92 @@ def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str,
             if k in holders and not node.attr.startswith("__"):
                 m, c = holders[k]
                 out.add((m, c, node.attr, f"{rel}:{node.lineno}"))
+        if calls_out is not None and isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            k = key_of(node.func.value)
+            if k in holders and not node.func.attr.startswith("__"):
+                m, c = holders[k]
+                calls_out.append((m, c, node.func.attr, f"{rel}:{node.lineno}",
+                                  sum(1 for a in node.args if not isinstance(a, ast.Starred)),
+                                  [kw.arg for kw in node.keywords if kw.arg],
+                                  any(isinstance(a, ast.Starred) for a in node.args)
+                                  or any(kw.arg is None for kw in node.keywords)))
+    return out
+
+
+def _parse_sig(sig: str) -> Optional[dict]:
+    """'(b, ph, q)' / '(q, c, r=True)' -> parameter structure; None if opaque."""
+    sig = (sig or "").strip()
+    if not sig.startswith("(") or sig.startswith("(..."):
+        return None
+    inner = sig[1:sig.rfind(")")] if ")" in sig else sig[1:]
+    parts, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    pos, kwonly, varpos, varkw, star = [], [], False, False, False
+    for part in parts:
+        name = part.split("=")[0].split(":")[0].strip()
+        if name == "/":
+            continue
+        if name == "*":
+            star = True
+            continue
+        if name.startswith("**"):
+            varkw = True
+            continue
+        if name.startswith("*"):
+            varpos, star = True, True
+            continue
+        (kwonly if star else pos).append((name, "=" in part))
+    return {"pos": pos, "kwonly": kwonly, "varpos": varpos, "varkw": varkw}
+
+
+def arity_problems(calls: list, sigs: Dict[Tuple[str, str], Dict[str, str]]) -> List[str]:
+    """Calls on library instances whose argument count or keywords cannot match
+    the real signature: 'QrackSimulator.r() takes (b, ph, q): 2 positional given'."""
+    out = []
+    for m, c, attr, where, npos, kws, dynamic in calls:
+        s = (sigs.get((m, c)) or sigs.get((m.split(".")[0], c)) or {}).get(attr)
+        p = _parse_sig(s) if s else None
+        if p is None or dynamic:
+            continue
+        names = [n for n, _ in p["pos"]]
+        required = [n for n, d in p["pos"] if not d] + [n for n, d in p["kwonly"] if not d]
+        filled = set(names[:npos]) | set(kws)
+        problem = None
+        if npos > len(names) and not p["varpos"]:
+            problem = f"{npos} positional argument(s) given, it takes at most {len(names)}"
+        else:
+            missing = [r for r in required if r not in filled]
+            unknown = [k for k in kws if k not in names and k not in [n for n, _ in p["kwonly"]]
+                       and not p["varkw"]]
+            if missing:
+                problem = f"missing required argument(s) {', '.join(missing)}"
+            elif unknown:
+                problem = f"unknown keyword(s) {', '.join(unknown)}"
+        if problem:
+            msg = f"{c}.{attr}{s}: {problem} ({where})"
+            if msg not in out:
+                out.append(msg)
+    return out
+
+
+def _known_class_sigs() -> Dict[Tuple[str, str], Dict[str, str]]:
+    out: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for root, r in _RUN_API_FACTS.items():
+        for full, info in (r.get("objects") or {}).items():
+            if info.get("kind") == "class":
+                mod, _, cls = full.rpartition(".")
+                out[(mod, cls)] = {k: v for k, v in (info.get("members") or {}).items() if v}
     return out
 
 
@@ -7258,6 +7415,19 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str
             for prm in received:
                 used = any(isinstance(n, ast.Name) and n.id == prm and isinstance(n.ctx, ast.Load)
                            for n in ast.walk(fn))
+                if used:
+                    for a in ast.walk(fn):
+                        if isinstance(a, (ast.Assign, ast.AnnAssign)) and a.value is not None and \
+                                any(isinstance(x, ast.Name) and x.id == prm for x in ast.walk(a.value)):
+                            tg = a.targets if isinstance(a, ast.Assign) else [a.target]
+                            for t in tg:
+                                nm = t.id if isinstance(t, ast.Name) else (t.attr if isinstance(t, ast.Attribute) else "")
+                                if re.search(r'expect|target|reference|\bref\b|ref_|ideal|truth', nm, re.I):
+                                    out.append((f"{mstem}.py",
+                                                f"{mstem}.py:{a.lineno} sets `{nm}` from the control flag `{prm}`: the "
+                                                f"metric's reference follows the corruption, so the control cancels "
+                                                f"itself. Keep the reference the ORIGINAL intended state and let the "
+                                                f"flag break only the process."))
                 if used and mstem != estem:
                     reached["outside"] = True
                 elif used:
@@ -8663,7 +8833,7 @@ def library_misuse_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
     if not ndir.exists():
         return []
     refs = project_library_refs(ndir, set(_RUN_ALLOWED_IMPORTS or []) | {m for m, _ in known})
-    bad = []
+    bad = [f"{w}" for w in arity_problems(refs.get("calls", []), _known_class_sigs())]
     for mod, cls, attr, where in refs.get("instances", []):
         members = known.get((mod, cls)) or known.get((mod.split(".")[0], cls))
         if members is not None and attr not in members:
