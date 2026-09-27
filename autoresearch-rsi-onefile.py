@@ -3977,20 +3977,20 @@ def find_inherited_policy(run_dir: Path) -> Optional[Tuple[str, str]]:
     default_body = _policy_body(DEFAULT_POLICY_SOURCE)
     for d in earlier[:20]:
         pdir = policy_dir_for(d)
-        files = sorted(pdir.glob("pi_r*.py")) if pdir.exists() else []
-        if not files:
-            continue
-        src = read_file_content_safe(files[-1]) or ""
-        body = _policy_body(src)
-        if not body or body == default_body:
-            continue
-        # Only a policy that some dream actually selected over its predecessor.
-        if not any(_policy_body(read_file_content_safe(f) or "") != _policy_body(
-                read_file_content_safe(files[0]) or "") for f in files[1:]):
-            continue
-        ok, _ = validate_policy_source(body)
-        if ok:
-            return body, f"{d.name}/{files[-1].name}"
+        files = sorted(pdir.glob("pi_r*.py"), reverse=True) if pdir.exists() else []
+        for f in files:
+            src = read_file_content_safe(f) or ""
+            # Only a version a dream SELECTED because it beat the deployed one:
+            # never a rebuttal-round policy, never a carried-over unchanged one.
+            m = re.search(r'# Replay score (-?[\d.]+) \(deployed version (-?[\d.]+)\)', src)
+            if not m or float(m.group(1)) <= float(m.group(2)):
+                continue
+            body = _policy_body(src)
+            if not body or body == default_body or "Rebuttal round" in src or "TARGETS =" in body:
+                continue
+            ok, _ = validate_policy_source(body)
+            if ok:
+                return body, f"{d.name}/{f.name}"
     return None
 
 
@@ -4371,12 +4371,20 @@ def dream_policy_improvement(run_dir: Path, rnd: int, current_source: str,
     ddir.mkdir(parents=True, exist_ok=True)
     versions: List[dict] = []
 
+    # Coverage any policy can reach in replay: tasks with at least one recorded
+    # attempt in every tree (a candidate is judged against that, not against 1.0).
+    per_tree = []
+    for _, nodes in pool:
+        got = {n["task"] for n in nodes if n.get("task")}
+        per_tree.append(len(got & set(tasks)) / max(1, len(tasks)))
+    reachable = (sum(per_tree) / len(per_tree)) if per_tree else 1.0
+
     def _evaluate(name: str, idx: int, src: str) -> dict:
         res = replay_score(src, pool, tasks, budget)
         res.update({"name": name, "index": idx})
         # A revision that leaves assignments without any attempt can look cheap in
         # V but abandons deliverables; it is not a candidate.
-        if idx > 0 and res.get("valid") and float(res.get("coverage", 1.0)) < 0.999:
+        if idx > 0 and res.get("valid") and float(res.get("coverage", 1.0)) < reachable - 1e-3:
             res["valid"] = False
             res["detail"] = (f"covers only {float(res.get('coverage', 0)):.0%} of the assignments; every "
                              f"assignment must get at least one attempt")
@@ -9809,6 +9817,20 @@ def main():
             _, dstats = dream_policy_improvement(target_directory, rnd, policy_source,
                                                  pool, tasks, budget)
             dream_stats.append(dstats)
+            # Coverage guard: a deployed policy that left assignments without any
+            # attempt this round is not trusted for the next one - revert to pi_0.
+            this_round = [n for r_, ns in pool if r_ == rnd for n in ns if n.get("task")]
+            covered = {n["task"] for n in this_round}
+            if len(covered) < len(tasks):
+                nxt = policy_path(target_directory, rnd + 1)
+                with open(nxt, "w", encoding="ascii") as f:
+                    f.write(f"# Deployed for round {rnd + 1}: pi_0 restored - the round {rnd} policy left "
+                            f"{len(tasks) - len(covered)} assignment(s) without an attempt.\n"
+                            + DEFAULT_POLICY_SOURCE)
+                print(f"[RSI] round {rnd:02d} policy covered only {len(covered)}/{len(tasks)} assignments; "
+                      f"pi_0 restored for round {rnd + 1:02d}.", flush=True)
+                append_event(target_directory, {"round": rnd, "event": "coverage_guard",
+                                                "covered": len(covered), "tasks": len(tasks)})
             print_round_tokens(rnd)
             if rnd < end_round:
                 print_token_estimate(f"remaining ({end_round - rnd} round(s) plus final stages)",
