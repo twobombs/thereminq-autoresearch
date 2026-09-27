@@ -4750,7 +4750,28 @@ _RUN_MODE_WORDS = re.compile(r'\b(control|probe|negative|default[_ ]?config|corr
                              r'mode|flag|baseline run)\b', re.I)
 
 
-def validate_known_answers(lines: List[str], probe_cmd: str) -> Tuple[List[str], List[Tuple[str, str]]]:
+def experiment_conditions(body: List[str], probe_cmd: str) -> Set[str]:
+    """The values the experiment varies: Literal[...] options in the signature of
+    the function that takes the PROBE flag (e.g. 'forward', 'reverse')."""
+    idents, _ = _flag_tokens(probe_cmd)
+    words = [set(i.split("_")) for i in idents]
+    out: Set[str] = set()
+    for line in body:
+        if "def " not in line:
+            continue
+        m = re.search(r'\((.*)\)', line)
+        if not m:
+            continue
+        params = [p.split(":")[0].strip().lower() for p in m.group(1).split(",")]
+        if words and not any(any(fw <= set(p.split("_")) for fw in words) for p in params):
+            continue
+        for lit in re.findall(r'Literal\[([^\]]+)\]', line):
+            out |= {v.strip().strip("'\"").lower() for v in lit.split(",") if v.strip()}
+    return {v for v in out if len(v) >= 3}
+
+
+def validate_known_answers(lines: List[str], probe_cmd: str,
+                           conditions: Optional[Set[str]] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
     """Keep known answers that name a measured quantity on a concrete input.
     Drop lines that prescribe the summary score, or key a value to the control
     flag or a run mode - those turn 'known answers' into values to hardcode."""
@@ -4772,6 +4793,8 @@ def validate_known_answers(lines: List[str], probe_cmd: str) -> Tuple[List[str],
             dropped.append((line, "keyed to the control flag"))
         elif _RUN_MODE_WORDS.search(text):
             dropped.append((line, "keyed to a run mode, not an input"))
+        elif conditions and any(re.search(r'(?<![a-z])' + re.escape(c) + r'(?![a-z])', low) for c in conditions):
+            dropped.append((line, "keyed to an experimental condition - that is the outcome being measured"))
         else:
             kept.append(line)
     return kept, dropped
@@ -4854,7 +4877,8 @@ def synthesize_interfaces(prompt: str, contract: str,
         if effect:
             effect = ("predicted effect (a DIRECTION to check, not a value to produce): "
                       + re.sub(r'^\s*effect:\s*', '', effect, flags=re.I))
-        known, dropped = validate_known_answers(known, probe_cmd)
+        conditions = experiment_conditions(body, probe_cmd)
+        known, dropped = validate_known_answers(known, probe_cmd, conditions)
         for line, why in dropped:
             print(f"    [!] Dropped known answer ({why}): {line.strip()[:120]}", flush=True)
         section = ("INTERFACES (planner-chosen, not stated in the user's prompt)\n"
@@ -5314,7 +5338,9 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
 
     def is_metric(name: str) -> bool:
         low = name.lower()
-        return low in metric_names or bool(_SUMMARY_KEY_RE.search(low))
+        words = set(low.split("_"))
+        return (low in metric_names or bool(_SUMMARY_KEY_RE.search(low))
+                or any(m and "_" not in m and m in words for m in metric_names))
 
     def const_number(v) -> bool:
         if isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd)):
@@ -5366,6 +5392,53 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                                 hits.append(f"{p.name}:{sub.lineno} {{'{k.value}': {ast.unparse(v)}}}")
                     elif isinstance(sub, ast.Return) and sub.value is not None and const_number(sub.value):
                         hits.append(f"{p.name}:{sub.lineno} return {ast.unparse(sub.value)}")
+    return sorted(set(hits))[:10]
+
+
+_TRIVIAL_CONSTS = {0, 1}
+
+
+def hardcoded_metric_constants(proj: Path, metric_keys: List[str]) -> List[str]:
+    """'file:line name = 0.85' for a metric set to a non-trivial numeric constant
+    inside ANY conditional branch (e.g. per experimental condition). Guards like
+    `if total == 0: fidelity = 0.0` use 0/1 and are not flagged."""
+    names = {k.lower() for k in metric_keys} | {"score"}
+
+    def is_metric(n: str) -> bool:
+        low = n.lower()
+        return low in names or bool(_SUMMARY_KEY_RE.search(low)) or any(
+            m and "_" not in m and m in set(low.split("_")) for m in names)
+
+    def nontrivial(v) -> bool:
+        if isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd)):
+            v = v.operand
+        return (isinstance(v, ast.Constant) and isinstance(v.value, (int, float))
+                and not isinstance(v.value, bool) and float(v.value) not in _TRIVIAL_CONSTS)
+
+    hits: List[str] = []
+    for p in sorted(proj.rglob("*.py")):
+        if "__pycache__" in p.parts or _is_test_file(p.name):
+            continue
+        try:
+            tree = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            for stmt in list(node.body) + list(node.orelse):
+                for sub in ast.walk(stmt):
+                    if not isinstance(sub, (ast.Assign, ast.AnnAssign)) or sub.value is None:
+                        continue
+                    v = sub.value
+                    consts = [v] if not isinstance(v, ast.IfExp) else [v.body, v.orelse]
+                    if not any(nontrivial(c) for c in consts):
+                        continue
+                    targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                    for t in targets:
+                        nm = t.id if isinstance(t, ast.Name) else (t.attr if isinstance(t, ast.Attribute) else "")
+                        if nm and is_metric(nm):
+                            hits.append(f"{p.name}:{sub.lineno} {nm} = {ast.unparse(v)[:60]}")
     return sorted(set(hits))[:10]
 
 
@@ -5442,6 +5515,8 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
         base["noisy"] = sorted(set(noisy_keys))[:8]
     measured = [k for k, _, _ in pairs if not _SUMMARY_KEY_RE.search(k)]
     hard = hardcoded_control_branches(proj, _PCMD, [k for k, _ in a])
+    if not cmd:     # the negative control itself: constant metrics defeat any control
+        hard += hardcoded_metric_constants(proj, [k for k, _ in a])
     if hard:
         return {**base, "verdict": "HARDCODED", "hardcoded": hard,
                 "detail": "the code assigns a fixed value to a reported metric when the control flag is set ("
@@ -8805,13 +8880,20 @@ def run_verdict(proj: Path, test_ctx: dict) -> dict:
                    f"reported {reported[0]}" if reported else "no score line")
             detail.append(f"RUN failed ({why})" + (f": {origins[-1][:160]}" if origins else ""))
         control = 0.0
-        if ok and _RUN_PROBE_COMMAND:
+        static_hits = []
+        mkeys = [k for k, _ in numeric_fingerprint(out or "")]
+        for a in _RUN_ABLATIONS:
+            static_hits += hardcoded_control_branches(proj, a["cmd"], mkeys)
+        static_hits += hardcoded_metric_constants(proj, mkeys)
+        if ok and static_hits:
+            detail.append(f"metrics set to constants: {'; '.join(sorted(set(static_hits))[:3])}")
+        if ok and _RUN_PROBE_COMMAND and not static_hits:
             probe = sensitivity_probe(proj, 0, test_ctx, work, out or "", work=work / "probe_work")
             verdict = (probe or {}).get("verdict", "UNCOMPARABLE")
             control = _CONTROL_VALUE.get(verdict, 0.5)
             if verdict != "RESPONSIVE":
                 detail.append(f"control {verdict}: {(probe or {}).get('detail', '')[:160]}")
-        elif ok:
+        elif ok and not static_hits:
             control = 1.0
         if dead:
             detail.append(f"not executed by RUN: {', '.join(dead)}")
@@ -9112,13 +9194,17 @@ def shortcut_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
     sets a metric from the negative-control flag. A hit is a violation and caps
     the score, so gaming the control is a losing strategy, and the reason goes
     into the attempt's log for whoever continues it."""
-    if not _RUN_PROBE_COMMAND or not node.get("files"):
+    if not (_RUN_PROBE_COMMAND or _RUN_ABLATIONS) or not node.get("files"):
         return []
     ndir = work_dir_for(run_dir) / node.get("dir", "") / node["id"]
     if not ndir.exists():
         return []
     metric_keys = [k for k, _ in numeric_fingerprint(_RUN_LAST_RUN_TEXT)] if _RUN_LAST_RUN_TEXT else []
     hits = hardcoded_control_branches(ndir, _RUN_PROBE_COMMAND, metric_keys)
+    for a in _RUN_ABLATIONS:
+        hits += hardcoded_control_branches(ndir, a["cmd"], metric_keys)
+    hits += hardcoded_metric_constants(ndir, metric_keys)
+    hits = sorted(set(hits))
     if not hits:
         return []
     msg = ("SHORTCUT: sets a metric from the negative-control flag instead of measuring it ("
