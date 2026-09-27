@@ -7326,7 +7326,8 @@ def _owners_by_file_uncached(run_dir: Path) -> Dict[str, str]:
     return {d: roster[i]["id"] for d, i in idx.items() if i is not None and i < len(roster)}
 
 
-def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str, str]]:
+def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
+                       insensitive: bool = False) -> List[Tuple[str, str]]:
     """Follow the negative-control flag from the entry file through local calls
     and report the exact place it stops: parsed but never passed on, passed to a
     function without a matching parameter, or received but never used.
@@ -7389,6 +7390,72 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str
             return (mods[f.value.id], f.attr)
         return None
 
+    def class_method(stem: str, scope, call: ast.Call):
+        """sim.method(...) where sim = LocalClass(...) (class imported or defined locally)."""
+        f = call.func
+        if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)):
+            return None
+        var = f.value.id
+        cls_name = None
+        for n in ast.walk(scope):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) \
+                    and any(isinstance(t, ast.Name) and t.id == var for t in n.targets):
+                cls_name = n.value.func.id
+        if not cls_name:
+            return None
+        where = None
+        for n in ast.walk(trees[stem]):
+            if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in trees and \
+                    any((a.asname or a.name) == cls_name for a in n.names):
+                where = (n.module, next(a.name for a in n.names if (a.asname or a.name) == cls_name))
+        if where is None and any(isinstance(c, ast.ClassDef) and c.name == cls_name for c in trees[stem].body):
+            where = (stem, cls_name)
+        if where is None:
+            return None
+        mod, cname = where
+        for c in trees[mod].body:
+            if isinstance(c, ast.ClassDef) and c.name == cname:
+                for m in c.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name == f.attr:
+                        return mod, f"{cname}.{m.name}", m, True
+        return None
+
+    def resolve(stem: str, scope, call: ast.Call):
+        tgt = local_target(stem, call)
+        if tgt and tgt[0] in trees:
+            fn2 = funcs_of(tgt[0]).get(tgt[1])
+            if fn2 is not None:
+                return tgt[0], tgt[1], fn2, False
+        return class_method(stem, scope, call)
+
+    def _consumer_chain_impl(stem: str, scope, call: ast.Call, names: Set[str], depth: int):
+        r = resolve(stem, scope, call)
+        if r is None or depth > 4:
+            return []
+        mod, qual, fdef, is_method = r
+        params = [a.arg for a in fdef.args.posonlyargs + fdef.args.args + fdef.args.kwonlyargs]
+        if is_method and params and params[0] in ("self", "cls"):
+            params = params[1:]
+        received = set()
+        for i, a in enumerate(call.args):
+            if any(isinstance(x, ast.Name) and x.id in names for x in ast.walk(a)) and i < len(params):
+                received.add(params[i])
+        for k in call.keywords:
+            if k.arg in params and any(isinstance(x, ast.Name) and x.id in names for x in ast.walk(k.value)):
+                received.add(k.arg)
+        hop = [(mod, qual, fdef.lineno)]
+        if not received:
+            return hop
+        for inner in [c for c in ast.walk(fdef) if isinstance(c, ast.Call)]:
+            if any(isinstance(x, ast.Name) and x.id in received
+                   for a in list(inner.args) + [k.value for k in inner.keywords] for x in ast.walk(a)):
+                deeper = _consumer_chain_impl(mod, fdef, inner, received, depth + 1)
+                if deeper:
+                    return hop + deeper
+        return hop
+
+    nonlocal_chain = {"f": _consumer_chain_impl}
+
     out: List[Tuple[str, str]] = []
     reached = {"outside": False}
     local_use: List[str] = []
@@ -7436,6 +7503,53 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str) -> List[Tuple[str
                                                 f"metric's reference follows the corruption, so the control cancels "
                                                 f"itself. Keep the reference the ORIGINAL intended state and let the "
                                                 f"flag break only the process."))
+                if used and mstem != estem and insensitive:
+                    # Wired, yet the numbers did not move: find what the flag changes
+                    # and who receives it next - that consumer ignores its input.
+                    changed = set()
+                    for node in ast.walk(fn):
+                        cond = None
+                        if isinstance(node, ast.If):
+                            cond = node.test
+                            body_nodes = node.body + node.orelse
+                        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.IfExp):
+                            cond = node.value.test
+                            body_nodes = [node]
+                        if cond is None or not any(isinstance(x, ast.Name) and x.id == prm for x in ast.walk(cond)):
+                            continue
+                        for bn in body_nodes:
+                            for x in ast.walk(bn):
+                                if isinstance(x, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                                    tg = x.targets if isinstance(x, ast.Assign) else [x.target]
+                                    for t in tg:
+                                        base = t
+                                        while isinstance(base, (ast.Subscript, ast.Attribute)):
+                                            base = base.value
+                                        if isinstance(base, ast.Name):
+                                            changed.add(base.id)
+                                elif isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and \
+                                        isinstance(x.func.value, ast.Name) and \
+                                        x.func.attr in ("insert", "append", "extend", "pop", "remove", "reverse",
+                                                        "update", "clear", "__setitem__"):
+                                    changed.add(x.func.value.id)
+                    for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
+                        if not changed or not any(isinstance(x, ast.Name) and x.id in changed
+                                                  for a in list(call.args) + [k.value for k in call.keywords]
+                                                  for x in ast.walk(a)):
+                            continue
+                        hops = nonlocal_chain["f"](mstem, fn, call, changed, 0)
+                        if not hops:
+                            continue
+                        deep_mod, deep_name, deep_line = hops[-1]
+                        if deep_mod in (mstem, estem):
+                            continue
+                        chain = " -> ".join(f"{m}.{n}()" for m, n, _ in hops)
+                        out.append((f"{deep_mod}.py",
+                                    f"Under the negative control {mstem}.py:{call.lineno} passes a CHANGED "
+                                    f"`{', '.join(sorted(changed))}` along {chain}, yet the run's numbers did not "
+                                    f"move: {deep_mod}.{deep_name}() ({deep_mod}.py:{deep_line}) appears to ignore "
+                                    f"its input (e.g. returns a fixed, ideal or precomputed result). It must "
+                                    f"compute its output FROM the input it receives."))
                 if used and mstem != estem:
                     reached["outside"] = True
                 elif used:
@@ -7538,7 +7652,8 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
     probe = res.get("probe") or {}
     if res.get("ok") and probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY", "PROBE FAILED", None) \
             and _RUN_PROBE_COMMAND and len(_RUN_COMMAND.split()) > 1:
-        for path, msg in trace_control_flag(proj, _RUN_COMMAND.split()[1], _RUN_PROBE_COMMAND):
+        for path, msg in trace_control_flag(proj, _RUN_COMMAND.split()[1], _RUN_PROBE_COMMAND,
+                                            insensitive=probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY")):
             add(path, msg)
     # Only a SUCCESSFUL run says anything about which modules take part: after a
     # crash, everything past the crash point "never ran".
