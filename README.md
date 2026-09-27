@@ -2,13 +2,13 @@
 
 **A fully local, multi-tier agentic research pipeline**
 
-`ThereminQ-Autoresearch` ingests a prompt, a document or a whole Git repository. It decomposes the work into atomic assignments and runs them on a swarm of locally hosted, quantized LLMs (GGUF via `llama.cpp`, Vulkan backend). The output is a tested, distilled list of actionable tasks. By default nothing leaves the machine: every tier is an OpenAI-compatible endpoint you host yourself. The one opt-in exception is the Gemini gateway in `9-misc/` (section 7). It lets the Google Gemini API stand in for the apex tier.
+`ThereminQ-Autoresearch` ingests a prompt, a document or a whole Git repository. It decomposes the work into atomic assignments and runs them on a swarm of locally hosted, quantized LLMs (GGUF via `llama.cpp`, Vulkan backend). The output is a tested, integrated and *run* project with a grounded write-up, plus a distilled list of actionable tasks. By default nothing leaves the machine: every tier is an OpenAI-compatible endpoint you host yourself. The one opt-in exception is the Gemini gateway in `9-misc/` (section 7). It lets the Google Gemini API stand in for any tier, and is used for hardening runs with fast, error-prone hosted models.
 
 The repository contains two self-contained pipeline scripts at its root. It also holds the infrastructure, helper tools and MCP servers around them, in numbered folders.
 
 | Script | Architecture | Status |
 |---|---|---|
-| `autoresearch-rsi-onefile.py` | Two tiers (Apex + Workers), mechanical consolidation, recursive self-improvement of the exploration policy (Dream-RSI) | Current direction |
+| `autoresearch-rsi-onefile.py` | Two tiers (Apex + Workers), mechanical consolidation, recursive self-improvement of the exploration policy (Dream-RSI), plus a verification and hardening layer (grounded runs, negative controls, shortcut detection, routed findings, cross-round iteration) | Current direction |
 | `autoresearch-core-onefile.py` | Three tiers (Apex + Stitchers + Workers), model-driven map-reduce with per-chunk polishing | Original pipeline |
 
 Detailed documentation lives in [`HOWTO-autoresearch-rsi-onefile.md`](HOWTO-autoresearch-rsi-onefile.md) (also as [PDF](HOWTO-autoresearch-rsi-onefile.pdf)) and [`HOWTO-autoresearch-core-onefile.md`](HOWTO-autoresearch-core-onefile.md). [`methodology_report.md`](methodology_report.md) is a generated write-up of the original three-tier design.
@@ -22,7 +22,7 @@ Detailed documentation lives in [`HOWTO-autoresearch-rsi-onefile.md`](HOWTO-auto
 | `autoresearch-rsi-onefile.py` | RSI pipeline (see below) |
 | `autoresearch-core-onefile.py` | Core three-tier pipeline (see below) |
 | `docker-compose.yaml` | Example container stack: VDI workspace, orchestrator node and two 9B worker nodes (`twobombs/thereminq-tensors:jupyter`) |
-| `0-build/` | `build_llamas.sh` builds `llama.cpp` with Vulkan and makes per-role copies. `fetch_llamas.sh` downloads the GGUF models. `GITS-SAC.sh` starts an in-container apex model on port 9931 |
+| `0-build/` | `build_llamas.sh` builds `llama.cpp` with Vulkan and makes per-role copies. `fetch_llamas.sh` downloads the GGUF models. `GITS-SAC.sh` starts an in-container apex model on port 9931 (the RSI script now expects the apex on 9933: set `OPENAI_API_BASE` or change the port) |
 | `1-runinfra/` | Launch scripts for the inference tiers: the full six-GPU swarm (`start-zerg-all.sh`), the worker swarm, VRAM-aware tier launcher (`launch-build-tiers.sh`), single-model launchers (2B/4B/9B/27B, Qwen-Next, GLM) |
 | `2-startcore/` | The earlier split-file version of the core pipeline: generate → distill → agentic workflow → post-processing |
 | `3-agilengine/` | Standalone unit-test generation, TODO distillation and a daily agentic "agile" report |
@@ -37,40 +37,56 @@ Detailed documentation lives in [`HOWTO-autoresearch-rsi-onefile.md`](HOWTO-auto
 
 This script implements recursive self-improvement at the **exploration layer**, following Dream-RSI (Zheng et al., 2026). The models, the evaluator and the execution interfaces stay fixed. Only the exploration policy, the code that decides which agent assignments to run next, is improved from round to round.
 
+Around that loop sits a **verification and hardening layer** that makes the evaluator hard to fool. Its principle: *a number counts only if the project actually runs, its metrics respond to a negative control by measurement, and the write-up quotes only what the run printed.* The layer was built by running the pipeline against fast, error-prone models and closing every gap their failures exposed; [HOWTO §17](HOWTO-autoresearch-rsi-onefile.md#17-verification-and-hardening-layer) describes it and [§18](HOWTO-autoresearch-rsi-onefile.md#18-change-log-since-the-paper-aligned-release) lists each change with the failure that motivated it.
+
 ### Tiers
 
 | Tier | Default endpoint | Used for |
 |---|---|---|
-| **Apex** | `http://localhost:9931/v1` | Phase 1 generation, Phase 2 distillation, Phase 3 partitioning, offline policy development ("dreaming"), Phase 6 distillation. Single slot, strictly serial |
-| **Workers** | `http://localhost:8030/v1` … `:8035/v1` | Every agent assignment, Phase 0 repository map-reduce, evaluator test generation |
+| **Apex** | `http://localhost:9933/v1` | Phase 1 generation, Phase 2 distillation, contract and interface synthesis, Phase 3 partitioning, offline policy development ("dreaming"), skeptic review, Phase 6 distillation. Single slot, strictly serial |
+| **Workers** | `http://localhost:9931/v1`, `http://localhost:9932/v1` (at least 2 required) | Every agent assignment, Phase 0 repository map-reduce, evaluator test generation, rebuttal round, final write-up refresh |
 
 There is **no stitcher tier**. No model merges the outputs of multiple agents. Consolidation is mechanical: a filesystem walk plus content hashing, written to `RECONCILE.md`.
 
 ### Phases
 
 - **Phase 0 – Git intake** (`-g`, workers). Clones the repository and map-reduces its files into an intake document within size caps.
-- **Phase 1 – Generation** (`-p`/`-f`, apex). Writes the raw document from the prompt.
+- **Phase 1 – Generation** (`-p`/`-f`, apex). Writes a raw background document from the prompt (non-binding).
 - **Phase 2 – Distillation** (apex). Turns the raw document into actionable tasks and explicit requirements.
-- **Phase 3 – Partition and rounds.** The apex splits the work into disjoint assignments (`comms/roster.json`). Each round:
-  - **Online rollout:** the current policy selects batches of assignments for the workers.
-  - **Scoring:** a fixed evaluator scores every attempt once.
-  - **Dreaming:** new policy versions are written offline and replayed over the recorded discovery trees, at zero agent-call cost. The best version becomes the next round's policy.
+- **Contract forge** (apex). Uses pinned sections of the prompt, or synthesizes DELIVERABLES and CONSTRAINTS from the prompt text only. The planner adds a shared API (INTERFACES with pinned value vocabularies and key formats), a RUN command, a negative control (PROBE), ablations and validated KNOWN ANSWERS. Saved as `CONTRACT.md`; the original prompt goes verbatim to every agent.
+- **Container discovery.** Installed Python modules, the real APIs of the libraries in use, and compute devices (OpenCL, Vulkan, PyQrack) are scanned before every round. Nothing is configured: install a package and the next scan picks it up. Imports the container cannot satisfy reject the attempt.
+- **Phase 3 – Partition and rounds.** The apex splits the work into disjoint assignments (`comms/roster.json`). Each round (default 3 rounds of 15 agent calls):
+  - **Online rollout:** the current policy selects batches of assignments for the workers. From round 2 on, each assignment's first attempt *continues its best earlier attempt* with that attempt's evaluation, instead of starting over; dead lines of work are pruned.
+  - **Scoring:** a fixed evaluator scores every attempt once (below).
+  - **Grounding:** the integrated project is run; the negative control and ablations are run and compared with a noise floor; exception origins and executed functions are recorded; the public API is frozen for the next round.
+  - **Routing:** project-level failures (a crash, a control flag that stops somewhere, a simulator that ignores its input, a module nothing calls, tests that cannot fail) are sent to the assignment that must change a file.
+  - **Dreaming:** new policy versions are written offline and replayed over the recorded discovery trees, at zero agent-call cost. The best version becomes the next round's policy. The best dreamed policy is also inherited by the next run.
+- **Final stages.** A skeptic review of the final run's metrics, a short rebuttal round that acts on its findings, and a write-up refresh against the final run (every quoted number is checked).
 - **Phase 5 – Test telemetry.** Per-round and cumulative execution reports (`reports/`).
 - **Phase 6 – Project distillation** (apex). Combines intake, test telemetry and reconciliation into `DISTILLED_TASKS.md`.
+- **Token accounting.** Every model call is recorded (`tokens.jsonl`); the run ends with a per-category table of tokens, runtime and tok/s (`TOKENS.md`).
 
 **Scope isolation.** Every agent writes only into its own working directory. Cross-agent writes are quarantined as violations. Agents see each other through a shared comms map and record hand-offs there, instead of inventing another agent's output.
 
 **Fixed evaluator.** Each attempt's score is final once assigned:
 
 ```
-score = 0.6 × heuristic + 0.4 × unit-test pass rate
+file-level = 0.6 × heuristic + 0.4 × unit-test pass rate
+q          = weighted mean of whole-project checks:
+             coverage, compile, import, pytest, and the run group
+             (project runs, control responds, required modules executed)
+score      = 0.5 × file-level + 0.5 × (0.5 × q + 0.5 × own contribution to q)
 ```
 
 - **Heuristic:** rewards status, deliverables on disk, log depth and novelty, and penalizes ownership violations and truncation.
 - **Pass rate:** comes from tests generated and executed for the attempt's deliverables.
-- **Weights:** the mix is set by `EVAL_HEURISTIC_MIX` and the individual heuristic weights by `EVAL_W_*`.
+- **Own contribution:** whole-project q with this attempt minus q with the assignment's previous best, so one shared bug no longer flattens every score.
+- **Gates:** an import the container lacks scores 0; a metric set from a control flag or to a constant caps the score at 0.2; calling library members that do not exist, or with the wrong arguments, caps it at 0.3.
+- **Weights:** `EVAL_HEURISTIC_MIX`, `EVAL_INTEGRATION_MIX`, `EVAL_CREDIT_MIX`, `EVAL_W_*` and the caps are all configurable.
 
-**Test sandbox.** Phase 5 tests run in a per-run virtual environment (`tests/.venv`, `--system-site-packages`). Packages are installed from binary wheels only, with resource limits applied.
+**Test sandbox.** Phase 5 tests and all project runs use a per-run virtual environment (`tests/.venv`, `--system-site-packages`) with resource limits; packages are installed from binary wheels only, and only if the container already has them.
+
+**Transport resilience.** Sampling penalties an endpoint rejects are dropped automatically; transient upstream errors (429/5xx, "high demand") are retried with backoff; stalled unit-test generation is retried on another worker endpoint.
 
 ---
 
@@ -105,7 +121,7 @@ This is the original three-tier pipeline. It uses a dedicated stitcher tier for 
 ## 3. Requirements
 
 - Linux (POSIX process groups and `ulimit` are used by the test runner and policy sandbox)
-- Python ≥ 3.9 with `openai` and `requests`; `pytest` for Python tests
+- Python ≥ 3.9 with `openai` and `requests`; `pytest` for Python tests. Python ≥ 3.12 is recommended for the RSI script: the grounding run records exception origins and executed functions with `sys.monitoring`, which older versions skip
 - `git` on `PATH` (for `-g`)
 - `gcc`/`g++` and `bash` (Phase 5 C/C++ and shell tests)
 - One or more `llama-server` instances (or any OpenAI-compatible server) serving GGUF models. See `0-build/` and `1-runinfra/`.
@@ -132,10 +148,10 @@ All endpoints and models can be overridden through environment variables. The tw
 
 | Variable | RSI default | Core default |
 |---|---|---|
-| `OPENAI_API_BASE` (apex) | `http://localhost:9931/v1` | `http://localhost:8081/v1` |
+| `OPENAI_API_BASE` (apex) | `http://localhost:9933/v1` | `http://localhost:8081/v1` |
 | `LLM_MODEL` (apex) | `Qwen3.8-Flash-Next-UD-IQ4_XS` | `Qwen3.6-27B-UD-IQ3_XXS.gguf` |
 | `DISTILLER_URL` / `DISTILLER_MODEL` | same as apex | same as apex |
-| `WORKER_ENDPOINTS` | `:8030` … `:8035` | *not read — edit `WORKER_ENDPOINTS` in the source* (`:8033`, `:8034`) |
+| `WORKER_ENDPOINTS` | `:9931`, `:9932` (minimum `MIN_WORKER_ENDPOINTS` = 2) | *not read — edit `WORKER_ENDPOINTS` in the source* (`:8033`, `:8034`) |
 | `WORKER_MODEL` | `Qwen3.8-9B-Q4_K_M.gguf` | `Qwen3.5-9B-IQ4_XS.gguf` |
 | `STITCHER_ENDPOINTS` / `STITCHER_MODEL` | — | `:8070`, `:8071` / `gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf` |
 
@@ -152,12 +168,23 @@ Both scripts verify these against the servers at startup.
 Example for the RSI script:
 
 ```bash
-export OPENAI_API_BASE="http://localhost:9931/v1"
+export OPENAI_API_BASE="http://localhost:9933/v1"
 export LLM_MODEL="Qwen3.8-Flash-Next-UD-IQ4_XS"
-export WORKER_ENDPOINTS="http://localhost:8030/v1,http://localhost:8031/v1"
+export WORKER_ENDPOINTS="http://localhost:9931/v1,http://localhost:9932/v1"
 ```
 
-The full list of variables (evaluator weights, RSI budgets, sandbox limits) is in the HOWTO documents.
+Frequently used RSI settings:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RSI_ROUNDS` / `ROUND_BUDGET` | `3` / `15` | Rounds per run; agent calls per round |
+| `CARRY_FORWARD` / `LINEAGE_PATIENCE` | `1` / `2` | Continue each assignment's best attempt across rounds; abandon a line of work after 2 continuations without improvement |
+| `INHERIT_POLICY` | `1` | Start from the newest dream-selected policy of an earlier run |
+| `REBUTTAL_CALLS` | `4` | Agent calls for acting on the final skeptic review (`0` disables) |
+| `ENFORCE_RUN_IN_INTEGRATION` | `1` | Run the project and its negative control inside every attempt's integration check |
+| `TEST_STALL_SECS` / `TRANSIENT_RETRIES` | `20` / `4` | Stall timeout for test generation; retries of transient upstream errors |
+
+The full list of variables (evaluator weights, RSI budgets, contract and verification switches, sandbox limits) is in the HOWTO documents.
 
 ---
 
@@ -179,8 +206,11 @@ RSI-only arguments:
 
 | Argument | Meaning |
 |---|---|
-| `-n ROUNDS` | Recursive rounds (default 1, max 12) |
-| `--budget N` | Agent calls per round (default scales with the roster) |
+| `-n ROUNDS` | Recursive rounds (default 3, max 12) |
+| `--budget N` | Agent calls per round (default 15; `ROUND_BUDGET_PER_TASK` scales it with the roster instead) |
+| `--seed-from latest\|RUN_DIR` | Continue an earlier run's final project instead of rewriting it |
+| `--force-dream` | Run policy revisions even when replay shows too little headroom |
+| `--integration-cmd CMD` | Extra command run in every assembled project (its `"score"` line is parsed) |
 | `--no-dream` | Skip policy improvement: fixed-exploration control |
 | `--dream-only` | Run no agents; dream over the recorded trees and write the next policy (requires `-r`) |
 | `--semantic-guidance` | Inject directional guidance into agent prompts (off by default) |
@@ -198,8 +228,11 @@ Examples:
 # Core pipeline over a repository
 python3 autoresearch-core-onefile.py -g https://github.com/user/target-repo.git
 
-# RSI pipeline, three recursive rounds
-python3 autoresearch-rsi-onefile.py -p "Develop a fully concurrent web crawler" -n 3
+# RSI pipeline, default three rounds of 15 agent calls
+python3 autoresearch-rsi-onefile.py -f 8-workdir/testprompt.txt
+
+# RSI pipeline continuing the previous run's final project
+python3 autoresearch-rsi-onefile.py -f 8-workdir/testprompt.txt --seed-from latest
 
 # Offline dreaming over the most recent RSI run (only the apex tier needs to be up)
 python3 autoresearch-rsi-onefile.py -r --dream-only
@@ -214,11 +247,17 @@ Each run writes to `DIR/CATEGORY/run_<timestamp>_<id>/`, which contains:
 
 RSI runs also contain:
 
+- `CONTRACT.md` (pinned or synthesized contract)
 - `work/` (per-agent deliverables)
-- `comms/` (roster and comms map)
+- `comms/` (roster, comms map, event log)
+- `env/` (container scans and library API facts per round)
+- `integration/` (integrated project per round, run output with control and ablations, frozen API, routed findings, final review; `integration/latest/` holds the final deliverables)
 - `trees/` (discovery trees)
 - `policy/` (policy versions)
 - `dream/` (replay scores)
+- `tokens.jsonl`, `TOKENS.md` (token, runtime and throughput accounting)
+
+Where to look first after a run: `integration/roundNN_run.md` (does it run, does the control respond, what never executed), `integration/roundNN_routed.json`, `integration/final_review.md`, then `TOKENS.md`.
 
 ---
 
@@ -236,11 +275,11 @@ Its ports do not match either script's defaults. When running a pipeline against
 
 ---
 
-## 7. Optional: Gemini as the apex tier (`9-misc/openai2gemini.py`)
+## 7. Optional: Gemini as a tier (`9-misc/openai2gemini.py`)
 
-`openai2gemini.py` is a single-file gateway that exposes an OpenAI-compatible API and routes it to the Google Gemini API. It serves `/v1/chat/completions` (streaming and non-streaming), `/v1/embeddings` and `/v1/models`. Its default port is **9931**, the same as the RSI apex tier, so it can replace a local apex model without changing the pipeline configuration.
+`openai2gemini.py` is a single-file gateway that exposes an OpenAI-compatible API and routes it to the Google Gemini API. It serves `/v1/chat/completions` (streaming and non-streaming), `/v1/embeddings` and `/v1/models`. Its default port is **9931** (the first RSI worker port). Run one instance per port to replace any tier: the RSI defaults are 9933 for the apex and 9931/9932 for the workers. The hardening runs point all three ports at gateway instances for a fast, cheap model, whose failures are the test data.
 
-**Using this gateway sends every apex request to Google.** That covers the raw document, the distillation input, Phase 3 planning, the dreaming traces and the Phase 6 inputs, including ingested repository content. The worker tier stays local.
+**Using this gateway sends every request of the tiers it replaces to Google.** For the apex that covers the raw document, the distillation input, contract synthesis, Phase 3 planning, the dreaming traces, the review and the Phase 6 inputs, including ingested repository content. For the workers it covers every agent prompt, including the project's code.
 
 ### Running it
 
@@ -255,15 +294,14 @@ python3 9-misc/openai2gemini.py --print-config > gateway.yaml   # optional annot
 python3 9-misc/openai2gemini.py -c gateway.yaml
 ```
 
-Then point the RSI pipeline's apex tier at it:
+To replace all three tiers, start one instance per port (every config key is also an environment variable `GW_<KEY>`):
 
 ```bash
-export OPENAI_API_BASE="http://localhost:9931/v1"
-export DISTILLER_URL="http://localhost:9931/v1"
-python3 autoresearch-rsi-onefile.py -p "..." -n 3
+for p in 9931 9932 9933; do GW_LISTEN_PORT=$p python3 9-misc/openai2gemini.py & done
+python3 autoresearch-rsi-onefile.py -f 8-workdir/testprompt.txt
 ```
 
-Do not run a local apex `llama-server` on port 9931 on the same host at the same time.
+To replace only the apex, run a single instance with `GW_LISTEN_PORT=9933` and keep local `llama-server` workers on 9931 and 9932. Do not run a local `llama-server` and a gateway on the same port at the same time. If the gateway's `force_model` names a model the upstream does not have, the pipeline's start-up smoke test stops the run within seconds.
 
 ### Behaviour worth knowing
 
@@ -275,7 +313,8 @@ Do not run a local apex `llama-server` on port 9931 on the same host at the same
 | Rate limits | Upstream 429/503 responses are waited out using Gemini's requested delay, up to `retry_max_attempts` (5) and `retry_max_wait` (120 s). Longer waits, such as an exhausted daily quota, go back to the client with `Retry-After`. The pipeline's apex client timeout (`WORKER_TIMEOUT_SECS`, default 300 s) must exceed this wait |
 | Outbound network | `outbound_proxy` / `proxy_http` / `proxy_https` (HTTP or SOCKS5), `no_proxy`, `trust_env`, custom CA bundle via `verify_tls`. Upstream redirects are never followed, so the API key cannot be forwarded to another host |
 | Remote media | `http(s)` `image_url` parts are fetched by the gateway, with a size cap and a public-address check (`media_block_private_hosts`). Disable with `fetch_remote_media: false` if untrusted clients can reach it |
-| Server-geometry check | The gateway has no llama.cpp `/props` endpoint, so the pipeline's apex context check cannot verify it. `APEX_SERVER_CTX` still sets the apex budgets |
+| Server-geometry check | The gateway has no llama.cpp `/props` endpoint, so the pipeline's context check cannot verify it. `APEX_SERVER_CTX` / `WORKER_SERVER_CTX` still set the budgets |
+| Sampling penalties | Some models reject `frequency_penalty` / `presence_penalty` (HTTP 400). The pipeline drops them automatically for that endpoint and retries |
 | Health | `GET /health` reports mode, upstream and whether a key is configured |
 
 Every config key can also be set as an environment variable `GW_<KEY>`, for example `GW_FORCE_MODEL`, `GW_CLIENT_API_KEYS` or `GW_OUTBOUND_PROXY`. The script's docstring documents all options.
@@ -286,13 +325,15 @@ Every config key can also be set as an environment variable `GW_<KEY>`, for exam
 
 - **MetaGPT** (Hong et al., 2023): multi-agent collaboration under standard operating procedures. ThereminQ likewise uses fixed roles and structured hand-offs.
 - **AutoGen** (Wu et al., 2023): conversational multi-agent applications. ThereminQ replaces conversational iteration with asynchronous, scope-isolated assignments and mechanical reconciliation.
-- **Dream-RSI** (Zheng et al., 2026): recursive self-improvement of the exploration policy by replaying recorded discovery histories. `autoresearch-rsi-onefile.py` implements this method. Its off-policy support probes are an extension that is not part of the paper.
+- **Dream-RSI** (Zheng et al., 2026): recursive self-improvement of the exploration policy by replaying recorded discovery histories. `autoresearch-rsi-onefile.py` implements this method. Its off-policy support probes, carry-forward roots, dream safeguards and cross-run policy inheritance are extensions that are not part of the paper.
+- **ScientistTwo** (Nam et al., 2026): an autonomous research agent with idea evaluation, ablations and a simulated review–rebuttal loop. The RSI pipeline adopts, at small scale, its per-line-of-work verdicts with pruning, strict-improvement updates, ablations as component checks, a review-driven rebuttal round and iterative expansion from a previous result.
 
 ## References
 
 1. Hong, S., et al. (2023). MetaGPT: Meta Programming for A Multi-Agent Collaborative Framework. *arXiv:2308.00352*. <http://arxiv.org/abs/2308.00352>
 2. Wu, Q., et al. (2023). AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation. *arXiv:2308.08155*. <http://arxiv.org/abs/2308.08155>
 3. Zheng, T., et al. (2026). Dream-RSI: Recursive Self-Improvement through Evolving Worlds. *arXiv:2609.14858*. <http://arxiv.org/abs/2609.14858>
+4. Nam, J., et al. (2026). ScientistTwo: Pioneering the Human Knowledge Frontier with Autonomous AI. *arXiv:2609.19644*. <http://arxiv.org/abs/2609.19644>
 
 ## License
 
