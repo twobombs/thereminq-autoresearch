@@ -4713,8 +4713,9 @@ _PROMPT_INTERFACES_SYNTH = (
     "product state, flip the input WITHOUT telling the metric), while every metric keeps comparing "
     "against the ORIGINAL intended reference. A control that changes the reference together with "
     "the input cancels itself and measures nothing.\n"
-    "- FLAGS ARE BARE SWITCHES: PROBE and ABLATION commands use bare flags (`python3 runner.py "
-    "--corrupt`), parsed with argparse action='store_true'. Never write `--flag True`.\n"
+    "- FLAGS ARE BARE SWITCHES: PROBE and ABLATION commands use bare, hyphenated flags "
+    "(`python3 runner.py --ablate-coupling`), parsed with argparse action='store_true' (argparse "
+    "maps them to ablate_coupling). Never write `--flag True` or underscores in flag names.\n"
     "- PIN MEASUREMENT KEY FORMATS: any dict of counts or probabilities states its keys exactly, "
     "e.g. `dict[str, int]  # keys: bitstrings of length qubit_count, character i = qubit i "
     "(qubit 0 leftmost)`. A function returning a single-qubit marginal says so ('0'/'1' keys).\n"
@@ -4950,6 +4951,8 @@ def _bare_flags(cmd: str) -> str:
     while i < len(toks):
         t = toks[i]
         nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t.startswith("--"):
+            t = "--" + t[2:].split("=")[0].replace("_", "-") + (("=" + t.split("=", 1)[1]) if "=" in t else "")
         if t.startswith("--") and nxt.lower() in ("true", "false", "1", "0", "yes", "no"):
             if nxt.lower() in ("true", "1", "yes"):
                 out.append(t.split("=")[0])
@@ -5340,15 +5343,22 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                 continue
             for stmt in list(node.body) + list(node.orelse):
                 for sub in ast.walk(stmt):
-                    if isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and const_number(sub.value):
+                    if isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and sub.value is not None:
+                        # A metric assigned inside a branch on the flag is computed
+                        # differently under the control - a constant, a cap like
+                        # min(x, 0.25), a scale like x * 0.5: all forbidden.
                         targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
                         for t in targets:
                             name = (t.id if isinstance(t, ast.Name) else
                                     t.attr if isinstance(t, ast.Attribute) else
                                     t.slice.value if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
                                     and isinstance(t.slice.value, str) else "")
-                            if name and is_metric(name):
-                                hits.append(f"{p.name}:{sub.lineno} {name} = {ast.unparse(sub.value)}")
+                            if name and is_metric(name) and (
+                                    const_number(sub.value) or isinstance(sub, ast.AugAssign) or any(
+                                        isinstance(x, ast.Constant) and isinstance(x.value, (int, float))
+                                        and not isinstance(x.value, bool) for x in ast.walk(sub.value))
+                                    or any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(sub.value))):
+                                hits.append(f"{p.name}:{sub.lineno} {name} = {ast.unparse(sub.value)[:60]}")
                     elif isinstance(sub, ast.Dict):
                         for k, v in zip(sub.keys, sub.values):
                             if isinstance(k, ast.Constant) and isinstance(k.value, str) and is_metric(k.value) \
@@ -5704,7 +5714,9 @@ if _path and _root != os.sep and hasattr(sys, "monitoring"):
         if not fn.startswith("<"):
             rp = os.path.realpath(fn)
             if rp.startswith(_root):
-                _ran.add(os.path.relpath(rp, _root))
+                rel = os.path.relpath(rp, _root)
+                _ran.add(rel)
+                _ran.add(rel + "::" + getattr(code, "co_qualname", code.co_name))
         return _M.DISABLE   # one event per code object is enough
     if _tid is not None:
         _M.register_callback(_tid, _M.events.RAISE, lambda c, o, e: _rec("raise", c, e))
@@ -5775,7 +5787,16 @@ def executed_files(log: Path) -> Optional[List[str]]:
         data = json.loads(read_file_content_safe(log) or "null")
     except json.JSONDecodeError:
         return None
-    return sorted(data.get("executed", [])) if isinstance(data, dict) else None
+    return sorted(x for x in data.get("executed", []) if "::" not in x) if isinstance(data, dict) else None
+
+
+def executed_functions(log: Path) -> List[str]:
+    """'file.py::Class.method' for every project function that ran."""
+    try:
+        data = json.loads(read_file_content_safe(log) or "null")
+    except json.JSONDecodeError:
+        return []
+    return sorted(x for x in data.get("executed", []) if "::" in x) if isinstance(data, dict) else []
 
 
 def unexecuted_deliverables(executed: Optional[List[str]]) -> List[str]:
@@ -5922,6 +5943,7 @@ def grounding_run(proj: Path, rnd: int, test_ctx: dict, run_dir: Path) -> Option
     res = {"round": rnd, "command": _RUN_COMMAND, "ok": ok, "rc": rc, "timed_out": to,
            "score": score, "reported_errors": reported_errors, "status": status,
            "exception_origins": origins, "not_executed": dead, "executed": ran or [],
+           "executed_functions": executed_functions(raise_log),
            "elapsed": round(elapsed, 2), "produced": produced, "probe": probe,
            "ablations": [{k: v for k, v in r.items() if k != "output_tail"} for r in ablation_results]}
     with open(idir / f"round{rnd:02d}_run.json", "w", encoding="ascii") as f:
@@ -7327,7 +7349,8 @@ def _owners_by_file_uncached(run_dir: Path) -> Dict[str, str]:
 
 
 def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
-                       insensitive: bool = False) -> List[Tuple[str, str]]:
+                       insensitive: bool = False,
+                       executed_fns: Optional[Set[str]] = None) -> List[Tuple[str, str]]:
     """Follow the negative-control flag from the entry file through local calls
     and report the exact place it stops: parsed but never passed on, passed to a
     function without a matching parameter, or received but never used.
@@ -7396,19 +7419,44 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
         if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)):
             return None
         var = f.value.id
-        cls_name = None
+        cands = []
         for n in ast.walk(scope):
-            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) \
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) \
                     and any(isinstance(t, ast.Name) and t.id == var for t in n.targets):
-                cls_name = n.value.func.id
-        if not cls_name:
+                fn_ = n.value.func
+                if isinstance(fn_, ast.Name):
+                    cands.append((fn_.id, None))
+                elif isinstance(fn_, ast.Attribute) and isinstance(fn_.value, ast.Name):
+                    cands.append((fn_.attr, fn_.value.id))           # sim = reference.RefSimulator()
+        if not cands:
             return None
+        resolved = [r for r in (resolve_class(stem, c, m, f.attr) for c, m in cands) if r]
+        if not resolved:
+            return None
+        if executed_fns:
+            # Several backends assigned to the same name: follow the one that actually ran.
+            ran = [r for r in resolved if f"{r[0]}.py::{r[1]}" in executed_fns]
+            if ran:
+                return ran[0]
+        return resolved[-1]
+
+    def resolve_class(stem: str, cls_name: str, via_mod: Optional[str], meth: str):
         where = None
+        if via_mod:
+            mods_alias = {}
+            for n in ast.walk(trees[stem]):
+                if isinstance(n, ast.Import):
+                    for a in n.names:
+                        if a.name in trees:
+                            mods_alias[a.asname or a.name] = a.name
+            if via_mod in mods_alias:
+                where = (mods_alias[via_mod], cls_name)
         for n in ast.walk(trees[stem]):
-            if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in trees and \
-                    any((a.asname or a.name) == cls_name for a in n.names):
+            if where is None and not via_mod and isinstance(n, ast.ImportFrom) and n.level == 0 \
+                    and n.module in trees and any((a.asname or a.name) == cls_name for a in n.names):
                 where = (n.module, next(a.name for a in n.names if (a.asname or a.name) == cls_name))
-        if where is None and any(isinstance(c, ast.ClassDef) and c.name == cls_name for c in trees[stem].body):
+        if where is None and not via_mod and any(isinstance(c, ast.ClassDef) and c.name == cls_name
+                                                 for c in trees[stem].body):
             where = (stem, cls_name)
         if where is None:
             return None
@@ -7416,7 +7464,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
         for c in trees[mod].body:
             if isinstance(c, ast.ClassDef) and c.name == cname:
                 for m in c.body:
-                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name == f.attr:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name == meth:
                         return mod, f"{cname}.{m.name}", m, True
         return None
 
@@ -7544,12 +7592,29 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                         if deep_mod in (mstem, estem):
                             continue
                         chain = " -> ".join(f"{m}.{n}()" for m, n, _ in hops)
+                        what = ", ".join(sorted(changed))
                         out.append((f"{deep_mod}.py",
-                                    f"Under the negative control {mstem}.py:{call.lineno} passes a CHANGED "
-                                    f"`{', '.join(sorted(changed))}` along {chain}, yet the run's numbers did not "
-                                    f"move: {deep_mod}.{deep_name}() ({deep_mod}.py:{deep_line}) appears to ignore "
-                                    f"its input (e.g. returns a fixed, ideal or precomputed result). It must "
-                                    f"compute its output FROM the input it receives."))
+                                    f"Under the negative control {mstem}.py:{call.lineno} passes a CHANGED `{what}` "
+                                    f"along {chain}, yet the run's numbers did not move. Either "
+                                    f"{deep_mod}.{deep_name}() ({deep_mod}.py:{deep_line}) ignores or silently drops "
+                                    f"parts of its input (fixed/ideal result, unknown ops skipped, coarse "
+                                    f"thresholding), or the part the control changes cannot affect what is "
+                                    f"measured. Check with a known answer: two inputs that must give different "
+                                    f"results must give different results."))
+                        # Who BUILT the value the control changes: if the change cannot reach the
+                        # measured quantity, the construction (e.g. the circuit) is wrong.
+                        for asg in ast.walk(fn):
+                            if isinstance(asg, ast.Assign) and isinstance(asg.value, ast.Call) and \
+                                    any(isinstance(t, ast.Name) and t.id in changed for t in asg.targets):
+                                src = local_target(mstem, asg.value) or (class_method(mstem, fn, asg.value) or (None,))[:2]
+                                if src and src[0] and src[0] not in (mstem, estem):
+                                    out.append((f"{src[0]}.py",
+                                                f"The negative control changes the `{what}` your "
+                                                f"{src[0]}.{src[1]}() builds ({mstem}.py:{asg.lineno}), and the "
+                                                f"measured numbers do not move. Check that what you build actually "
+                                                f"implements the protocol end to end (state preparation, entangling, "
+                                                f"the measurement it relies on, corrections) so that removing a "
+                                                f"required step MUST change the measured result."))
                 if used and mstem != estem:
                     reached["outside"] = True
                 elif used:
@@ -7618,6 +7683,57 @@ def _interface_blocks(contract: str) -> Dict[str, str]:
     return out
 
 
+def known_answer_values(contract: str) -> List[float]:
+    vals = []
+    for line in known_answer_lines(contract):
+        for part in line.split("->")[1:]:
+            m = re.match(r'\s*(-?\d+(?:\.\d+)?)', part)
+            if m:
+                vals.append(float(m.group(1)))
+    return sorted(set(vals))
+
+
+def hollow_known_answer_tests(proj: Path, contract: str) -> List[str]:
+    """Test files in which no assertion involves any known-answer value (or a
+    threshold near it). A 'known answers' test that only checks keys or types
+    cannot fail on a broken measurement."""
+    vals = known_answer_values(contract)
+    names = {l.split(":", 1)[0].strip().lower() for l in known_answer_lines(contract) if ":" in l}
+    if not vals or not names:
+        return []
+    files = [p for p in proj.rglob("*.py") if _is_test_file(p.name) and "__pycache__" not in p.parts]
+    if not files:
+        return []
+    found_any = False
+    for p in files:
+        try:
+            tree = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            continue
+        for n in ast.walk(tree):
+            is_assert = isinstance(n, ast.Assert) or (
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr.startswith("assert"))
+            if not is_assert:
+                continue
+            # The assertion must be about a known-answer metric (its name appears as a
+            # variable, attribute or key) AND compare it with a value near a known answer.
+            mentions = False
+            for c in ast.walk(n):
+                nm = (c.id if isinstance(c, ast.Name) else c.attr if isinstance(c, ast.Attribute)
+                      else c.value if isinstance(c, ast.Constant) and isinstance(c.value, str) else "")
+                if nm and any(k in str(nm).lower() for k in names):
+                    mentions = True
+            if not mentions:
+                continue
+            for c in ast.walk(n):
+                if isinstance(c, ast.Constant) and isinstance(c.value, (int, float)) and not isinstance(c.value, bool):
+                    if any(abs(float(c.value) - v) <= 0.15 for v in vals):
+                        found_any = True
+    if found_any:
+        return []
+    return [str(p.relative_to(proj)) for p in files]
+
+
 def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, List[str]]:
     """Project-level failures turned into instructions for the owners who have to
     act: the file where the run crashes, where the control flag stops, and which
@@ -7653,8 +7769,17 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
     if res.get("ok") and probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY", "PROBE FAILED", None) \
             and _RUN_PROBE_COMMAND and len(_RUN_COMMAND.split()) > 1:
         for path, msg in trace_control_flag(proj, _RUN_COMMAND.split()[1], _RUN_PROBE_COMMAND,
-                                            insensitive=probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY")):
+                                            insensitive=probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY"),
+                                            executed_fns=set(res.get("executed_functions") or [])):
             add(path, msg)
+    hollow = hollow_known_answer_tests(proj, _RUN_CONTRACT)
+    if hollow:
+        vals = ", ".join(f"{v:g}" for v in known_answer_values(_RUN_CONTRACT))
+        for tf in hollow:
+            add(tf, f"No assertion in the tests checks a KNOWN ANSWER value ({vals}). A test that only checks keys, "
+                    f"types or 'is a float' cannot fail on a broken measurement. Call the measuring function with "
+                    f"each known-answer input and assert the value with a tolerance (e.g. fidelity >= 0.9 for the "
+                    f"ideal case, <= 0.1 for the orthogonal one). If it then fails, the code is wrong - not the test.")
     # Only a SUCCESSFUL run says anything about which modules take part: after a
     # crash, everything past the crash point "never ran".
     dead = (res.get("not_executed") or []) if res.get("ok") else []
