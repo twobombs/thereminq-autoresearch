@@ -4773,30 +4773,64 @@ def experiment_conditions(body: List[str], probe_cmd: str) -> Set[str]:
 def validate_known_answers(lines: List[str], probe_cmd: str,
                            conditions: Optional[Set[str]] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
     """Keep known answers that name a measured quantity on a concrete input.
-    Drop lines that prescribe the summary score, or key a value to the control
-    flag or a run mode - those turn 'known answers' into values to hardcode."""
+    Each line may hold several cases ('metric: a -> 1.0; b -> 0.0'); every case
+    is judged on its own, so one bad case does not take a good one with it.
+    Dropped: cases that prescribe the summary score, refer to the control flag
+    or a run mode, and cases keyed to experimental conditions when the same
+    metric gets DIFFERENT values under different conditions - that encodes the
+    outcome being measured. A single case that merely mentions a condition
+    (e.g. 'ideal forward teleportation -> 1.0') is kept."""
     idents, lits = _flag_tokens(probe_cmd)
-    # A line refers to the flag when it contains EVERY word of the flag name
-    # (corrupt-state -> 'corrupt' and 'state'); one shared word is not enough.
     flag_sets = [[w for w in i.split("_") if w] for i in idents]
+    conds = conditions or set()
+
+    def cond_of(text: str) -> Optional[str]:
+        low = text.lower()
+        for c in sorted(conds):
+            if re.search(r'(?<![a-z])' + re.escape(c) + r'(?![a-z])', low):
+                return c
+        return None
+
+    parsed = []   # (line, name, case_text, value)
     kept, dropped = [], []
     for line in lines:
         text = line.strip()
         name = text.split(":", 1)[0].strip().strip("`").lower() if ":" in text else ""
-        low = text.lower()
-        if not name or "->" not in text and "=" not in text:
+        if not name or ("->" not in text and "=" not in text):
             dropped.append((line, "no 'metric: input -> expected' form"))
-        elif name == "score" or _SUMMARY_KEY_RE.search(name):
+            continue
+        if name == "score" or _SUMMARY_KEY_RE.search(name):
             dropped.append((line, "prescribes the summary score"))
-        elif any(l.lower() in low for l in lits) or any(
+            continue
+        body = text.split(":", 1)[1]
+        for case in [c.strip() for c in re.split(r';', body) if c.strip()]:
+            parsed.append((line, name, case))
+    # outcome encoding: one metric, several conditions, different values
+    by_metric: Dict[str, Dict[str, set]] = {}
+    for _, name, case in parsed:
+        c = cond_of(case.split("->")[0]) if "->" in case else None
+        if c:
+            val = case.split("->", 1)[1].strip()
+            by_metric.setdefault(name, {}).setdefault(c, set()).add(val)
+    outcome_metrics = {n for n, d in by_metric.items()
+                       if len(d) >= 2 and len({v for vs in d.values() for v in vs}) >= 2}
+    good: Dict[str, List[str]] = {}
+    for line, name, case in parsed:
+        low = case.lower()
+        if any(l.lower() in low for l in lits) or any(
                 ws and all(re.search(r'(?<![a-z])' + re.escape(w), low) for w in ws) for ws in flag_sets):
-            dropped.append((line, "keyed to the control flag"))
-        elif _RUN_MODE_WORDS.search(text):
-            dropped.append((line, "keyed to a run mode, not an input"))
-        elif conditions and any(re.search(r'(?<![a-z])' + re.escape(c) + r'(?![a-z])', low) for c in conditions):
-            dropped.append((line, "keyed to an experimental condition - that is the outcome being measured"))
+            dropped.append((f"{name}: {case}", "keyed to the control flag"))
+        elif _RUN_MODE_WORDS.search(case):
+            dropped.append((f"{name}: {case}", "keyed to a run mode, not an input"))
+        elif name in outcome_metrics and cond_of(case.split("->")[0] if "->" in case else case):
+            dropped.append((f"{name}: {case}", "different values per experimental condition - that is the "
+                                               "outcome being measured"))
+        elif "->" not in case and "=" not in case:
+            dropped.append((f"{name}: {case}", "no 'input -> expected' form"))
         else:
-            kept.append(line)
+            good.setdefault(name, []).append(case)
+    for name, cases in good.items():
+        kept.append(f"  {name}: " + "; ".join(cases))
     return kept, dropped
 
 
@@ -7582,6 +7616,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
     out: List[Tuple[str, str]] = []
     reached = {"outside": False}
     local_use: List[str] = []
+    insens_done: Set[Tuple[str, str]] = set()
 
     def follow(stem: str, scope, depth: int, origin: str) -> None:
         passed = False
@@ -7626,25 +7661,27 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                                                 f"metric's reference follows the corruption, so the control cancels "
                                                 f"itself. Keep the reference the ORIGINAL intended state and let the "
                                                 f"flag break only the process."))
-                if used and mstem != estem and insensitive:
-                    # Wired, yet the numbers did not move: find what the flag changes
-                    # and who receives it next - that consumer ignores its input.
+                if used and mstem != estem and insensitive and (mstem, fname) not in insens_done:
+                    insens_done.add((mstem, fname))
+                    # Wired, yet the numbers did not move. Seeds: values set under a
+                    # condition on the flag. They propagate through assignments in
+                    # statement order; the LAST project call that receives a changed
+                    # value is the measuring consumer, its result is a measurement and
+                    # is not propagated further. Earlier project calls that produce a
+                    # changed value (Config(...), build_circuit(...)) are producers.
                     changed = set()
                     for node in ast.walk(fn):
-                        cond = None
+                        cond, body_nodes = None, []
                         if isinstance(node, ast.If):
-                            cond = node.test
-                            body_nodes = node.body + node.orelse
+                            cond, body_nodes = node.test, node.body + node.orelse
                         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.IfExp):
-                            cond = node.value.test
-                            body_nodes = [node]
+                            cond, body_nodes = node.value.test, [node]
                         if cond is None or not any(isinstance(x, ast.Name) and x.id == prm for x in ast.walk(cond)):
                             continue
                         for bn in body_nodes:
                             for x in ast.walk(bn):
                                 if isinstance(x, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                                    tg = x.targets if isinstance(x, ast.Assign) else [x.target]
-                                    for t in tg:
+                                    for t in (x.targets if isinstance(x, ast.Assign) else [x.target]):
                                         base = t
                                         while isinstance(base, (ast.Subscript, ast.Attribute)):
                                             base = base.value
@@ -7653,43 +7690,99 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                                 elif isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and \
                                         isinstance(x.func.value, ast.Name) and \
                                         x.func.attr in ("insert", "append", "extend", "pop", "remove", "reverse",
-                                                        "update", "clear", "__setitem__"):
+                                                        "update", "clear"):
                                     changed.add(x.func.value.id)
-                    for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
-                        if not changed or not any(isinstance(x, ast.Name) and x.id in changed
-                                                  for a in list(call.args) + [k.value for k in call.keywords]
-                                                  for x in ast.walk(a)):
+                    if not changed:
+                        continue
+                    seeds = set(changed)
+                    stmts = sorted([n for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.Expr))
+                                    and getattr(n, "value", None) is not None], key=lambda n: n.lineno)
+
+                    def carries(expr) -> bool:
+                        return any(isinstance(x, ast.Name) and x.id in changed for x in ast.walk(expr))
+
+                    def ctor_target(c):
+                        """Config(...) where Config is a class from a project module."""
+                        if not isinstance(c.func, ast.Name):
+                            return None
+                        for n in ast.walk(trees[mstem]):
+                            if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in trees:
+                                for a in n.names:
+                                    if (a.asname or a.name) == c.func.id and any(
+                                            isinstance(k, ast.ClassDef) and k.name == a.name
+                                            for k in trees[n.module].body):
+                                        return (n.module, a.name)
+                        return None
+
+                    def project_call(expr):
+                        for c in ast.walk(expr):
+                            if isinstance(c, ast.Call) and (resolve(mstem, fn, c) or ctor_target(c)):
+                                return c
+                        return None
+
+                    producers, consumer = [], None
+                    # Whoever builds a value the control then alters is a producer too
+                    # (circuit = build(...); if corrupt: circuit = circuit[:-2]).
+                    for st in stmts:
+                        if isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id in seeds
+                                                              for t in st.targets):
+                            pc = project_call(st.value)
+                            if pc is not None and not carries(st.value):
+                                producers.append((st, pc, next(t.id for t in st.targets
+                                                               if isinstance(t, ast.Name) and t.id in seeds)))
+                    for st in stmts:
+                        if not carries(st.value):
                             continue
-                        hops = nonlocal_chain["f"](mstem, fn, call, changed, 0)
-                        if not hops:
-                            continue
-                        deep_mod, deep_name, deep_line = hops[-1]
-                        if deep_mod in (mstem, estem):
-                            continue
-                        chain = " -> ".join(f"{m}.{n}()" for m, n, _ in hops)
-                        what = ", ".join(sorted(changed))
+                        pc = project_call(st.value)
+                        targets = ([t for t in st.targets] if isinstance(st, ast.Assign) else
+                                   [st.target] if isinstance(st, ast.AnnAssign) else [])
+                        if pc is not None and resolve(mstem, fn, pc):
+                            consumer = (st, pc)          # the latest one wins
+                        for t in targets:
+                            if isinstance(t, ast.Name) and t.id != prm:
+                                if pc is not None:
+                                    producers.append((st, pc, t.id))
+                                changed.add(t.id)
+                    if consumer is None:
+                        continue
+                    cst, ccall = consumer
+                    hops = nonlocal_chain["f"](mstem, fn, ccall, changed, 0)
+                    if not hops:
+                        continue
+                    deep_mod, deep_name, deep_line = hops[-1]
+                    fed = sorted({x.id for a in list(ccall.args) + [k.value for k in ccall.keywords]
+                                  for x in ast.walk(a) if isinstance(x, ast.Name) and x.id in changed})
+                    what = ", ".join(fed) or "input"
+                    chain = " -> ".join(f"{m}.{n}()" for m, n, _ in hops)
+                    if deep_mod not in (mstem, estem):
                         out.append((f"{deep_mod}.py",
-                                    f"Under the negative control {mstem}.py:{call.lineno} passes a CHANGED `{what}` "
+                                    f"Under the negative control {mstem}.py:{ccall.lineno} passes a CHANGED `{what}` "
                                     f"along {chain}, yet the run's numbers did not move. Either "
                                     f"{deep_mod}.{deep_name}() ({deep_mod}.py:{deep_line}) ignores or silently drops "
                                     f"parts of its input (fixed/ideal result, unknown ops skipped, coarse "
-                                    f"thresholding), or the part the control changes cannot affect what is "
-                                    f"measured. Check with a known answer: two inputs that must give different "
-                                    f"results must give different results."))
-                        # Who BUILT the value the control changes: if the change cannot reach the
-                        # measured quantity, the construction (e.g. the circuit) is wrong.
-                        for asg in ast.walk(fn):
-                            if isinstance(asg, ast.Assign) and isinstance(asg.value, ast.Call) and \
-                                    any(isinstance(t, ast.Name) and t.id in changed for t in asg.targets):
-                                src = local_target(mstem, asg.value) or (class_method(mstem, fn, asg.value) or (None,))[:2]
-                                if src and src[0] and src[0] not in (mstem, estem):
-                                    out.append((f"{src[0]}.py",
-                                                f"The negative control changes the `{what}` your "
-                                                f"{src[0]}.{src[1]}() builds ({mstem}.py:{asg.lineno}), and the "
-                                                f"measured numbers do not move. Check that what you build actually "
-                                                f"implements the protocol end to end (state preparation, entangling, "
-                                                f"the measurement it relies on, corrections) so that removing a "
-                                                f"required step MUST change the measured result."))
+                                    f"thresholding, a fallback that swallows errors), or the part the control changes "
+                                    f"cannot affect what is measured. Check with a known answer: two inputs that "
+                                    f"must give different results must give different results."))
+                    seen_prod = set()
+                    cres = resolve(mstem, fn, ccall)
+                    for st, pc, var in producers:
+                        if pc is ccall:
+                            continue
+                        r = resolve(mstem, fn, pc) or ctor_target(pc)
+                        if not r or r[0] in (mstem, estem) or (r[0], r[1]) in seen_prod:
+                            continue
+                        if cres and (r[0], r[1]) == (cres[0], cres[1]):
+                            continue        # another call of the consumer (e.g. a fallback branch)
+                        if st.lineno > cst.lineno:
+                            continue
+                        seen_prod.add((r[0], r[1]))
+                        out.append((f"{r[0]}.py",
+                                    f"The negative control changes the `{var}` your {r[0]}.{r[1]}() builds "
+                                    f"({mstem}.py:{st.lineno}), and the measured numbers do not move. Check that "
+                                    f"what you build actually uses every input it is given and implements the "
+                                    f"protocol end to end (state preparation, entangling, the measurement it "
+                                    f"relies on, corrections), so that a changed input or a removed step MUST "
+                                    f"change the measured result."))
                 if used and mstem != estem:
                     reached["outside"] = True
                 elif used:
@@ -7809,6 +7902,39 @@ def hollow_known_answer_tests(proj: Path, contract: str) -> List[str]:
     return [str(p.relative_to(proj)) for p in files]
 
 
+def silent_fallbacks(proj: Path) -> List[Tuple[str, str]]:
+    """(file, 'file:line ...') for broad exception handlers that swallow the error
+    and compute something else instead (try: pyqrack(...) except Exception:
+    reference(...)). RUN RULES forbid them: they turn a broken backend into a
+    silently different experiment."""
+    out: List[Tuple[str, str]] = []
+    for p in sorted(proj.rglob("*.py")):
+        if "__pycache__" in p.parts or _is_test_file(p.name):
+            continue
+        try:
+            tree = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for h in node.handlers:
+                broad = h.type is None or (isinstance(h.type, ast.Name) and h.type.id in ("Exception", "BaseException"))
+                if not broad:
+                    continue
+                reraises = any(isinstance(x, ast.Raise) for x in ast.walk(ast.Module(body=h.body, type_ignores=[])))
+                calls = [x for x in ast.walk(ast.Module(body=h.body, type_ignores=[])) if isinstance(x, ast.Call)
+                         and not (isinstance(x.func, ast.Attribute) and x.func.attr in
+                                  ("print", "write", "print_exc", "exception", "error", "warning", "exit", "flush"))
+                         and not (isinstance(x.func, ast.Name) and x.func.id in ("print", "exit"))]
+                if not reraises and calls:
+                    rel = p.name if p.parent == proj else str(p.relative_to(proj))
+                    out.append((rel, f"{rel}:{h.lineno} catches every exception and runs "
+                                     f"`{ast.unparse(calls[0])[:60]}` instead: a silent fallback. RUN RULES forbid it - "
+                                     f"let the error raise (with a traceback), or report it in the output."))
+    return out[:8]
+
+
 def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, List[str]]:
     """Project-level failures turned into instructions for the owners who have to
     act: the file where the run crashes, where the control flag stops, and which
@@ -7847,6 +7973,8 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
                                             insensitive=probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY"),
                                             executed_fns=set(res.get("executed_functions") or [])):
             add(path, msg)
+    for path, msg in silent_fallbacks(proj):
+        add(path, msg)
     hollow = hollow_known_answer_tests(proj, _RUN_CONTRACT)
     if hollow:
         vals = ", ".join(f"{v:g}" for v in known_answer_values(_RUN_CONTRACT))
@@ -9205,6 +9333,10 @@ def shortcut_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
         hits += hardcoded_control_branches(ndir, a["cmd"], metric_keys)
     hits += hardcoded_metric_constants(ndir, metric_keys)
     hits = sorted(set(hits))
+    for _, msg in silent_fallbacks(ndir):
+        v = "SILENT FALLBACK: " + msg
+        if v[:300] not in (node.get("violations") or []):
+            node.setdefault("violations", []).append(v[:300])
     if not hits:
         return []
     msg = ("SHORTCUT: sets a metric from the negative-control flag instead of measuring it ("
