@@ -1,3 +1,7 @@
+<img width="2816" height="1536" alt="Gemini_Generated_Image_v5ir22v5ir22v5ir" src="https://github.com/user-attachments/assets/74974d09-48d9-4b3d-a6af-9b895fe243f6" />
+
+
+
 # ThereminQ-Autoresearch
 
 **A fully local, multi-tier agentic research pipeline**
@@ -338,3 +342,6 @@ Every config key can also be set as an environment variable `GW_<KEY>`, for exam
 ## License
 
 See [LICENSE](LICENSE).
+
+https://github.com/user-attachments/assets/02bc3922-1791-4d31-a924-9f683c5d76d1
+
