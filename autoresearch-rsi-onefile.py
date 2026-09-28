@@ -194,6 +194,17 @@ WORKER_PARALLEL_SLOTS = min(
 )
 WORKER_RETRIES = 3
 WORKER_TIMEOUT_SECS = float(os.getenv("WORKER_TIMEOUT_SECS", "300.0"))
+# Agent calls stream; no data for this long (before the first token or between
+# chunks) is a stall - abandoned and retried once on another agent endpoint.
+AGENT_STALL_SECS = int(os.getenv("AGENT_STALL_SECS", "90"))
+
+
+def _agent_timeout():
+    try:
+        import httpx
+        return httpx.Timeout(connect=15.0, read=float(AGENT_STALL_SECS), write=60.0, pool=15.0)
+    except Exception:
+        return float(AGENT_STALL_SECS)
 WORKER_RESERVE_TOKENS = int(os.getenv("WORKER_RESERVE_TOKENS", "2048"))
 
 # ------------------------------------------------------------------------------
@@ -3269,7 +3280,7 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
     task = agent["id"]
     reference_hashes = set(reference_hashes or set())
     client = OpenAI(base_url=endpoint, api_key=WORKER_API_KEY,
-                    timeout=WORKER_TIMEOUT_SECS, max_retries=0)
+                    timeout=_agent_timeout(), max_retries=0)
     start_time = time.time()
 
     wroot = work_dir_for(run_dir)
@@ -3401,41 +3412,64 @@ def run_agent(agent: dict, roster: List[dict], rnd: int, node_id: str, seq: int,
             presence_penalty=0.5,
             stream=True,
         )
-        try:
-            response = _safe_create(client,
-                stream_options={"include_usage": True}, **base_kwargs)
-        except Exception as e:
-            if _is_stream_options_rejection(str(e).lower()):
-                response = _safe_create(client, **base_kwargs)
-            else:
-                raise
-
         call_t0, ttft = time.time(), None
-        try:
-            for chunk in response:
-                now = time.time()
-                if ttft is None and chunk.choices and chunk.choices[0].delta is not None \
-                        and chunk.choices[0].delta.content:
-                    ttft = now - call_t0
-                if now - start_time > WORKER_MAX_WALL_SECS:
-                    truncated = True
-                    finish_reason = "wall_clock"
-                    break
-                if chunk.choices:
-                    ch = chunk.choices[0]
-                    if ch.delta is not None and ch.delta.content is not None:
-                        result_text += ch.delta.content
-                    if getattr(ch, "finish_reason", None):
-                        finish_reason = ch.finish_reason
-                if getattr(chunk, "usage", None) is not None:
-                    prompt_tokens = chunk.usage.prompt_tokens
-                    comp_tokens = chunk.usage.completion_tokens
-                    is_estimated = False
-        finally:
+        for _try in range(2):
             try:
-                response.close()
-            except Exception:
-                pass
+                try:
+                    response = _safe_create(client,
+                        stream_options={"include_usage": True}, **base_kwargs)
+                except Exception as e:
+                    if _is_stream_options_rejection(str(e).lower()):
+                        response = _safe_create(client, **base_kwargs)
+                    else:
+                        raise
+
+                call_t0, ttft = time.time(), None
+                try:
+                    for chunk in response:
+                        now = time.time()
+                        if ttft is None and chunk.choices and chunk.choices[0].delta is not None \
+                                and chunk.choices[0].delta.content:
+                            ttft = now - call_t0
+                        if now - start_time > WORKER_MAX_WALL_SECS:
+                            truncated = True
+                            finish_reason = "wall_clock"
+                            break
+                        if chunk.choices:
+                            ch = chunk.choices[0]
+                            if ch.delta is not None and ch.delta.content is not None:
+                                result_text += ch.delta.content
+                            if getattr(ch, "finish_reason", None):
+                                finish_reason = ch.finish_reason
+                        if getattr(chunk, "usage", None) is not None:
+                            prompt_tokens = chunk.usage.prompt_tokens
+                            comp_tokens = chunk.usage.completion_tokens
+                            is_estimated = False
+                finally:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                break
+            except Exception as e:
+                stalled = type(e).__name__ in ("APITimeoutError", "ReadTimeout", "Timeout") or \
+                    "timed out" in str(e).lower()
+                if stalled and not result_text and _try == 0:
+                    # No token within AGENT_STALL_SECS: the upstream is stuck. Retry once
+                    # on another agent endpoint instead of waiting for the gateway to give up.
+                    nxt = _failover_endpoint(endpoint, endpoint)
+                    _mark_stall(endpoint)
+                    print(f"\n    [*] {node_id} ({task}): no data for {AGENT_STALL_SECS}s on {endpoint}; "
+                          f"retrying on {nxt}", flush=True)
+                    _LEDGER.add("agent attempts (stalled)", "agent", 0, 0, time.time() - call_t0, None, True,
+                                rnd=rnd, truncated=True)
+                    endpoint = nxt
+                    client = OpenAI(base_url=nxt, api_key=WORKER_API_KEY, timeout=_agent_timeout(), max_retries=0)
+                    continue
+                if stalled and result_text:
+                    truncated, finish_reason = True, "stall"
+                    break
+                raise
 
         if finish_reason == "length":
             truncated = True
@@ -5300,6 +5334,8 @@ def run_rules_section(cmd: str) -> str:
         '  "score": <finite number>, and reports no error ("status": "error", an "error" field,',
         "  or a traceback in its output).",
         "- Printed prose (conclusions, notes) is not a result; only measured numbers count.",
+        "- Seed every source of randomness (numpy, random, simulator shot sampling) with a fixed seed,",
+        "  so two identical runs print identical numbers and the control's effect is unambiguous.",
         "- Boolean switches are bare flags parsed with argparse action='store_true' (present = on).",
         "  Never type=bool: argparse turns '--flag False' into True.",
         "- On any failure, print the full traceback to stderr (traceback.print_exc()) before exiting",
@@ -5342,6 +5378,56 @@ def _flag_tokens(probe_cmd: str) -> Tuple[Set[str], Set[str]]:
     return idents, lits
 
 
+_MEASURE_CALL_RE = re.compile(
+    r'^(m|mz|mx|my|measure\w*|sample\w*|choice|choices|get_probabilit\w*|prob|prob_\w*|probabilities|'
+    r'out_probs|get_counts|counts|run_simulation|simulate\w*|execute|run_circuit|run_shots|shots)$', re.I)
+_MUTATORS = {"append", "extend", "insert", "update", "pop", "remove", "clear", "setdefault", "reverse", "sort"}
+
+
+def measurement_vars(fn) -> Set[str]:
+    """Names in a function that hold measurement output: assigned from a
+    measurement-like call (sim.m(q), measure_shots, np.random.choice over
+    probabilities, run_simulation, get_counts ...) or derived from such a name
+    (appends, joins, loops, arithmetic), to a fixed point."""
+    def call_name(c):
+        f = c.func
+        return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+
+    def taints(expr, tainted) -> bool:
+        for x in ast.walk(expr):
+            if isinstance(x, ast.Call) and _MEASURE_CALL_RE.match(call_name(x) or ""):
+                return True
+            if isinstance(x, ast.Name) and x.id in tainted:
+                return True
+        return False
+    tainted: Set[str] = set()
+    grew = True
+    while grew:
+        grew = False
+        for n in ast.walk(fn):
+            targets, value = [], None
+            if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and n.value is not None:
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                value = n.value
+            elif isinstance(n, (ast.For, ast.comprehension)):
+                targets, value = [n.target], n.iter
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _MUTATORS \
+                    and isinstance(n.func.value, ast.Name):
+                targets, value = [n.func.value], ast.Tuple(elts=list(n.args), ctx=ast.Load())
+            if value is None or not taints(value, tainted):
+                continue
+            for t in targets:
+                base = t
+                while isinstance(base, (ast.Subscript, ast.Attribute)):
+                    base = base.value
+                for nm in ([base] if isinstance(base, ast.Name) else
+                           [e for e in getattr(base, "elts", []) if isinstance(e, ast.Name)]):
+                    if nm.id not in tainted:
+                        tainted.add(nm.id)
+                        grew = True
+    return tainted
+
+
 def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str]) -> List[str]:
     """'file:line name = constant' for every branch on the control flag that
     assigns a literal number to a reported metric (or to anything named like a
@@ -5350,6 +5436,7 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
     if not idents and not lits:
         return []
     metric_names = {k.lower() for k in metric_keys} | {"score"}
+    metric_names |= {k.rsplit("_", 1)[-1] for k in list(metric_names) if "_" in k and len(k.rsplit("_", 1)[-1]) >= 2}
 
     # The flag rarely keeps its name on the way down (--corrupt -> args.corrupt ->
     # corrupt_flag -> corrupt_state), so an identifier matches when it contains
@@ -5389,7 +5476,65 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
             tree = _quiet_parse(read_file_content_safe(p) or "")
         except (SyntaxError, ValueError):
             continue
+        funcs = {p.name: [f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]}
+        mcache: Dict[int, Set[str]] = {}
         for node in ast.walk(tree):
+            # metric = A if flag else B with different A and B: computed differently
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.IfExp) \
+                    and refs_flag(node.value.test) \
+                    and ast.unparse(node.value.body) != ast.unparse(node.value.orelse) \
+                    and not (const_number(node.value.body) or const_number(node.value.orelse)):
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    name = t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute) else ""
+                    if name and is_metric(name):
+                        hits.append(f"{p.name}:{node.lineno} {name} computed differently under the flag")
+            # if flag: circuit = [("x",[0],[]), ...]  else: circuit = build(...)
+            # The control replaces the experiment with a fixed stand-in instead of
+            # breaking it: whatever the stand-in yields is decided by its author.
+            if isinstance(node, ast.If) and refs_flag(node.test) and node.orelse:
+                def lit_assigns(stmts):
+                    return {t.id: st for st in stmts if isinstance(st, ast.Assign)
+                            and isinstance(st.value, (ast.List, ast.Tuple, ast.Dict))
+                            and all(isinstance(x, (ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Load))
+                                    for x in ast.walk(st.value) if x is not st.value)
+                            for t in st.targets if isinstance(t, ast.Name)}
+
+                def call_assigns(stmts):
+                    return {t.id for st in stmts if isinstance(st, ast.Assign) and isinstance(st.value, ast.Call)
+                            for t in st.targets if isinstance(t, ast.Name)}
+                lits_, calls_ = lit_assigns(node.body), call_assigns(node.orelse)
+                for nm, st in lits_.items():
+                    if nm in calls_:
+                        hits.append(f"{p.name}:{st.lineno} {nm} replaced by a fixed literal under the flag "
+                                    f"({ast.unparse(st.value)[:40]}) instead of breaking the process")
+            # if flag: b_str = flip(b_str) / counts[k] = ... / counts.update(...)
+            # The control rewrites what was MEASURED instead of breaking the process:
+            # the result is whatever the rewrite says, not what the experiment did.
+            if isinstance(node, ast.If) and refs_flag(node.test):
+                fn = next((f for f in funcs.get(p.name, [])
+                           if f.lineno <= node.lineno <= getattr(f, "end_lineno", f.lineno)), None)
+                if fn is not None:
+                    mv = mcache.get(id(fn))
+                    if mv is None:
+                        mv = mcache[id(fn)] = measurement_vars(fn)
+                    for st in node.body:
+                        for w in ast.walk(st):
+                            nm, how = None, ""
+                            if isinstance(w, ast.AugAssign) and isinstance(w.target, ast.Name):
+                                nm, how = w.target.id, ast.unparse(w)[:60]
+                            elif isinstance(w, (ast.Assign, ast.AnnAssign)) and w.value is not None:
+                                for t in (w.targets if isinstance(w, ast.Assign) else [w.target]):
+                                    if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                                        nm, how = t.value.id, ast.unparse(w)[:60]
+                                    elif isinstance(t, ast.Name) and any(
+                                            isinstance(x, ast.Name) and x.id == t.id for x in ast.walk(w.value)):
+                                        nm, how = t.id, ast.unparse(w)[:60]
+                            elif isinstance(w, ast.Call) and isinstance(w.func, ast.Attribute) and \
+                                    w.func.attr in _MUTATORS and isinstance(w.func.value, ast.Name):
+                                nm, how = w.func.value.id, ast.unparse(w)[:60]
+                            if nm and nm in mv:
+                                hits.append(f"{p.name}:{w.lineno} rewrites the measurement result `{nm}` under the "
+                                            f"flag ({how}) instead of breaking the process")
             # metric = <measured> if not flag else 0.1   (a flag-keyed constant for a metric)
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.IfExp) \
                     and refs_flag(node.value.test) \
@@ -5413,11 +5558,16 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                                     t.attr if isinstance(t, ast.Attribute) else
                                     t.slice.value if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
                                     and isinstance(t.slice.value, str) else "")
+                            # Under the flag a metric may be COMPUTED (score = 1 - |delta|
+                            # from a measured delta is fine), but not SET: a constant, an
+                            # in-place change, or a transform of its own value
+                            # (min(f, 0.25), f * 0.5, 0.5 + abs(f - 0.5) * 0.1).
                             if name and is_metric(name) and (
-                                    const_number(sub.value) or isinstance(sub, ast.AugAssign) or any(
-                                        isinstance(x, ast.Constant) and isinstance(x.value, (int, float))
-                                        and not isinstance(x.value, bool) for x in ast.walk(sub.value))
-                                    or any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(sub.value))):
+                                    const_number(sub.value) or isinstance(sub, ast.AugAssign)
+                                    or any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(sub.value))
+                                    or (isinstance(t, ast.Subscript) and any(
+                                        isinstance(x, ast.Subscript) and ast.unparse(x) == ast.unparse(t)
+                                        for x in ast.walk(sub.value)))):
                                 hits.append(f"{p.name}:{sub.lineno} {name} = {ast.unparse(sub.value)[:60]}")
                     elif isinstance(sub, ast.Dict):
                         for k, v in zip(sub.keys, sub.values):
@@ -5426,6 +5576,56 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                                 hits.append(f"{p.name}:{sub.lineno} {{'{k.value}': {ast.unparse(v)}}}")
                     elif isinstance(sub, ast.Return) and sub.value is not None and const_number(sub.value):
                         hits.append(f"{p.name}:{sub.lineno} return {ast.unparse(sub.value)}")
+            # Computed DIFFERENTLY under the flag: the same metric assigned in both
+            # branches with different code, or assigned under the flag while the
+            # normal path assigns it elsewhere (an override).
+            if isinstance(node, ast.If) and refs_flag(node.test):
+                def metric_assigns(stmts):
+                    out = {}
+                    for st in stmts:
+                        for sub in ast.walk(st):
+                            if isinstance(sub, (ast.Assign, ast.AnnAssign)) and sub.value is not None:
+                                for t in (sub.targets if isinstance(sub, ast.Assign) else [sub.target]):
+                                    nm = (t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute)
+                                          else t.slice.value if isinstance(t, ast.Subscript)
+                                          and isinstance(t.slice, ast.Constant) and isinstance(t.slice.value, str)
+                                          else "")
+                                    if nm and is_metric(nm):
+                                        out.setdefault(nm, []).append((sub.lineno, ast.unparse(sub.value)))
+                    return out
+                a_body, a_else = metric_assigns(node.body), metric_assigns(node.orelse)
+
+                def norm(src: str) -> str:
+                    """Drop what passes the flag on (run(corrupt=True) vs run()): measuring
+                    under the flag is the point; computing the metric differently is not."""
+                    try:
+                        e = ast.parse(src, mode="eval")
+                    except SyntaxError:
+                        return src
+                    for c in ast.walk(e):
+                        if isinstance(c, ast.Call):
+                            c.keywords = [k for k in c.keywords if not (k.arg and ident_matches(k.arg))
+                                          and not refs_flag(k.value)]
+                            c.args = [a for a in c.args if not refs_flag(a)
+                                      and not (isinstance(a, ast.Constant) and isinstance(a.value, bool))]
+                    return ast.unparse(e)
+                for nm, uses in a_body.items():
+                    if nm in a_else and {norm(u) for _, u in uses} != {norm(u) for _, u in a_else[nm]}:
+                        hits.append(f"{p.name}:{uses[0][0]} {nm} computed differently under the flag "
+                                    f"({uses[0][1][:40]} vs {a_else[nm][0][1][:40]})")
+                    elif nm not in a_else and not all(norm(u) != u for _, u in uses):
+                        fn = next((f for f in funcs.get(p.name, [])
+                                   if f.lineno <= node.lineno <= getattr(f, "end_lineno", f.lineno)), None)
+                        if fn is not None:
+                            inside = {id(x) for x in ast.walk(node)}
+                            others = [x for x in ast.walk(fn) if isinstance(x, (ast.Assign, ast.AnnAssign))
+                                      and id(x) not in inside and any(
+                                          (isinstance(t, ast.Name) and t.id == nm) or
+                                          (isinstance(t, ast.Attribute) and t.attr == nm)
+                                          for t in (x.targets if isinstance(x, ast.Assign) else [x.target]))]
+                            if others:
+                                hits.append(f"{p.name}:{uses[0][0]} {nm} overridden under the flag "
+                                            f"({uses[0][1][:50]})")
     return sorted(set(hits))[:10]
 
 
@@ -5437,6 +5637,7 @@ def hardcoded_metric_constants(proj: Path, metric_keys: List[str]) -> List[str]:
     inside ANY conditional branch (e.g. per experimental condition). Guards like
     `if total == 0: fidelity = 0.0` use 0/1 and are not flagged."""
     names = {k.lower() for k in metric_keys} | {"score"}
+    names |= {k.rsplit("_", 1)[-1] for k in list(names) if "_" in k and len(k.rsplit("_", 1)[-1]) >= 2}
 
     def is_metric(n: str) -> bool:
         low = n.lower()
@@ -5485,6 +5686,20 @@ def free_text_fields(out: str) -> List[str]:
     return sorted({k for k, _ in _FREE_TEXT_RE.findall(out or "")})[:10]
 
 
+_DOWN_WORDS = re.compile(r'decreas|drop|fall|lower|reduc|degrad|toward[s]?\s+(?:zero|0|random|0\.5)|vanish|worse|collaps|diminish', re.I)
+_UP_WORDS = re.compile(r'increas|rise|rises|higher|improv|grow', re.I)
+
+
+def predicted_direction(contract: str) -> int:
+    """-1 / +1 from the PROBE's 'predicted effect' line, 0 if unclear."""
+    m = re.search(r'predicted effect[^\n]*:\s*([^\n]+)', contract or "", re.I)
+    if not m:
+        return 0
+    text = m.group(1)
+    down, up = bool(_DOWN_WORDS.search(text)), bool(_UP_WORDS.search(text))
+    return -1 if down and not up else 1 if up and not down else 0
+
+
 def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
                       run_out: str, work: Optional[Path] = None,
                       cmd: Optional[str] = None) -> Optional[dict]:
@@ -5522,25 +5737,36 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
         du, dv = dict(u), dict(v)
         return [(k, du[k], dv[k]) for k in du if k in dv]
 
-    # Noise floor: run the unmodified RUN command once more. A value that moves
+    # Noise floor: run the unmodified RUN command twice more. A value that moves
     # between two identical runs (unseeded sampling, float jitter) can only
     # count as a response if the control moves it clearly further.
     noise: Dict[int, float] = {}
-    rerrs: List[str] = []
-    shutil.rmtree(work / "repeat", ignore_errors=True)
-    shutil.copytree(proj, work / "repeat", ignore=shutil.ignore_patterns("__pycache__", ".home"))
-    rrc, rout, rto = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "repeat", env,
-                                  cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=rerrs)
     noisy_keys: List[str] = []
-    if rrc == 0 and not rto:
-        rep_pairs = pair_up(a, numeric_fingerprint(rout or ""))
-        for i, (k, x, y) in enumerate(rep_pairs):
-            noise[i] = abs(x - y)
-            if abs(x - y) > 1e-9 * max(1.0, abs(x)):
-                noisy_keys.append(k)
+    repeats = []
+    for rep_i in range(2):
+        rerrs = []
+        shutil.rmtree(work / "repeat", ignore_errors=True)
+        shutil.copytree(proj, work / "repeat", ignore=shutil.ignore_patterns("__pycache__", ".home"))
+        rrc, rout, rto = _run_limited(_RUN_COMMAND.split(), RUN_COMMAND_SECS, work / "repeat", env,
+                                      cpu=max(TEST_CPU_SECS, RUN_COMMAND_SECS), stderr_sink=rerrs)
+        if rrc == 0 and not rto:
+            repeats.append(numeric_fingerprint(rout or ""))
+    # Noise = the largest spread among the run and two identical repeats; one
+    # repeat can land close by chance and make a noisy metric look responsive.
+    for fp in repeats:
+        for i, (k, x, y) in enumerate(pair_up(a, fp)):
+            noise[i] = max(noise.get(i, 0.0), abs(x - y))
+    if len(repeats) == 2:
+        for i, (k, x, y) in enumerate(pair_up(repeats[0], repeats[1])):
+            noise[i] = max(noise.get(i, 0.0), abs(x - y))
+    for i, (k, x) in enumerate(a):
+        if noise.get(i, 0.0) > 1e-9 * max(1.0, abs(x)):
+            noisy_keys.append(k)
 
     def moved(i: int, x: float, y: float) -> bool:
         floor = max(1e-6 * max(1.0, abs(x)), 3.0 * noise.get(i, 0.0))
+        if noise.get(i, 0.0) > 1e-9 * max(1.0, abs(x)):
+            floor = max(floor, 0.02 * max(1.0, abs(x)))    # sampled metric: small moves are noise
         return abs(x - y) > floor
 
     pairs = pair_up(a, b)
@@ -5571,6 +5797,20 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
                           "the measurement."}
     note = (f" (run-to-run noise on {', '.join(base['noisy'][:4])}: changes are counted only above "
             f"3x that noise; seed the randomness for a cleaner control)" if base.get("noisy") else "")
+    if not cmd:
+        # The contract predicts the DIRECTION of the control's effect. A control that
+        # pushes every changed metric the other way (a "corruption" that makes the
+        # result perfect) does not break the experiment - it replaces it.
+        want = predicted_direction(_RUN_CONTRACT)
+        if want:
+            signs = [1 if y > x else -1 for _, x, y in changed]
+            if all(sg == -want for sg in signs):
+                return {**base, "verdict": "WRONG DIRECTION",
+                        "detail": "the control moved every changed metric the opposite way to the contract's "
+                                  f"prediction ({'decrease' if want < 0 else 'increase'}): "
+                                  + ", ".join(f"{k} {x:.6g} -> {y:.6g}" for k, x, y in changed[:6])
+                                  + ". A negative control must break the process, not produce a better "
+                                    "(or perfect) result."}
     return {**base, "verdict": "RESPONSIVE",
             "detail": "changed under the control: "
                       + ", ".join(f"{k} {x:.6g} -> {y:.6g}" for k, x, y in changed[:6]) + note}
@@ -6094,6 +6334,7 @@ def load_round_grounding(run_dir: Path, upto_rnd: int) -> None:
         run_md = idir / f"round{r:02d}_run.md"
         if not _RUN_LAST_RUN_TEXT and run_md.exists():
             _RUN_LAST_RUN_TEXT = read_file_content_safe(run_md) or ""
+            load_demoted(run_dir)
             rj = idir / f"round{r:02d}_routed.json"
             if rj.exists():
                 try:
@@ -7157,6 +7398,16 @@ def decompose_to_atomic_pieces(large_query: str, required: Optional[Dict[str, st
             print(f"    [*] Adding dedicated assignment(s) for: {', '.join(best_missing)}", flush=True)
         pieces = attach_deliverable_specs(best_pieces, required)[:MAX_DECOMPOSE_TASKS]
         owner, missing = deliverable_coverage(pieces, required)
+        # An assignment that owns no required deliverable has nothing binding to
+        # build; in practice it writes copies of other agents' files (a whole
+        # project under its own name). Drop it.
+        owning = {i for i in owner.values() if i is not None}
+        idle = [i for i in range(len(pieces)) if i not in owning]
+        if idle and owning:
+            print(f"    [i] Dropped {len(idle)} assignment(s) that own no required deliverable: "
+                  + "; ".join(pieces[i].splitlines()[0][:60] for i in idle), flush=True)
+            pieces = [p for i, p in enumerate(pieces) if i in owning]
+            owner, missing = deliverable_coverage(pieces, required)
         print(f"    [+] Deliverable coverage: {len(required) - len(missing)}/{len(required)} owned "
               f"across {len(pieces)} assignment(s).", flush=True)
         if missing:
@@ -7861,19 +8112,48 @@ def known_answer_values(contract: str) -> List[float]:
     return sorted(set(vals))
 
 
-def hollow_known_answer_tests(proj: Path, contract: str) -> List[str]:
-    """Test files in which no assertion involves any known-answer value (or a
-    threshold near it). A 'known answers' test that only checks keys or types
-    cannot fail on a broken measurement."""
+def _assert_tolerance(n) -> Optional[float]:
+    """Tolerance of an assertion: delta=/abs=/rel= keywords, places=, or
+    abs(a - b) < t / <= t. None if it has none."""
+    if isinstance(n, ast.Call):
+        for k in n.keywords:
+            if k.arg in ("delta", "abs", "atol", "rel", "rtol") and isinstance(k.value, ast.Constant) \
+                    and isinstance(k.value.value, (int, float)):
+                return float(k.value.value)
+            if k.arg == "places" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, int):
+                return 0.5 * 10 ** (-k.value.value)
+    for c in ast.walk(n):
+        if isinstance(c, ast.Compare) and len(c.ops) == 1 and isinstance(c.ops[0], (ast.Lt, ast.LtE)) \
+                and isinstance(c.left, ast.Call) and getattr(c.left.func, "id", "") == "abs" \
+                and isinstance(c.comparators[0], ast.Constant) and isinstance(c.comparators[0].value, (int, float)):
+            return float(c.comparators[0].value)
+    return None
+
+
+def _is_range_bound(n) -> bool:
+    """assertGreaterEqual(x, 0.0) / assertLessEqual(x, 1.0) / assert 0.0 <= x <= 1.0 / x >= 0 ..."""
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and len(n.args) >= 2 \
+            and isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, (int, float)):
+        v, a = float(n.args[1].value), n.func.attr
+        return (a in ("assertGreaterEqual", "assertGreater") and v == 0.0) or \
+               (a in ("assertLessEqual", "assertLess") and v == 1.0)
+    if isinstance(n, ast.Assert) and isinstance(n.test, ast.Compare):
+        consts = [c.value for c in [n.test.left] + n.test.comparators
+                  if isinstance(c, ast.Constant) and isinstance(c.value, (int, float))]
+        return bool(consts) and all(float(c) in (0.0, 1.0) for c in consts) and all(
+            isinstance(o, (ast.GtE, ast.LtE, ast.Gt, ast.Lt)) for o in n.test.ops)
+    return False
+
+
+def loose_known_answer_asserts(proj: Path, contract: str) -> List[str]:
+    """Known-answer assertions whose tolerance is so wide they cannot fail for a
+    quantity in [0, 1] (e.g. assertAlmostEqual(p, 0.95, delta=1.0)): a failing
+    known-answer test 'fixed' by loosening it instead of fixing the code."""
     vals = known_answer_values(contract)
-    names = {l.split(":", 1)[0].strip().lower() for l in known_answer_lines(contract) if ":" in l}
-    if not vals or not names:
+    if not vals:
         return []
-    files = [p for p in proj.rglob("*.py") if _is_test_file(p.name) and "__pycache__" not in p.parts]
-    if not files:
-        return []
-    found_any = False
-    for p in files:
+    out = []
+    for p in [p for p in proj.rglob("*.py") if _is_test_file(p.name) and "__pycache__" not in p.parts]:
         try:
             tree = _quiet_parse(read_file_content_safe(p) or "")
         except (SyntaxError, ValueError):
@@ -7883,23 +8163,147 @@ def hollow_known_answer_tests(proj: Path, contract: str) -> List[str]:
                 isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr.startswith("assert"))
             if not is_assert:
                 continue
-            # The assertion must be about a known-answer metric (its name appears as a
-            # variable, attribute or key) AND compare it with a value near a known answer.
-            mentions = False
-            for c in ast.walk(n):
+            near = [c.value for c in ast.walk(n) if isinstance(c, ast.Constant)
+                    and isinstance(c.value, float) and any(abs(c.value - v) <= 0.15 for v in vals)]
+            tol = _assert_tolerance(n)
+            if near and tol is not None and tol >= 0.5:
+                rel = str(p.relative_to(proj))
+                out.append(f"{rel}:{n.lineno} {ast.unparse(n)[:70]} (tolerance {tol:g} accepts any value)")
+    return out[:6]
+
+
+def hollow_known_answer_tests(proj: Path, contract: str) -> List[str]:
+    """Test files in which no test function both concerns a known-answer metric
+    (its name, the metric's name or 'known' appears anywhere in the function)
+    and asserts a value near a known answer. A 'known answers' test that only
+    checks keys or types cannot fail on a broken measurement."""
+    vals = known_answer_values(contract)
+    names = {l.split(":", 1)[0].strip().lower() for l in known_answer_lines(contract) if ":" in l}
+    names |= {n.rsplit("_", 1)[-1] for n in list(names) if "_" in n}
+    if not vals or not names:
+        return []
+    files = [p for p in proj.rglob("*.py") if _is_test_file(p.name) and "__pycache__" not in p.parts]
+    if not files:
+        return []
+    for p in files:
+        try:
+            tree = _quiet_parse(read_file_content_safe(p) or "")
+        except (SyntaxError, ValueError):
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or not fn.name.startswith("test"):
+                continue
+            words = [fn.name.lower()]
+            for c in ast.walk(fn):
                 nm = (c.id if isinstance(c, ast.Name) else c.attr if isinstance(c, ast.Attribute)
                       else c.value if isinstance(c, ast.Constant) and isinstance(c.value, str) else "")
-                if nm and any(k in str(nm).lower() for k in names):
-                    mentions = True
-            if not mentions:
+                if nm:
+                    words.append(str(nm).lower())
+            if not any(k in w for w in words for k in names | {"known"}):
                 continue
-            for c in ast.walk(n):
-                if isinstance(c, ast.Constant) and isinstance(c.value, (int, float)) and not isinstance(c.value, bool):
-                    if any(abs(float(c.value) - v) <= 0.15 for v in vals):
-                        found_any = True
-    if found_any:
-        return []
+            for n in ast.walk(fn):
+                is_assert = isinstance(n, ast.Assert) or (
+                    isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr.startswith("assert"))
+                if not is_assert:
+                    continue
+                tol = _assert_tolerance(n)
+                if tol is not None and tol >= 0.5:
+                    continue                # delta=1.0 on a probability cannot fail
+                if _is_range_bound(n):
+                    continue                # x >= 0.0 / x <= 1.0: the value range, not an answer
+                for c in ast.walk(n):
+                    if isinstance(c, ast.Constant) and isinstance(c.value, (int, float)) and not isinstance(c.value, bool):
+                        if isinstance(c.value, int) and c.value in (0, 1):
+                            continue        # len(x) > 0, == 1: counts, not measured values
+                        if any(abs(float(c.value) - v) <= 0.15 for v in vals):
+                            return []
     return [str(p.relative_to(proj)) for p in files]
+
+def contract_metric_names() -> Set[str]:
+    """Metric names the contract already commits to, so the shortcut scan works
+    from round 1 on (before any run output exists): known-answer metrics and the
+    JSON keys the contract shows ("fidelity": ...)."""
+    names = {l.split(":", 1)[0].strip().strip("`").lower()
+             for l in known_answer_lines(_RUN_CONTRACT) if ":" in l}
+    names |= {m.lower() for m in re.findall(r'"([A-Za-z_][A-Za-z0-9_]{2,40})"\s*:', _RUN_CONTRACT or "")}
+    # Metrics the contract names in prose: "returns fidelity metric", the PROBE's
+    # and ABLATIONS' predicted effects ("fidelity decreases ...").
+    text = _RUN_CONTRACT or ""
+    for m in re.finditer(r'returns?\s+(?:the\s+|a\s+)?([a-z][a-z_]{2,40})(?:\s+(?:metric|value|score))?', text, re.I):
+        names.add(m.group(1).lower())
+    for m in re.finditer(r'predicted(?:\s+effect)?[^:\n]*:\s*(?:the\s+)?([a-z][a-z_]{2,40})', text, re.I):
+        names.add(m.group(1).lower())
+    names -= {"a", "an", "the", "none", "list", "dict", "float", "int", "str", "bool", "true", "false",
+              "json", "counts", "result", "results", "value", "values", "it", "direction", "metric", "metrics",
+              "measurement", "bitstring", "output", "default", "directional", "input", "state", "circuit",
+              "qubit", "qubits", "simulator", "experiment", "run", "runner", "probability", "probabilities"}
+    # Never a metric: anything that is a parameter or field in the INTERFACES
+    # (coupling, coupling_strength, ablate_coupling ...): ablations legitimately set those.
+    params = set()
+    for sig in re.findall(r'def\s+\w+\s*\(([^)]*)\)', text):
+        for p_ in sig.split(","):
+            nm = p_.split(":")[0].split("=")[0].strip().lower()
+            if nm:
+                params.add(nm)
+                params |= set(nm.split("_"))
+    names = {n for n in names if n not in params or n == "score"}
+    names |= {n.rsplit("_", 1)[-1] for n in list(names) if "_" in n}     # coupling_asymmetry -> asymmetry
+    names -= {"status", "error", "message", "name", "type", "mode", "direction", "config", "version"}
+    return {n for n in names if n and " " not in n}
+
+
+_DEMOTED: Set[str] = set()
+
+
+def demoted_path(run_dir: Path) -> Path:
+    return integration_dir_for(run_dir) / "demoted.json"
+
+
+def load_demoted(run_dir: Path) -> None:
+    try:
+        _DEMOTED.update(json.loads(read_file_content_safe(demoted_path(run_dir)) or "[]"))
+    except json.JSONDecodeError:
+        pass
+
+
+def demote_hardcoded_incumbents(run_dir: Path, proj: Path, rnd: int, metric_keys: List[str]) -> Dict[str, List[str]]:
+    """After a round: attempts whose files, now integrated, set metrics from a
+    control/ablation flag or to constants - checks that may not have been
+    possible when the attempt was scored (round 1 has no run output yet) - are
+    DEMOTED: no longer integrated or carried forward while an alternative exists.
+    Their recorded scores stay untouched, so replay remains exact.
+    Returns task -> findings for routing."""
+    keys = sorted(set(metric_keys) | contract_metric_names())
+    hits = []
+    if _RUN_PROBE_COMMAND:
+        hits += hardcoded_control_branches(proj, _RUN_PROBE_COMMAND, keys)
+    for a in _RUN_ABLATIONS:
+        hits += hardcoded_control_branches(proj, a["cmd"], keys)
+    hits += hardcoded_metric_constants(proj, keys)
+    hits = sorted(set(hits))
+    if not hits:
+        return {}
+    owners = _owners_by_file(run_dir)
+    best = best_known_nodes(run_dir, rnd)
+    by_task: Dict[str, List[str]] = {}
+    for h in hits:
+        f = h.split(":", 1)[0]
+        t = owners.get(f) or owners.get(PurePosixPath(f).name)
+        if t:
+            by_task.setdefault(t, []).append(h)
+    for t, hs in by_task.items():
+        n = best.get(t)
+        if n and n["id"] not in _DEMOTED:
+            _DEMOTED.add(n["id"])
+            print(f"[DEMOTE] {t}: {n['id']} sets metrics without measuring them ({hs[0][:90]}); no longer "
+                  f"integrated or continued while an alternative exists", flush=True)
+            append_event(run_dir, {"round": rnd, "event": "demoted", "agent": t, "node": n["id"], "hits": hs[:5]})
+    with open(demoted_path(run_dir), "w", encoding="ascii") as fh:
+        json.dump(sorted(_DEMOTED), fh)
+    return {t: [f"Your integrated attempt sets metrics without measuring them: {'; '.join(hs[:3])}. Remove every "
+                f"assignment of a metric under the control/ablation flags and every constant metric; let the flags "
+                f"change the experiment's input or procedure and compute each metric from the measurement. "
+                f"That attempt is demoted and will not be integrated again."] for t, hs in by_task.items()}
 
 
 def silent_fallbacks(proj: Path) -> List[Tuple[str, str]]:
@@ -7967,7 +8371,7 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
         if m:
             add(m.group(1), f"The run crashes in YOUR file {m.group(1)}:{m.group(2)}: {o[:220]}")
     probe = res.get("probe") or {}
-    if res.get("ok") and probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY", "PROBE FAILED", None) \
+    if res.get("ok") and probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY", "PROBE FAILED", "WRONG DIRECTION", None) \
             and _RUN_PROBE_COMMAND and len(_RUN_COMMAND.split()) > 1:
         for path, msg in trace_control_flag(proj, _RUN_COMMAND.split()[1], _RUN_PROBE_COMMAND,
                                             insensitive=probe.get("verdict") in ("INSENSITIVE", "SCORE-ONLY"),
@@ -7975,6 +8379,10 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
             add(path, msg)
     for path, msg in silent_fallbacks(proj):
         add(path, msg)
+    for x in loose_known_answer_asserts(proj, _RUN_CONTRACT):
+        add(x.split(":", 1)[0], f"{x}. A known-answer test with a tolerance this wide cannot fail. Restore a "
+                                f"tolerance that separates right from wrong (e.g. 0.1); if it then fails, fix the "
+                                f"measurement, not the test.")
     hollow = hollow_known_answer_tests(proj, _RUN_CONTRACT)
     if hollow:
         vals = ", ".join(f"{v:g}" for v in known_answer_values(_RUN_CONTRACT))
@@ -8044,6 +8452,13 @@ def after_round_grounding(run_dir: Path, rnd: int, test_ctx: dict) -> None:
                 except Exception as exc:
                     routed = {}
                     print(f"    [!] Routing failed: {str(exc)[:120]}", flush=True)
+                try:
+                    mkeys = [k for k, _ in numeric_fingerprint(_RUN_LAST_RUN_TEXT)] if _RUN_LAST_RUN_TEXT else []
+                    for t, msgs in demote_hardcoded_incumbents(run_dir, proj, rnd, mkeys).items():
+                        cur = routed.setdefault(t, [])
+                        cur.extend(m for m in msgs if m not in cur)
+                except Exception as exc:
+                    print(f"    [!] Demotion check failed: {str(exc)[:120]}", flush=True)
                 _RUN_ROUTED.clear()
                 _RUN_ROUTED.update(routed)
                 with open(idir / f"round{rnd:02d}_routed.json", "w", encoding="ascii") as f:
@@ -8709,7 +9124,7 @@ _INTEGRATION_WEIGHTS = {"coverage": 0.20, "compile": 0.10, "import": 0.15, "pyte
 # Inside the 'run' group: does the project run, does its control respond, and
 # did every required module take part.
 RUN_GROUP_WEIGHTS = {"ok": 0.5, "control": 0.3, "executed": 0.2}
-_CONTROL_VALUE = {"RESPONSIVE": 1.0, "PROBE FAILED": 0.5, "UNCOMPARABLE": 0.5,
+_CONTROL_VALUE = {"RESPONSIVE": 1.0, "PROBE FAILED": 0.5, "UNCOMPARABLE": 0.5, "WRONG DIRECTION": 0.0,
                   "INSENSITIVE": 0.0, "SCORE-ONLY": 0.0, "HARDCODED": 0.0}
 _PYTEST_COUNT_RE = re.compile(r'(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed)\b')
 _CMD_SCORE_RE = re.compile(r'"score"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)')
@@ -8757,7 +9172,8 @@ def best_known_nodes(run_dir: Path, upto_rnd: int) -> Dict[str, dict]:
             # whole-project q, then higher score; on a tie the incumbent (earlier)
             # attempt stays, so the project can never slide backwards.
             q = n.get("integration_q")
-            key = (round(float(q), 3) if isinstance(q, (int, float)) else -1.0,
+            key = (n.get("id") not in _DEMOTED,
+                   round(float(q), 3) if isinstance(q, (int, float)) else -1.0,
                    round(float(n.get("score", 0.0)), 3), -prnd, -n.get("seq", 0))
             cur = best.get(n["task"])
             if cur is None or key > cur[0]:
@@ -8776,7 +9192,8 @@ def carry_forward_source(run_dir: Path, task: str, upto_rnd: int) -> Optional[di
         for n in nodes:
             if n.get("task") != task or not n.get("files") or n.get("status") not in ("success", "partial"):
                 continue
-            if n.get("dependency_violations") or n.get("shortcut_hits") or n.get("lineage_dead"):
+            if n.get("dependency_violations") or n.get("shortcut_hits") or n.get("lineage_dead") \
+                    or n.get("id") in _DEMOTED:
                 continue
             q = n.get("integration_q")
             qv = round(float(q), 3) if isinstance(q, (int, float)) else -1.0
@@ -8847,24 +9264,33 @@ def assemble_project(run_dir: Path, roster: List[dict], chosen: Dict[str, dict],
     dir_names = {r["dir"] for r in roster}
     placed: Dict[str, str] = {}
     conflicts: List[str] = []
-    for r in roster:
-        node = chosen.get(r["id"])
-        if node is None:
-            continue
-        files = _node_files(run_dir, node)
-        for rel in sorted(files, key=lambda x: (x.count("/"), x)):
-            target = _project_rel(rel, dir_names)
-            if not target:
+    owners = _owners_by_file(run_dir)
+    # Pass 1: every deliverable from its OWNER. Pass 2: everything else, first come.
+    # A sibling's copy of someone else's deliverable never displaces the owner's.
+    for owner_pass in (True, False):
+        for r in roster:
+            node = chosen.get(r["id"])
+            if node is None:
                 continue
-            if target in placed:
-                if placed[target] != r["id"]:
-                    conflicts.append(f"{target}: kept {placed[target]}, dropped {r['id']} ({node['id']})")
-                continue
-            out = dest / target
-            out.parent.mkdir(parents=True, exist_ok=True)
-            with open(out, "w", encoding="ascii", errors="ignore") as f:
-                f.write(files[rel])
-            placed[target] = r["id"]
+            files = _node_files(run_dir, node)
+            for rel in sorted(files, key=lambda x: (x.count("/"), x)):
+                target = _project_rel(rel, dir_names)
+                if not target:
+                    continue
+                is_owner = owners.get(target) == r["id"]
+                if owner_pass != is_owner:
+                    continue
+                if target in placed:
+                    if placed[target] != r["id"] and owner_pass is False:
+                        conflicts.append(f"{target}: kept {placed[target]} (owner), dropped {r['id']} ({node['id']})"
+                                         if owners.get(target) == placed[target] else
+                                         f"{target}: kept {placed[target]}, dropped {r['id']} ({node['id']})")
+                    continue
+                out = dest / target
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with open(out, "w", encoding="ascii", errors="ignore") as f:
+                    f.write(files[rel])
+                placed[target] = r["id"]
     return placed, conflicts
 
 
@@ -9328,10 +9754,21 @@ def shortcut_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
     if not ndir.exists():
         return []
     metric_keys = [k for k, _ in numeric_fingerprint(_RUN_LAST_RUN_TEXT)] if _RUN_LAST_RUN_TEXT else []
+    metric_keys = sorted(set(metric_keys) | contract_metric_names())
     hits = hardcoded_control_branches(ndir, _RUN_PROBE_COMMAND, metric_keys)
     for a in _RUN_ABLATIONS:
         hits += hardcoded_control_branches(ndir, a["cmd"], metric_keys)
     hits += hardcoded_metric_constants(ndir, metric_keys)
+    hits += [f"loosened known-answer test: {x}" for x in loose_known_answer_asserts(ndir, _RUN_CONTRACT)]
+    # A continuation that turns its parent's real known-answer test into one that
+    # cannot fail (asserts removed, replaced by range bounds) weakened the test.
+    pid = node.get("seeded_from") or node.get("parent")
+    pdir = work_dir_for(run_dir) / node.get("dir", "") / str(pid) if pid else None
+    if pdir is not None and pdir.exists() and any(_is_test_file(PurePosixPath(f).name) for f in node["files"]):
+        mine, theirs = hollow_known_answer_tests(ndir, _RUN_CONTRACT), hollow_known_answer_tests(pdir, _RUN_CONTRACT)
+        if mine and not theirs:
+            hits.append(f"weakened known-answer test: {mine[0]} no longer asserts a known-answer value that "
+                        f"{pid} asserted")
     hits = sorted(set(hits))
     for _, msg in silent_fallbacks(ndir):
         v = "SILENT FALLBACK: " + msg
