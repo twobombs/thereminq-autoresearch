@@ -4735,24 +4735,23 @@ _PROMPT_INTERFACES_SYNTH = (
     "who never talk can still call each other correctly.\n"
     "- Pin every VALUE vocabulary, not just types: a str that selects between options is written "
     "as Literal[\"a\", \"b\"]; a dict return lists its exact keys and value types; an instruction "
-    "or gate list gets its exact tuple layout AND the complete set of op names, e.g.\n"
-    "    Gate = tuple[Literal[\"h\", \"x\", \"cx\", \"rz\"], list[int], list[float]]  "
-    "# (op, qubits, params); rz params=[theta]\n"
+    "or operation list gets its exact tuple layout AND the complete set of op names, e.g.\n"
+    "    Op = tuple[Literal[\"op_a\", \"op_b\", \"op_c\"], list[int], list[float]]  # (name, targets, params)\n"
     "  and every producer emits only those names while every consumer accepts all of them. Put "
     "shared vocabularies as named aliases at the top of the module that owns them.\n"
     "- THREAD THE PROBE FLAG: the PROBE's flag must appear as an optional parameter in BOTH the "
     "entry module's function that parses/handles it AND the function that prepares and runs the "
-    "experiment, e.g. `def run_experiment(coupling: str, corrupt: bool = False) -> float`. The "
-    "corruption breaks the PROCESS (e.g. skip the correction gates, replace the entangled pair by a "
-    "product state, flip the input WITHOUT telling the metric), while every metric keeps comparing "
+    "experiment, e.g. `def run_experiment(condition: str, control: bool = False) -> float`. The "
+    "control breaks the PROCESS (e.g. skip a required step, replace a key component by a null "
+    "version, perturb the input WITHOUT telling the metric), while every metric keeps comparing "
     "against the ORIGINAL intended reference. A control that changes the reference together with "
     "the input cancels itself and measures nothing.\n"
     "- FLAGS ARE BARE SWITCHES: PROBE and ABLATION commands use bare, hyphenated flags "
-    "(`python3 runner.py --ablate-coupling`), parsed with argparse action='store_true' (argparse "
-    "maps them to ablate_coupling). Never write `--flag True` or underscores in flag names.\n"
-    "- PIN MEASUREMENT KEY FORMATS: any dict of counts or probabilities states its keys exactly, "
-    "e.g. `dict[str, int]  # keys: bitstrings of length qubit_count, character i = qubit i "
-    "(qubit 0 leftmost)`. A function returning a single-qubit marginal says so ('0'/'1' keys).\n"
+    "(`python3 main.py --ablate-component`), parsed with argparse action='store_true' (argparse "
+    "maps them to ablate_component). Never write `--flag True` or underscores in flag names.\n"
+    "- PIN RESULT KEY FORMATS: any dict of counts, frequencies or probabilities states exactly "
+    "what its keys encode, e.g. `dict[str, int]  # keys: fixed-length codes, position i = "
+    "element i`. A function returning a reduced or partial result says so and names its keys.\n"
     "- If a module wraps an external library, name the library calls it must use ONLY from the "
     "LIBRARY API FACTS given below, and use only libraries listed in the CONTAINER ENVIRONMENT.\n"
     "- RUN is ONE command, no shell operators, that runs the project's entry point with its "
@@ -4760,17 +4759,17 @@ _PROMPT_INTERFACES_SYNTH = (
     "\"score\": <number> (JSON) for the summary score.\n"
     "- PROBE is a NEGATIVE CONTROL: the same entry point with one flag that introduces a change "
     "whose effect on the reported metrics is known in advance and does NOT depend on the "
-    "hypothesis being tested (e.g. deliberately corrupt the transmitted state, skip a required "
-    "correction, use an orthogonal target). If the metrics do not move under PROBE, they measure "
+    "hypothesis being tested (e.g. deliberately damage the input, skip a required step, compare "
+    "against a known-wrong target). If the metrics do not move under PROBE, they measure "
     "nothing. The flag must appear in the entry module's interface. Same output format as RUN.\n"
     "- ABLATIONS: two or three commands, each switching off or replacing ONE component of the "
-    "method (e.g. skip the coupling, use the reference simulator instead of PyQrack), threaded "
+    "method (e.g. remove one interaction, swap one backend for an alternative), threaded "
     "into the experiment function like the PROBE flag. They tell which components actually move "
     "the metrics. Predict a direction; never state a value.\n"
     "- KNOWN ANSWERS: for every MEASURED quantity (not the summary score), one concrete input "
     "with a known expected value and one with a DIFFERENT known expected value, stated from "
-    "first principles, as 'metric: <concrete input> -> <value>' (e.g. 'fidelity: ideal "
-    "teleportation of |1>, coupling 0 -> 1.0; orthogonal target state -> 0.0'). Never name the "
+    "first principles, as 'metric: <concrete input> -> <value>' (e.g. 'error: noise-free input, "
+    "exact method -> 0.0; input with a known offset of 1 -> 1.0'). Never name the "
     "score, the control flag or a run mode ('default', 'corrupted', 'control') in a known answer, "
     "and never state the outcome the experiment is meant to measure. Lines that do are dropped.\n"
     "- Serve the user's request and the deliverables; do not add features."
@@ -4786,7 +4785,7 @@ _RUN_MODE_WORDS = re.compile(r'\b(control|probe|negative|default[_ ]?config|corr
 
 def experiment_conditions(body: List[str], probe_cmd: str) -> Set[str]:
     """The values the experiment varies: Literal[...] options in the signature of
-    the function that takes the PROBE flag (e.g. 'forward', 'reverse')."""
+    the function that takes the PROBE flag (e.g. 'mode_a', 'mode_b')."""
     idents, _ = _flag_tokens(probe_cmd)
     words = [set(i.split("_")) for i in idents]
     out: Set[str] = set()
@@ -4813,7 +4812,7 @@ def validate_known_answers(lines: List[str], probe_cmd: str,
     or a run mode, and cases keyed to experimental conditions when the same
     metric gets DIFFERENT values under different conditions - that encodes the
     outcome being measured. A single case that merely mentions a condition
-    (e.g. 'ideal forward teleportation -> 1.0') is kept."""
+    (e.g. 'ideal input under mode_a -> 1.0') is kept."""
     idents, lits = _flag_tokens(probe_cmd)
     flag_sets = [[w for w in i.split("_") if w] for i in idents]
     conds = conditions or set()
@@ -4961,12 +4960,12 @@ def synthesize_interfaces(prompt: str, contract: str,
                         + "  If the reported numbers do not change under PROBE, the metrics are flagged as\n"
                           "  measuring nothing.\n"
                           "  HOW TO WIRE IT: the entry point passes the flag into the experiment function (see\n"
-                          "  INTERFACES). That function USES it to break the PROCESS - e.g. skip the correction\n"
-                          "  gates, replace the entangled pair by a product state, or flip the input WITHOUT\n"
+                          "  INTERFACES). That function USES it to break the PROCESS - e.g. skip a required\n"
+                          "  step, replace a key component by a null version, or perturb the input WITHOUT\n"
                           "  telling the metric - and then runs and measures exactly as in a normal run.\n"
-                          "  The metric's REFERENCE (expected state, target, ideal value) must NOT depend on the\n"
-                          "  flag: if the reference follows the corrupted input, the control cancels itself.\n"
-                          "  The metrics then change because the physics changed.\n"
+                          "  The metric's REFERENCE (expected value, target, ideal result) must NOT depend on the\n"
+                          "  flag: if the reference follows the damaged input, the control cancels itself.\n"
+                          "  The metrics then change because the process changed.\n"
                           "  What is not allowed: computing the metrics or the score differently under the flag,\n"
                           "  or setting any of them to a value. The effect above is a prediction the pipeline\n"
                           "  checks, not a value to produce.")
@@ -5030,14 +5029,14 @@ def interface_problems(body: List[str], run_lines: List[str], probe_lines: List[
                             f"(`{flag}: bool = False`); the flag cannot reach the experiment")
     text = "\n".join(body)
     if re.search(r'dict\[str,\s*(int|float)\]', text) and \
-            not re.search(r'bitstring|marginal|\bkeys?\b|\bkeyed\b', text, re.I):
-        problems.append("dicts of counts/probabilities do not state their key format (bitstring length and "
-                        "qubit order)")
+            not re.search(r'\bkeys?\b|\bkeyed\b|\bencod|\bformat\b', text, re.I):
+        problems.append("dicts of counts/frequencies/probabilities do not state what their keys encode "
+                        "(format, length, ordering)")
     return problems
 
 
 def _bare_flags(cmd: str) -> str:
-    """'--corrupt True' -> '--corrupt'; '--x False' drops the flag. Switches are store_true."""
+    """'--control True' -> '--control'; '--x False' drops the flag. Switches are store_true."""
     toks = cmd.split()
     out, i = [], 0
     while i < len(toks):
@@ -5334,7 +5333,7 @@ def run_rules_section(cmd: str) -> str:
         '  "score": <finite number>, and reports no error ("status": "error", an "error" field,',
         "  or a traceback in its output).",
         "- Printed prose (conclusions, notes) is not a result; only measured numbers count.",
-        "- Seed every source of randomness (numpy, random, simulator shot sampling) with a fixed seed,",
+        "- Seed every source of randomness (random, numpy, any sampling inside libraries) with a fixed seed,",
         "  so two identical runs print identical numbers and the control's effect is unambiguous.",
         "- Boolean switches are bare flags parsed with argparse action='store_true' (present = on).",
         "  Never type=bool: argparse turns '--flag False' into True.",
@@ -5380,7 +5379,8 @@ def _flag_tokens(probe_cmd: str) -> Tuple[Set[str], Set[str]]:
 
 _MEASURE_CALL_RE = re.compile(
     r'^(m|mz|mx|my|measure\w*|sample\w*|choice|choices|get_probabilit\w*|prob|prob_\w*|probabilities|'
-    r'out_probs|get_counts|counts|run_simulation|simulate\w*|execute|run_circuit|run_shots|shots)$', re.I)
+    r'out_probs|get_counts|counts|run_simulation|simulate\w*|execute|run_shots|shots|observe\w*|acquire\w*|'
+    r'read_sensor\w*|evaluate)$', re.I)
 _MUTATORS = {"append", "extend", "insert", "update", "pop", "remove", "clear", "setdefault", "reverse", "sort"}
 
 
@@ -5438,8 +5438,8 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
     metric_names = {k.lower() for k in metric_keys} | {"score"}
     metric_names |= {k.rsplit("_", 1)[-1] for k in list(metric_names) if "_" in k and len(k.rsplit("_", 1)[-1]) >= 2}
 
-    # The flag rarely keeps its name on the way down (--corrupt -> args.corrupt ->
-    # corrupt_flag -> corrupt_state), so an identifier matches when it contains
+    # The flag rarely keeps its name on the way down (--damage-input -> args.damage_input ->
+    # damage_flag -> damage_input_state), so an identifier matches when it contains
     # every word of the flag name as one of its own underscore-separated words.
     flag_words = [set(i.split("_")) for i in idents]
 
@@ -5488,7 +5488,7 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                     name = t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute) else ""
                     if name and is_metric(name):
                         hits.append(f"{p.name}:{node.lineno} {name} computed differently under the flag")
-            # if flag: circuit = [("x",[0],[]), ...]  else: circuit = build(...)
+            # if flag: pipeline = [("op", [0], []), ...]  else: pipeline = build(...)
             # The control replaces the experiment with a fixed stand-in instead of
             # breaking it: whatever the stand-in yields is decided by its author.
             if isinstance(node, ast.If) and refs_flag(node.test) and node.orelse:
@@ -5507,7 +5507,7 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                     if nm in calls_:
                         hits.append(f"{p.name}:{st.lineno} {nm} replaced by a fixed literal under the flag "
                                     f"({ast.unparse(st.value)[:40]}) instead of breaking the process")
-            # if flag: b_str = flip(b_str) / counts[k] = ... / counts.update(...)
+            # if flag: sample = flip(sample) / counts[k] = ... / counts.update(...)
             # The control rewrites what was MEASURED instead of breaking the process:
             # the result is whatever the rewrite says, not what the experiment did.
             if isinstance(node, ast.If) and refs_flag(node.test):
@@ -5596,7 +5596,7 @@ def hardcoded_control_branches(proj: Path, probe_cmd: str, metric_keys: List[str
                 a_body, a_else = metric_assigns(node.body), metric_assigns(node.orelse)
 
                 def norm(src: str) -> str:
-                    """Drop what passes the flag on (run(corrupt=True) vs run()): measuring
+                    """Drop what passes the flag on (run(control=True) vs run()): measuring
                     under the flag is the point; computing the metric differently is not."""
                     try:
                         e = ast.parse(src, mode="eval")
@@ -5635,7 +5635,7 @@ _TRIVIAL_CONSTS = {0, 1}
 def hardcoded_metric_constants(proj: Path, metric_keys: List[str]) -> List[str]:
     """'file:line name = 0.85' for a metric set to a non-trivial numeric constant
     inside ANY conditional branch (e.g. per experimental condition). Guards like
-    `if total == 0: fidelity = 0.0` use 0/1 and are not flagged."""
+    `if total == 0: accuracy = 0.0` use 0/1 and are not flagged."""
     names = {k.lower() for k in metric_keys} | {"score"}
     names |= {k.rsplit("_", 1)[-1] for k in list(names) if "_" in k and len(k.rsplit("_", 1)[-1]) >= 2}
 
@@ -5799,7 +5799,7 @@ def sensitivity_probe(proj: Path, rnd: int, test_ctx: dict, run_dir: Path,
             f"3x that noise; seed the randomness for a cleaner control)" if base.get("noisy") else "")
     if not cmd:
         # The contract predicts the DIRECTION of the control's effect. A control that
-        # pushes every changed metric the other way (a "corruption" that makes the
+        # pushes every changed metric the other way (a "damage" that makes the
         # result perfect) does not break the experiment - it replaces it.
         want = predicted_direction(_RUN_CONTRACT)
         if want:
@@ -5822,7 +5822,7 @@ _PROMPT_SKEPTIC_REVIEW = (
     "metric the output reports, decide from the code whether it actually measures what its name "
     "says. Look for: values that are constant by construction, conditions that are always true, "
     "comparisons against the wrong reference, parameters that never reach the computation, "
-    "operations that cannot affect the measured quantity, silent fallbacks, and circuits or models "
+    "operations that cannot affect the measured quantity, silent fallbacks, and pipelines or models "
     "missing the steps their names imply. Quote the exact code line that decides your verdict.\n"
     "Also trace the negative-control flag from the entry point: what does it actually change? It must "
     "break the experiment's PROCESS so the metric changes BY MEASUREMENT, while the metric's reference "
@@ -5898,8 +5898,8 @@ def review_findings(run_dir: Path, review: str) -> Dict[str, List[str]]:
         ev = re.search(r'EVIDENCE:\s*([\w./\-]+\.py)', tail)
         why = re.search(r'REASON:\s*(.+)', tail)
         advice = {"self-cancelling": "The flag changes the metric's reference together with the input, so the "
-                                     "effect cancels. Keep the reference the ORIGINAL intended state; let the "
-                                     "flag break only the process (skip correction, break the entangled pair).",
+                                     "effect cancels. Keep the reference the ORIGINAL intended one; let the "
+                                     "flag break only the process (skip a required step, disable a key component).",
                   "hardcoded": "Do not set any metric from the flag; let it break the process and measure "
                                "as normal.",
                   "not wired": "Pass the flag into the experiment function and let it break the process; "
@@ -6101,8 +6101,8 @@ def _raise_capture_env(env: Dict[str, str], work: Path, project: Path) -> Path:
 
 def exception_origins(log: Path) -> List[str]:
     """Rendered origin + path of the last few exceptions raised in project code
-    (SystemExit excluded): 'ValueError: axes don't match array at simulator.py:37 in
-    apply_gate; passed through experiment.py:88 -> runner.py:21'."""
+    (SystemExit excluded): 'ValueError: shapes do not match at core.py:37 in
+    apply_step; passed through pipeline.py:88 -> main.py:21'."""
     try:
         data = json.loads(read_file_content_safe(log) or "[]")
     except json.JSONDecodeError:
@@ -6710,8 +6710,8 @@ def project_library_refs(project: Optional[Path], allowed: Set[str]) -> Dict[str
 def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str, str]],
                            rel: str, calls_out: Optional[list] = None) -> Set[Tuple[str, str, str, str]]:
     """(module, Class, attribute, 'file:line') for attributes used on variables
-    holding a library class instance: `sim = QrackSimulator(...)` or
-    `self.sim = pyqrack.QrackSimulator(...)`, then `sim.rz(...)` / `self.sim.rz`.
+    holding a library class instance: `obj = LibClass(...)` or
+    `self.obj = lib.LibClass(...)`, then `obj.method(...)` / `self.obj.method`.
     Tracking is by name within one file - enough for the common patterns."""
     cls_by_local = {n: (m, n) for (m, n) in imported}
 
@@ -6737,7 +6737,7 @@ def _instance_method_calls(tree, alias: Dict[str, str], imported: Set[Tuple[str,
         return None
 
     def class_ref(expr) -> Optional[Tuple[str, str]]:
-        """A bare class reference: QrackSimulator or pyqrack.QrackSimulator."""
+        """A bare class reference: LibClass or lib.LibClass."""
         if isinstance(expr, ast.Name) and expr.id in cls_by_local:
             return cls_by_local[expr.id]
         if isinstance(expr, ast.Attribute):
@@ -6831,7 +6831,7 @@ def _parse_sig(sig: str) -> Optional[dict]:
 
 def arity_problems(calls: list, sigs: Dict[Tuple[str, str], Dict[str, str]]) -> List[str]:
     """Calls on library instances whose argument count or keywords cannot match
-    the real signature: 'QrackSimulator.r() takes (b, ph, q): 2 positional given'."""
+    the real signature: 'LibClass.method() takes (a, b, c): 2 positional given'."""
     out = []
     for m, c, attr, where, npos, kws, dynamic in calls:
         s = (sigs.get((m, c)) or sigs.get((m.split(".")[0], c)) or {}).get(attr)
@@ -7013,8 +7013,8 @@ def probe_library_api(run_dir: Path, focus: List[str], refs: Dict[str, Any]) -> 
 
 
 # Member names that get a full signature even when the budget is tight.
-_API_CORE_PREFIXES = ("out_", "in_", "prob", "measure", "reset", "m_all", "num_qubits", "mtrx",
-                      "mcmtrx", "swap", "seed", "run", "apply", "get", "set")
+_API_CORE_PREFIXES = ("run", "apply", "get", "set", "measure", "prob", "sample", "reset", "seed",
+                      "compute", "evaluate", "load", "save", "create", "build", "to_", "from_")
 
 
 def render_api_facts(facts: Dict[str, dict], budget: int = API_FACTS_BUDGET) -> str:
@@ -7153,7 +7153,7 @@ def disallowed_imports(node: dict, run_dir: Path) -> List[str]:
                 dotted[full] = str(p.relative_to(ndir))
     out = [f"{m} ({f})" for m, f in bad.items()]
     # An installed package does not mean every submodule path exists:
-    # qiskit is installed, qiskit.providers.aer is not (it moved to qiskit_aer).
+    # a package can be installed while one of its historic submodules no longer exists.
     for full in missing_submodules(run_dir, list(dotted)):
         out.append(f"{full} (no such module in the installed {full.split('.')[0]}; {dotted[full]})")
     return out
@@ -7787,7 +7787,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                 if isinstance(fn_, ast.Name):
                     cands.append((fn_.id, None))
                 elif isinstance(fn_, ast.Attribute) and isinstance(fn_.value, ast.Name):
-                    cands.append((fn_.attr, fn_.value.id))           # sim = reference.RefSimulator()
+                    cands.append((fn_.attr, fn_.value.id))           # obj = module.LibClass()
         if not cands:
             return None
         resolved = [r for r in (resolve_class(stem, c, m, f.attr) for c, m in cands) if r]
@@ -7909,7 +7909,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                                 if re.search(r'expect|target|reference|\bref\b|ref_|ideal|truth', nm, re.I):
                                     out.append((f"{mstem}.py",
                                                 f"{mstem}.py:{a.lineno} sets `{nm}` from the control flag `{prm}`: the "
-                                                f"metric's reference follows the corruption, so the control cancels "
+                                                f"metric's reference follows the control, so the control cancels "
                                                 f"itself. Keep the reference the ORIGINAL intended state and let the "
                                                 f"flag break only the process."))
                 if used and mstem != estem and insensitive and (mstem, fname) not in insens_done:
@@ -7919,7 +7919,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                     # statement order; the LAST project call that receives a changed
                     # value is the measuring consumer, its result is a measurement and
                     # is not propagated further. Earlier project calls that produce a
-                    # changed value (Config(...), build_circuit(...)) are producers.
+                    # changed value (Config(...), build_pipeline(...)) are producers.
                     changed = set()
                     for node in ast.walk(fn):
                         cond, body_nodes = None, []
@@ -7973,7 +7973,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
 
                     producers, consumer = [], None
                     # Whoever builds a value the control then alters is a producer too
-                    # (circuit = build(...); if corrupt: circuit = circuit[:-2]).
+                    # (steps = build(...); if control: steps = steps[:-2]).
                     for st in stmts:
                         if isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id in seeds
                                                               for t in st.targets):
@@ -8031,9 +8031,8 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                                     f"The negative control changes the `{var}` your {r[0]}.{r[1]}() builds "
                                     f"({mstem}.py:{st.lineno}), and the measured numbers do not move. Check that "
                                     f"what you build actually uses every input it is given and implements the "
-                                    f"protocol end to end (state preparation, entangling, the measurement it "
-                                    f"relies on, corrections), so that a changed input or a removed step MUST "
-                                    f"change the measured result."))
+                                    f"method end to end (every step the measured quantity depends on), so that a "
+                                    f"changed input or a removed step MUST change the measured result."))
                 if used and mstem != estem:
                     reached["outside"] = True
                 elif used:
@@ -8041,7 +8040,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                 if not used:
                     out.append((f"{mstem}.py", f"{mstem}.{fname}() receives the control flag as `{prm}` (from "
                                                 f"{where}) but never uses it. It must change the experiment's input "
-                                                f"or procedure (e.g. corrupt the state before it is teleported), "
+                                                f"or procedure (e.g. damage the input or skip a required step), "
                                                 f"never set a metric."))
                 elif depth < 3:
                     follow(mstem, fn, depth + 1, where)
@@ -8060,7 +8059,7 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
         where = ", ".join(local_use[:2]) or entry
         out.append((f"{estem}.py", f"The control flag never leaves {estem}.py: {where} only uses it locally (e.g. to "
                                    f"change what is printed). Pass it into the experiment function so the "
-                                   f"corruption is applied to the experiment's input."))
+                                   f"control is applied to the experiment's input or procedure."))
     # Tell the owners of the experiment functions the entry calls, if they lack a flag parameter.
     if not reached["outside"]:
         for call in [n for n in ast.walk(trees[estem]) if isinstance(n, ast.Call)]:
@@ -8072,10 +8071,10 @@ def trace_control_flag(proj: Path, entry: str, probe_cmd: str,
                 continue
             params = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs]
             if not any(is_flag_name(p) for p in params):
-                flag = sorted(idents)[0] if idents else "corrupt"
+                flag = sorted(idents)[0] if idents else "control"
                 out.append((f"{tgt[0]}.py", f"{tgt[0]}.{tgt[1]}() has no parameter for the negative control. Add "
                                             f"`{flag}: bool = False` (an optional parameter does not break the frozen "
-                                            f"API) and, when it is True, corrupt the experiment's INPUT before running "
+                                            f"API) and, when it is True, damage the experiment's INPUT or skip a required step before running "
                                             f"it; measure exactly as normal."))
     return out
 
@@ -8222,12 +8221,12 @@ def hollow_known_answer_tests(proj: Path, contract: str) -> List[str]:
 def contract_metric_names() -> Set[str]:
     """Metric names the contract already commits to, so the shortcut scan works
     from round 1 on (before any run output exists): known-answer metrics and the
-    JSON keys the contract shows ("fidelity": ...)."""
+    JSON keys the contract shows ("accuracy": ...)."""
     names = {l.split(":", 1)[0].strip().strip("`").lower()
              for l in known_answer_lines(_RUN_CONTRACT) if ":" in l}
     names |= {m.lower() for m in re.findall(r'"([A-Za-z_][A-Za-z0-9_]{2,40})"\s*:', _RUN_CONTRACT or "")}
-    # Metrics the contract names in prose: "returns fidelity metric", the PROBE's
-    # and ABLATIONS' predicted effects ("fidelity decreases ...").
+    # Metrics the contract names in prose: "returns accuracy metric", the PROBE's
+    # and ABLATIONS' predicted effects ("accuracy decreases ...").
     text = _RUN_CONTRACT or ""
     for m in re.finditer(r'returns?\s+(?:the\s+|a\s+)?([a-z][a-z_]{2,40})(?:\s+(?:metric|value|score))?', text, re.I):
         names.add(m.group(1).lower())
@@ -8235,10 +8234,10 @@ def contract_metric_names() -> Set[str]:
         names.add(m.group(1).lower())
     names -= {"a", "an", "the", "none", "list", "dict", "float", "int", "str", "bool", "true", "false",
               "json", "counts", "result", "results", "value", "values", "it", "direction", "metric", "metrics",
-              "measurement", "bitstring", "output", "default", "directional", "input", "state", "circuit",
-              "qubit", "qubits", "simulator", "experiment", "run", "runner", "probability", "probabilities"}
+              "measurement", "output", "default", "directional", "input", "state", "model", "module",
+              "backend", "experiment", "run", "runner", "probability", "probabilities", "data"}
     # Never a metric: anything that is a parameter or field in the INTERFACES
-    # (coupling, coupling_strength, ablate_coupling ...): ablations legitimately set those.
+    # (strength, component_strength, ablate_component ...): ablations legitimately set those.
     params = set()
     for sig in re.findall(r'def\s+\w+\s*\(([^)]*)\)', text):
         for p_ in sig.split(","):
@@ -8247,7 +8246,7 @@ def contract_metric_names() -> Set[str]:
                 params.add(nm)
                 params |= set(nm.split("_"))
     names = {n for n in names if n not in params or n == "score"}
-    names |= {n.rsplit("_", 1)[-1] for n in list(names) if "_" in n}     # coupling_asymmetry -> asymmetry
+    names |= {n.rsplit("_", 1)[-1] for n in list(names) if "_" in n}     # mean_error -> error
     names -= {"status", "error", "message", "name", "type", "mode", "direction", "config", "version"}
     return {n for n in names if n and " " not in n}
 
@@ -8389,8 +8388,8 @@ def route_findings(run_dir: Path, proj: Path, res: Optional[dict]) -> Dict[str, 
         for tf in hollow:
             add(tf, f"No assertion in the tests checks a KNOWN ANSWER value ({vals}). A test that only checks keys, "
                     f"types or 'is a float' cannot fail on a broken measurement. Call the measuring function with "
-                    f"each known-answer input and assert the value with a tolerance (e.g. fidelity >= 0.9 for the "
-                    f"ideal case, <= 0.1 for the orthogonal one). If it then fails, the code is wrong - not the test.")
+                    f"each known-answer input and assert the value with a tolerance (e.g. >= 0.9 where the known answer "
+                    f"is 1.0, <= 0.1 where it is 0.0). If it then fails, the code is wrong - not the test.")
     # Only a SUCCESSFUL run says anything about which modules take part: after a
     # crash, everything past the crash point "never ran".
     dead = (res.get("not_executed") or []) if res.get("ok") else []
@@ -9707,7 +9706,7 @@ def write_evaluation_feedback(node: dict, run_dir: Path) -> None:
 
 def library_misuse_gate(node: dict, run_dir: Path, rnd: int) -> List[str]:
     """Part of the fixed evaluator: attributes this attempt uses on library class
-    instances (sim = QrackSimulator(); sim.rz(...)) that the class does not have,
+    instances (obj = LibClass(); obj.method(...)) that the class does not have,
     checked against the members inspected in this container. A violation plus a
     log line naming the file, line and the nearest real members."""
     known = _known_class_members()
