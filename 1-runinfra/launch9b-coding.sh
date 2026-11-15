@@ -2,7 +2,8 @@
 ../0-build/llama.cpp/build/bin/llama-server \
   -m ../0-build/Qwopus3.5-9B-Coder-MTP-Q3_K_M.gguf \
   --mmproj ../0-build/mmproj-F32.gguf \
-  --no-mmproj-offload \
+  --image-min-tokens 1024 \
+  --image-max-tokens 1024 \
   -c 12800 \
   -b 256 \
   -ub 256 \
@@ -20,7 +21,8 @@
   --cache-type-k-draft q8_0 \
   --cache-type-v-draft q4_0 \
   --spec-type draft-mtp \
-  --spec-draft-n-max 3 \
+  --spec-draft-n-max 2 \
+  --reasoning-preserve \
   --host 0.0.0.0 \
   --port 8033 \
   --tools all \
