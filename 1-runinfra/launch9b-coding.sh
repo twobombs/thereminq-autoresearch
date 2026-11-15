@@ -1,17 +1,18 @@
 #!/bin/bash
 ../0-build/llama.cpp/build/bin/llama-server \
   -m ../0-build/Qwopus3.5-9B-Coder-MTP-Q3_K_M.gguf \
-  -c 8192 \
+  --mmproj ../0-build/mmproj-F32.gguf \
+  --no-mmproj-offload \
+  -c 12800 \
   -b 256 \
   -ub 256 \
   -t 4 \
   -tb 4 \
   --no-cache-idle-slots \
   -np 1 \
-  --device Vulkan1 \
-  --fit on \
-  --fit-target 192 \
-  --no-kv-offload \
+  --device Vulkan1,Vulkan0 \
+  --split-mode layer \
+  --tensor-split 90,10 \
   --kv-unified \
   -fa on \
   --cache-type-k q8_0 \
@@ -19,7 +20,7 @@
   --cache-type-k-draft q8_0 \
   --cache-type-v-draft q4_0 \
   --spec-type draft-mtp \
-  --spec-draft-n-max 2 \
+  --spec-draft-n-max 3 \
   --host 0.0.0.0 \
   --port 8033 \
   --tools all \
