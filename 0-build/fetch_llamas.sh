@@ -21,8 +21,8 @@ wget https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/resolve/main/Qwen3
 # wget https://huggingface.co/bartowski/nvidia_Orchestrator-8B-GGUF/resolve/main/nvidia_Orchestrator-8B-Q5_K_S.gguf
 
 # Qwen 3.5 MTP coding agent
-wgt https://huggingface.co/Jackrong/Qwopus3.5-9B-Coder-MTP-GGUF/resolve/main/Qwopus3.5-9B-Coder-MTP-Q3_K_M.gguf
-
+wget https://huggingface.co/Jackrong/Qwopus3.5-9B-Coder-MTP-GGUF/resolve/main/Qwopus3.5-9B-Coder-MTP-Q3_K_M.gguf
+wget https://huggingface.co/Jackrong/Qwopus3.5-9B-Coder-MTP-GGUF/resolve/main/mmproj-F32.gguf
 # Qwen 3.8 nextgen Apex midrange model
 wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf &
 wget https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf &
